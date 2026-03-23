@@ -1,4 +1,5 @@
 import copy
+from enum import Enum
 import hashlib
 import math
 import os
@@ -6,7 +7,7 @@ import pickle
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -16,10 +17,21 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1,
     KVConnectorMetadata,
     KVConnectorRole,
+    SupportsHMA,
 )
 from vllm.distributed.parallel_state import get_tp_group, get_world_group
 from vllm.platforms import current_platform
 from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.utils.torch_utils import get_dtype_size
+from vllm.v1.kv_cache_interface import (
+    AttentionSpec,
+    FullAttentionSpec,
+    KVCacheConfig,
+    KVCacheSpec,
+    MambaSpec,
+    SlidingWindowSpec,
+    UniformTypeKVCacheSpecs,
+)
 
 from ucm.integration.vllm.device import create_device
 from ucm.logger import init_logger
@@ -58,15 +70,22 @@ class RequestDispatchMeta:
     ]  # [0] mean ucm_block_ids, [1] means vllm_block_ids
     dump_block_ids: tuple[list[bytes], list[int]]
 
+class AttnType(Enum):
+    SELF_ATTN = "self_attn"
+    LINEAR_ATTN = "linear_attn"
+    UNKNOWN = "unknown"
+
 
 class KVCacheLayout:
     def __init__(
-        self, kvcaches, use_layerwise: bool, vllm_config: "VllmConfig"
+        self, vllm_config: "VllmConfig", use_layerwise: bool, kv_cache_config: Optional["KVCacheConfig"] = None
     ) -> None:
-        # each row is a layer, each column is a tensor_size/ptr in the layer (e.g., k, v, rope, k_index)
-        self.base_ptrs: np.ndarray  # (n_layers, n_ptrs）
-        self.tensor_size_lists: np.ndarray  # (n_layers, n_tensor_sizes)
+        # Per AttnType: each row is a layer, each column is a ptr / stride in that layer.
+        self.base_ptrs: dict[AttnType, np.ndarray]  # values: (n_layers, n_ptrs)
+        self.stride_lists: dict[AttnType, np.ndarray]  # values: (n_layers, n_strides)
+        self.tensor_size_lists: dict[AttnType, np.ndarray]  # values: (n_layers, n_tensor_sizes)
         self.use_layerwise = use_layerwise
+        self.kv_cache_config = kv_cache_config
         self.vllm_config = vllm_config
         self.pp_size = self.vllm_config.parallel_config.pipeline_parallel_size
         self.num_hidden_layers = getattr(
@@ -74,80 +93,154 @@ class KVCacheLayout:
         )
         if self.pp_size > 1 and self.num_hidden_layers <= 0:
             raise ValueError("num_hidden_layers must be > 0 when pp_size > 1")
-        self._build_layout(kvcaches)
+        self.use_bybrid_attn = False
+        self.cache_block_size = self.vllm_config.cache_config.block_size
+        self.kernal_block_size = self.vllm_config.cache_config.block_size
+        self.kernal_blocks_per_cache_block = self.block_size // self.kernal_block_size
+        if self.kv_cache_config is not None:
+            self._initiallize_kv_cache_config()
+
+    def _initiallize_kv_cache_config(self):
+        self.layer_name_to_group_id: dict[str, int] = {}
+        self.layer_name_to_raw_tensor_idx: dict[str, int] = {}
+        self.mamba_group_ids: list[int] = []
+        self.attn_group_ids: list[int] = []
+        use_mamba, use_attn = False, False
+        for group_id, kv_cache_group_spec in enumerate(self.kv_cache_config.kv_cache_groups):
+            for layer_name in kv_cache_group_spec.layer_names:
+                self.layer_name_to_group_id[layer_name] = group_id
+            if isinstance(kv_cache_group_spec.kv_cache_spec, MambaSpec):
+                use_mamba = True
+                self.mamba_group_ids.append(group_id)
+            if isinstance(kv_cache_group_spec.kv_cache_spec, AttentionSpec):
+                use_attn = True
+                self.attn_group_ids.append(group_id)
+            if use_mamba and use_attn:
+                self.use_bybrid_attn = True
+
+    def initialize_kv_cache_layout(self, kvcaches):
+        if self.use_bybrid_attn:
+            self._build_layout_with_kv_cache_config(kvcaches)
+        else:
+            self._build_layout(kvcaches)
+
+    def _handle_kv_layer(self, kv_layer, attn_type: AttnType = AttnType.UNKNOWN):
+        ptrs = []
+        strides = []
+        tensor_sizes = []
+
+        def handle_kv_tensor(t: torch.Tensor):
+            ptrs.append(t.data_ptr())
+            strides.append(t.stride(0) * t.element_size())
+            tensor_size = math.prod([t.shape[i] for i in range(1, t.dim())]) * t.element_size()
+            if attn_type == AttnType.SELF_ATTN:
+                self.kernal_block_size = t.shape[1]
+                self.kernal_blocks_per_cache_block = self.cache_block_size // self.kernal_block_size
+                tensor_size *= self.kernal_blocks_per_cache_block
+            tensor_sizes.append(tensor_size)
+
+        if isinstance(kv_layer, torch.Tensor):
+            if kv_layer.dim() == 5 and kv_layer.shape[0] == 2:
+                # full attention packed KV: [2, num_blocks, ...]
+                handle_kv_tensor(kv_layer[0])
+                handle_kv_tensor(kv_layer[1])
+            else:
+                handle_kv_tensor(kv_layer)
+        elif isinstance(kv_layer,(tuple, list)):
+            for tensor in kv_layer:
+                handle_kv_tensor(tensor)
+        else:
+            raise TypeError(f"Unsupported kv cache type: {type(kv_layer)}")
+
+        return ptrs, strides, tensor_sizes
 
     def _build_layout(self, kvcaches):
         raw_ptr_rows = []
         stride_rows = []
+        tensor_size_rows = []
 
         for _, kv_layer in kvcaches.items():
-            ptrs = []
-            strides = []
-
-            def handle_tensor(t: torch.Tensor, size_dims):
-                ptrs.append(t[0].data_ptr())
-
-                stride = math.prod([t.shape[i] for i in size_dims]) * t.element_size()
-                strides.append(stride)
-
-            if isinstance(kv_layer, torch.Tensor):
-                if kv_layer.dim() == 5:
-                    # [2, num_blocks, block_size, num_head, head_dim]
-                    handle_tensor(kv_layer[0], (-3, -2, -1))
-                    handle_tensor(kv_layer[1], (-3, -2, -1))
-                elif kv_layer.dim() == 3:
-                    # [num_blocks, block_size, head_dim]
-                    handle_tensor(kv_layer, (-2, -1))
-                else:
-                    raise ValueError(
-                        f"Unsupported kv cache tensor shape: {kv_layer.shape}"
-                    )
-            elif isinstance(kv_layer, Tuple):
-                # vllm_ascend >= 0.10.0, ([num_blocks, block_size, num_head, head_dim], ...)
-                for tensor in kv_layer:
-                    handle_tensor(tensor, (-3, -2, -1))
-            else:
-                raise TypeError(f"Unsupported kv cache type: {type(kv_layer)}")
-
+            ptrs, strides, tensor_sizes = self._handle_kv_layer(kv_layer)
             raw_ptr_rows.append(ptrs)
             stride_rows.append(strides)
+            tensor_size_rows.append(tensor_sizes)
 
-        self.base_ptrs = np.asarray(raw_ptr_rows, dtype=np.uint64)
-        self.tensor_size_lists = np.asarray(stride_rows, dtype=np.uint64)
+        self.base_ptrs = {AttnType.SELF_ATTN: np.asarray(raw_ptr_rows, dtype=np.uint64)}
+        self.stride_lists = {AttnType.SELF_ATTN: np.asarray(stride_rows, dtype=np.uint64)}
+        self.tensor_size_lists = {AttnType.SELF_ATTN: np.asarray(tensor_size_rows, dtype=np.uint64)}
 
         logger.info(
-            f"base_ptrs: {self.base_ptrs.shape}, tensor_size_lists: {self.tensor_size_lists.shape}"
+            f"base_ptrs[{AttnType.SELF_ATTN}]: {self.base_ptrs[AttnType.SELF_ATTN].shape}, "
+            f"stride_lists[{AttnType.SELF_ATTN}]: {self.stride_lists[AttnType.SELF_ATTN].shape}, "
+            f"tensor_size_lists[{AttnType.SELF_ATTN}]: {self.tensor_size_lists[AttnType.SELF_ATTN].shape}"
         )
 
-    def extract_block_addrs(self, vllm_block_ids: List[int]) -> np.ndarray:
+    def _build_layout_with_kv_cache_config(self, kvcaches):
+        raw_ptr_rows: dict[AttnType, list[list[int]]] = defaultdict(list)
+        stride_rows: dict[AttnType, list[list[int]]] = defaultdict(list)
+        tensor_size_rows: dict[AttnType, list[list[int]]] = defaultdict(list)
+        
+        for raw_tensor_idx, kv_cache_tensor in enumerate(self.kv_cache_config.kv_cache_tensors):
+            layout_done_for_raw_tensor: set[AttnType] = set()
+            for layer_name in kv_cache_tensor.shared_by:
+                self.layer_name_to_raw_tensor_idx[layer_name] = raw_tensor_idx
+                group_id = self.layer_name_to_group_id[layer_name]
+                attn_type = AttnType.SELF_ATTN if group_id in self.attn_group_ids else AttnType.LINEAR_ATTN
+                if attn_type in layout_done_for_raw_tensor:
+                    continue
+                layout_done_for_raw_tensor.add(attn_type)
+                kv_layer = kvcaches.get(layer_name)
+                ptrs, strides, tensor_sizes = self._handle_kv_layer(kv_layer, attn_type)
+                raw_ptr_rows[attn_type].append(ptrs)
+                stride_rows[attn_type].append(strides)
+                tensor_size_rows[attn_type].append(tensor_sizes)
+
+        attn_types = (AttnType.SELF_ATTN, AttnType.LINEAR_ATTN)
+        self.base_ptrs = {
+            at: np.asarray(raw_ptr_rows[at], dtype=np.uint64) for at in attn_types
+        }
+        self.stride_lists = {
+            at: np.asarray(stride_rows[at], dtype=np.uint64) for at in attn_types
+        }
+        self.tensor_size_lists = {
+            at: np.asarray(tensor_size_rows[at], dtype=np.uint64) for at in attn_types
+        }
+        for at in attn_types:
+            logger.info(
+                f"layout[{at}]: base_ptrs {self.base_ptrs[at].shape}, "
+                f"stride_lists {self.stride_lists[at].shape}, "
+                f"tensor_size_lists {self.tensor_size_lists[at].shape}"
+            )
+
+    def extract_block_addrs(self, vllm_block_ids: List[int], attn_type: AttnType) -> np.ndarray:
         vllm_block_ids_np = np.array(vllm_block_ids, np.uint64)
         block_addrs = (
-            vllm_block_ids_np[:, None, None] * self.tensor_size_lists[None, :, :]
-            + self.base_ptrs[None, :, :]
+            vllm_block_ids_np[:, None, None] * self.tensor_size_lists[attn_type][None, :, :]
+            + self.base_ptrs[attn_type][None, :, :]
         )  # (num_blocks, n_layers, n_ptrs)
         return block_addrs
 
     @property
-    def tensor_size_list(self) -> list[int]:
+    def tensor_size_list(self, attn_type: AttnType) -> list[int]:
         return (
-            self.tensor_size_lists.reshape(-1).tolist()
+            self.tensor_size_lists[attn_type].reshape(-1).tolist()
             if not self.use_layerwise
-            else self.tensor_size_lists[0].tolist()
+            else self.tensor_size_lists[attn_type].tolist()
         )
 
     @property
-    def shard_size(self) -> int:
+    def shard_size(self, attn_type: AttnType) -> int:
         return int(
-            self.tensor_size_lists.sum()
+            self.tensor_size_lists[attn_type].sum()
             if not self.use_layerwise
-            else self.tensor_size_lists[0].sum()
+            else self.tensor_size_lists[attn_type].sum()
         )
 
     @property
-    def block_size(self) -> int:
+    def block_size(self, attn_type: AttnType) -> int:
         if self.pp_size > 1:
-            return int(self.tensor_size_lists[0].sum() * self.num_hidden_layers)
-        return int(self.tensor_size_lists.sum())
+            return int(self.tensor_size_lists[attn_type].sum() * self.num_hidden_layers)
+        return int(self.tensor_size_lists[attn_type].sum())
 
 
 @dataclass
@@ -172,14 +265,14 @@ class RequestHasher:
         return h.digest()
 
 
-class UCMDirectConnector(KVConnectorBase_V1):
+class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
     """
     This connector means synchronize:
     load -> forward -> save
     """
 
-    def __init__(self, vllm_config: "VllmConfig", role: KVConnectorRole):
-        super().__init__(vllm_config=vllm_config, role=role)
+    def __init__(self, vllm_config: "VllmConfig", role: KVConnectorRole, kv_cache_config: Optional["KVCacheConfig"] = None):
+        super().__init__(vllm_config=vllm_config, role=role, kv_cache_config=kv_cache_config)
         self.use_layerwise = False
         self.kv_caches: dict[str, torch.Tensor] = {}
         self.local_rank = (
@@ -320,8 +413,11 @@ class UCMDirectConnector(KVConnectorBase_V1):
             for i, tensor in enumerate(sample_kv_layer):
                 logger.info(f"kv cache shape {i}: {tensor.shape}")
         self.kv_cache_layout = KVCacheLayout(
-            self.kv_caches, self.use_layerwise, self._vllm_config
+            self._vllm_config,
+            self.use_layerwise,
+            getattr(self, "kv_cache_config", None),
         )
+        self.kv_cache_layout.initialize_kv_cache_layout(self.kv_caches)
         self.block_data_size = self.kv_cache_layout.block_size
 
         self.layer_name_to_id = {
@@ -669,6 +765,13 @@ class UCMDirectConnector(KVConnectorBase_V1):
         res = self._invalid_block_ids
         self._invalid_block_ids = set()
         return res
+
+    def request_finished_all_groups(
+        self,
+        request: "Request",
+        block_ids: tuple[list[int], ...],
+    ) -> tuple[bool, dict[str, Any] | None]:
+        return False, None
 
 
 class UCMLayerWiseConnector(UCMDirectConnector):
@@ -1050,9 +1153,9 @@ class UCMMockConnector(UCMDirectConnector):
         return expect_hit_block_num * self.block_size, False
 
 
-class UCMConnector(KVConnectorBase_V1):
-    def __init__(self, vllm_config: "VllmConfig", role: KVConnectorRole):
-        super().__init__(vllm_config=vllm_config, role=role)
+class UCMConnector(KVConnectorBase_V1, SupportsHMA):
+    def __init__(self, vllm_config: "VllmConfig", role: KVConnectorRole, kv_cache_config: Optional["KVCacheConfig"] = None):
+        super().__init__(vllm_config=vllm_config, role=role, kv_cache_config=kv_cache_config)
         self.connector: KVConnectorBase_V1
         # TODO new conn by config
         use_layerwise = (
@@ -1241,3 +1344,10 @@ class UCMConnector(KVConnectorBase_V1):
             Empty set if no load errors occurred.
         """
         return self.connector.get_block_ids_with_load_errors()
+
+    def request_finished_all_groups(
+        self,
+        request: "Request",
+        block_ids: tuple[list[int], ...],
+    ) -> tuple[bool, dict[str, Any] | None]:
+        return self.connector.request_finished_all_groups(request, block_ids)
