@@ -55,6 +55,7 @@ logger = init_logger(__name__)
 @dataclass
 class RequestMeta:
     ucm_block_ids: list[bytes] = field(default_factory=list)
+    mamba_block_ids: list[bytes] = field(default_factory=list)
     hbm_hit_block_num: int = 0
     # local_computed_block + external_computed_block
     total_hit_block_num: int = 0
@@ -70,20 +71,46 @@ class RequestDispatchMeta:
     ]  # [0] mean ucm_block_ids, [1] means vllm_block_ids
     dump_block_ids: tuple[list[bytes], list[int]]
 
-class AttnType(Enum):
-    SELF_ATTN = "self_attn"
-    LINEAR_ATTN = "linear_attn"
+class StoreKind(Enum):
+    ATTENTION = "attention"
+    MAMBA = "mamba"
     UNKNOWN = "unknown"
+
+
+@dataclass
+class SingleStoreLayout:
+    base_ptrs: np.ndarray
+    stride_lists: np.ndarray
+    tensor_size_lists: np.ndarray
+    layer_names: list[str]
+
+    def extract_block_addrs(self, vllm_block_ids: List[int]) -> np.ndarray:
+        vllm_block_ids_np = np.array(vllm_block_ids, np.uint64)
+        return (
+            vllm_block_ids_np[:, None, None] * self.tensor_size_lists[None, :, :]
+            + self.base_ptrs[None, :, :]
+        )
+
+    def tensor_size_list(self, use_layerwise: bool) -> list[int]:
+        return (
+            self.tensor_size_lists.reshape(-1).tolist()
+            if not use_layerwise
+            else self.tensor_size_lists.tolist()
+        )
+
+    def shard_size(self) -> int:
+        return int(self.tensor_size_lists.sum())
+
+    def block_size(self, pp_size: int, num_hidden_layers: int) -> int:
+        if pp_size > 1:
+            return int(self.tensor_size_lists.sum() * num_hidden_layers)
+        return int(self.tensor_size_lists.sum())
 
 
 class KVCacheLayout:
     def __init__(
         self, vllm_config: "VllmConfig", use_layerwise: bool, kv_cache_config: Optional["KVCacheConfig"] = None
     ) -> None:
-        # Per AttnType: each row is a layer, each column is a ptr / stride in that layer.
-        self.base_ptrs: dict[AttnType, np.ndarray]  # values: (n_layers, n_ptrs)
-        self.stride_lists: dict[AttnType, np.ndarray]  # values: (n_layers, n_strides)
-        self.tensor_size_lists: dict[AttnType, np.ndarray]  # values: (n_layers, n_tensor_sizes)
         self.use_layerwise = use_layerwise
         self.kv_cache_config = kv_cache_config
         self.vllm_config = vllm_config
@@ -93,38 +120,54 @@ class KVCacheLayout:
         )
         if self.pp_size > 1 and self.num_hidden_layers <= 0:
             raise ValueError("num_hidden_layers must be > 0 when pp_size > 1")
-        self.use_bybrid_attn = False
         self.cache_block_size = self.vllm_config.cache_config.block_size
-        self.kernal_block_size = self.vllm_config.cache_config.block_size
-        self.kernal_blocks_per_cache_block = self.block_size // self.kernal_block_size
-        if self.kv_cache_config is not None:
-            self._initiallize_kv_cache_config()
-
-    def _initiallize_kv_cache_config(self):
+        self.layouts: dict[StoreKind, SingleStoreLayout] = {}
         self.layer_name_to_group_id: dict[str, int] = {}
+        self.layer_name_to_store_kind: dict[str, StoreKind] = {}
         self.layer_name_to_raw_tensor_idx: dict[str, int] = {}
-        self.mamba_group_ids: list[int] = []
-        self.attn_group_ids: list[int] = []
-        use_mamba, use_attn = False, False
+        self.group_ids_by_store: dict[StoreKind, list[int]] = defaultdict(list)
+        self.store_kinds: list[StoreKind] = [StoreKind.ATTENTION]
+        if self.kv_cache_config is not None:
+            self._initialize_kv_cache_config()
+
+    @property
+    def is_hybrid(self) -> bool:
+        return len(self.store_kinds) > 1
+
+    @property
+    def default_store_kind(self) -> StoreKind:
+        if StoreKind.ATTENTION in self.store_kinds:
+            return StoreKind.ATTENTION
+        return self.store_kinds[0]
+
+    def _store_kind_from_spec(self, kv_cache_spec: "KVCacheSpec") -> StoreKind:
+        if isinstance(kv_cache_spec, MambaSpec):
+            return StoreKind.MAMBA
+        if isinstance(kv_cache_spec, AttentionSpec):
+            return StoreKind.ATTENTION
+        return StoreKind.UNKNOWN
+
+    def _initialize_kv_cache_config(self):
+        discovered_store_kinds: list[StoreKind] = []
         for group_id, kv_cache_group_spec in enumerate(self.kv_cache_config.kv_cache_groups):
+            store_kind = self._store_kind_from_spec(kv_cache_group_spec.kv_cache_spec)
+            if store_kind not in discovered_store_kinds and store_kind != StoreKind.UNKNOWN:
+                discovered_store_kinds.append(store_kind)
+            if store_kind != StoreKind.UNKNOWN:
+                self.group_ids_by_store[store_kind].append(group_id)
             for layer_name in kv_cache_group_spec.layer_names:
                 self.layer_name_to_group_id[layer_name] = group_id
-            if isinstance(kv_cache_group_spec.kv_cache_spec, MambaSpec):
-                use_mamba = True
-                self.mamba_group_ids.append(group_id)
-            if isinstance(kv_cache_group_spec.kv_cache_spec, AttentionSpec):
-                use_attn = True
-                self.attn_group_ids.append(group_id)
-            if use_mamba and use_attn:
-                self.use_bybrid_attn = True
+                self.layer_name_to_store_kind[layer_name] = store_kind
+        if discovered_store_kinds:
+            self.store_kinds = discovered_store_kinds
 
     def initialize_kv_cache_layout(self, kvcaches):
-        if self.use_bybrid_attn:
+        if self.kv_cache_config is not None:
             self._build_layout_with_kv_cache_config(kvcaches)
         else:
             self._build_layout(kvcaches)
 
-    def _handle_kv_layer(self, kv_layer, attn_type: AttnType = AttnType.UNKNOWN):
+    def _handle_kv_layer(self, kv_layer, store_kind: StoreKind = StoreKind.UNKNOWN):
         ptrs = []
         strides = []
         tensor_sizes = []
@@ -133,10 +176,10 @@ class KVCacheLayout:
             ptrs.append(t.data_ptr())
             strides.append(t.stride(0) * t.element_size())
             tensor_size = math.prod([t.shape[i] for i in range(1, t.dim())]) * t.element_size()
-            if attn_type == AttnType.SELF_ATTN:
-                self.kernal_block_size = t.shape[1]
-                self.kernal_blocks_per_cache_block = self.cache_block_size // self.kernal_block_size
-                tensor_size *= self.kernal_blocks_per_cache_block
+            if store_kind == StoreKind.ATTENTION:
+                kernel_block_size = t.shape[1]
+                kernel_blocks_per_cache_block = self.cache_block_size // kernel_block_size
+                tensor_size *= kernel_blocks_per_cache_block
             tensor_sizes.append(tensor_size)
 
         if isinstance(kv_layer, torch.Tensor):
@@ -154,93 +197,120 @@ class KVCacheLayout:
 
         return ptrs, strides, tensor_sizes
 
+    def _create_layout(
+        self,
+        raw_ptr_rows: list[list[int]],
+        stride_rows: list[list[int]],
+        tensor_size_rows: list[list[int]],
+        layer_names: list[str],
+    ) -> SingleStoreLayout:
+        return SingleStoreLayout(
+            base_ptrs=np.asarray(raw_ptr_rows, dtype=np.uint64),
+            stride_lists=np.asarray(stride_rows, dtype=np.uint64),
+            tensor_size_lists=np.asarray(tensor_size_rows, dtype=np.uint64),
+            layer_names=layer_names,
+        )
+
     def _build_layout(self, kvcaches):
         raw_ptr_rows = []
         stride_rows = []
         tensor_size_rows = []
+        layer_names = []
+        store_kind = self.default_store_kind
 
-        for _, kv_layer in kvcaches.items():
-            ptrs, strides, tensor_sizes = self._handle_kv_layer(kv_layer)
+        for layer_name, kv_layer in kvcaches.items():
+            ptrs, strides, tensor_sizes = self._handle_kv_layer(kv_layer, store_kind)
             raw_ptr_rows.append(ptrs)
             stride_rows.append(strides)
             tensor_size_rows.append(tensor_sizes)
+            layer_names.append(layer_name)
+            self.layer_name_to_store_kind.setdefault(layer_name, store_kind)
+            raw_tensor_idx = len(raw_ptr_rows) - 1
+            self.layer_name_to_raw_tensor_idx.setdefault(layer_name, raw_tensor_idx)
 
-        self.base_ptrs = {AttnType.SELF_ATTN: np.asarray(raw_ptr_rows, dtype=np.uint64)}
-        self.stride_lists = {AttnType.SELF_ATTN: np.asarray(stride_rows, dtype=np.uint64)}
-        self.tensor_size_lists = {AttnType.SELF_ATTN: np.asarray(tensor_size_rows, dtype=np.uint64)}
+        self.layouts = {
+            store_kind: self._create_layout(
+                raw_ptr_rows,
+                stride_rows,
+                tensor_size_rows,
+                layer_names,
+            )
+        }
+        self.store_kinds = [store_kind]
+        layout = self.layouts[store_kind]
 
         logger.info(
-            f"base_ptrs[{AttnType.SELF_ATTN}]: {self.base_ptrs[AttnType.SELF_ATTN].shape}, "
-            f"stride_lists[{AttnType.SELF_ATTN}]: {self.stride_lists[AttnType.SELF_ATTN].shape}, "
-            f"tensor_size_lists[{AttnType.SELF_ATTN}]: {self.tensor_size_lists[AttnType.SELF_ATTN].shape}"
+            f"layout[{store_kind}]: base_ptrs {layout.base_ptrs.shape}, "
+            f"stride_lists {layout.stride_lists.shape}, "
+            f"tensor_size_lists {layout.tensor_size_lists.shape}"
         )
 
     def _build_layout_with_kv_cache_config(self, kvcaches):
-        raw_ptr_rows: dict[AttnType, list[list[int]]] = defaultdict(list)
-        stride_rows: dict[AttnType, list[list[int]]] = defaultdict(list)
-        tensor_size_rows: dict[AttnType, list[list[int]]] = defaultdict(list)
-        
+        raw_ptr_rows: dict[StoreKind, list[list[int]]] = defaultdict(list)
+        stride_rows: dict[StoreKind, list[list[int]]] = defaultdict(list)
+        tensor_size_rows: dict[StoreKind, list[list[int]]] = defaultdict(list)
+        layer_names: dict[StoreKind, list[str]] = defaultdict(list)
+
         for raw_tensor_idx, kv_cache_tensor in enumerate(self.kv_cache_config.kv_cache_tensors):
-            layout_done_for_raw_tensor: set[AttnType] = set()
+            store_kind_to_layer_names: dict[StoreKind, list[str]] = defaultdict(list)
             for layer_name in kv_cache_tensor.shared_by:
                 self.layer_name_to_raw_tensor_idx[layer_name] = raw_tensor_idx
-                group_id = self.layer_name_to_group_id[layer_name]
-                attn_type = AttnType.SELF_ATTN if group_id in self.attn_group_ids else AttnType.LINEAR_ATTN
-                if attn_type in layout_done_for_raw_tensor:
+                store_kind = self.layer_name_to_store_kind.get(layer_name, StoreKind.UNKNOWN)
+                store_kind_to_layer_names[store_kind].append(layer_name)
+            for store_kind, shared_layer_names in store_kind_to_layer_names.items():
+                if store_kind == StoreKind.UNKNOWN:
                     continue
-                layout_done_for_raw_tensor.add(attn_type)
-                kv_layer = kvcaches.get(layer_name)
-                ptrs, strides, tensor_sizes = self._handle_kv_layer(kv_layer, attn_type)
-                raw_ptr_rows[attn_type].append(ptrs)
-                stride_rows[attn_type].append(strides)
-                tensor_size_rows[attn_type].append(tensor_sizes)
+                kv_layer = kvcaches.get(shared_layer_names[0])
+                if kv_layer is None:
+                    raise KeyError(
+                        f"Layer {shared_layer_names[0]} referenced by kv_cache_config "
+                        "was not found in registered KV caches."
+                    )
+                ptrs, strides, tensor_sizes = self._handle_kv_layer(kv_layer, store_kind)
+                raw_ptr_rows[store_kind].append(ptrs)
+                stride_rows[store_kind].append(strides)
+                tensor_size_rows[store_kind].append(tensor_sizes)
+                layer_names[store_kind].extend(shared_layer_names)
 
-        attn_types = (AttnType.SELF_ATTN, AttnType.LINEAR_ATTN)
-        self.base_ptrs = {
-            at: np.asarray(raw_ptr_rows[at], dtype=np.uint64) for at in attn_types
-        }
-        self.stride_lists = {
-            at: np.asarray(stride_rows[at], dtype=np.uint64) for at in attn_types
-        }
-        self.tensor_size_lists = {
-            at: np.asarray(tensor_size_rows[at], dtype=np.uint64) for at in attn_types
-        }
-        for at in attn_types:
-            logger.info(
-                f"layout[{at}]: base_ptrs {self.base_ptrs[at].shape}, "
-                f"stride_lists {self.stride_lists[at].shape}, "
-                f"tensor_size_lists {self.tensor_size_lists[at].shape}"
+        self.layouts = {}
+        for store_kind in self.store_kinds:
+            if not raw_ptr_rows[store_kind]:
+                continue
+            # Current hybrid models use all raw tensors for both stores, so the
+            # row index in each sublayout matches the global raw_tensor_idx.
+            self.layouts[store_kind] = self._create_layout(
+                raw_ptr_rows[store_kind],
+                stride_rows[store_kind],
+                tensor_size_rows[store_kind],
+                layer_names[store_kind],
             )
 
-    def extract_block_addrs(self, vllm_block_ids: List[int], attn_type: AttnType) -> np.ndarray:
-        vllm_block_ids_np = np.array(vllm_block_ids, np.uint64)
-        block_addrs = (
-            vllm_block_ids_np[:, None, None] * self.tensor_size_lists[attn_type][None, :, :]
-            + self.base_ptrs[attn_type][None, :, :]
-        )  # (num_blocks, n_layers, n_ptrs)
-        return block_addrs
+        for store_kind, layout in self.layouts.items():
+            logger.info(
+                f"layout[{store_kind}]: base_ptrs {layout.base_ptrs.shape}, "
+                f"stride_lists {layout.stride_lists.shape}, "
+                f"tensor_size_lists {layout.tensor_size_lists.shape}"
+            )
 
-    @property
-    def tensor_size_list(self, attn_type: AttnType) -> list[int]:
-        return (
-            self.tensor_size_lists[attn_type].reshape(-1).tolist()
-            if not self.use_layerwise
-            else self.tensor_size_lists[attn_type].tolist()
+    def get_layout(self, store_kind: Optional[StoreKind] = None) -> SingleStoreLayout:
+        resolved_store_kind = store_kind or self.default_store_kind
+        return self.layouts[resolved_store_kind]
+
+    def extract_block_addrs(
+        self, vllm_block_ids: List[int], store_kind: Optional[StoreKind] = None
+    ) -> np.ndarray:
+        return self.get_layout(store_kind).extract_block_addrs(vllm_block_ids)
+
+    def tensor_size_list(self, store_kind: Optional[StoreKind] = None) -> list[int]:
+        return self.get_layout(store_kind).tensor_size_list(self.use_layerwise)
+
+    def shard_size(self, store_kind: Optional[StoreKind] = None) -> int:
+        return self.get_layout(store_kind).shard_size()
+
+    def block_size(self, store_kind: Optional[StoreKind] = None) -> int:
+        return self.get_layout(store_kind).block_size(
+            self.pp_size, self.num_hidden_layers
         )
-
-    @property
-    def shard_size(self, attn_type: AttnType) -> int:
-        return int(
-            self.tensor_size_lists[attn_type].sum()
-            if not self.use_layerwise
-            else self.tensor_size_lists[attn_type].sum()
-        )
-
-    @property
-    def block_size(self, attn_type: AttnType) -> int:
-        if self.pp_size > 1:
-            return int(self.tensor_size_lists[attn_type].sum() * self.num_hidden_layers)
-        return int(self.tensor_size_lists[attn_type].sum())
 
 
 @dataclass
@@ -302,6 +372,7 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
             self.device = torch_dev.device(f"{dev_name}:{self.local_rank}")
 
         self.store: UcmKVStoreBaseV1
+        self.stores: dict[StoreKind, UcmKVStoreBaseV1] = {}
         self.rope_store: Optional[UcmKVStoreBaseV1] = None
 
         # save block info, avoid hash request twice, and track them until request finished
@@ -321,8 +392,13 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
         if role == KVConnectorRole.SCHEDULER:
             self.request_hasher = RequestHasher(vllm_config, 0)
             self._seed = self.request_hasher("UCM_HASH_SEED")
-            # init scheduler-size connector
-            self.store = self._create_store(None)
+            scheduler_layout = KVCacheLayout(
+                self._vllm_config,
+                self.use_layerwise,
+                getattr(self, "kv_cache_config", None),
+            )
+            self.stores = self._create_stores(scheduler_layout)
+            self.store = self.stores[scheduler_layout.default_store_kind]
         else:
             self.request_hasher = RequestHasher(
                 vllm_config, self.tp_rank % self.tp_size
@@ -367,8 +443,35 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
 
         return ret
 
+    def _generate_mamba_block_ids(self, attn_block_id: bytes) -> list[bytes]:
+        if not hasattr(self, "kv_cache_layout"):
+            return []
+        mamba_group_ids = self.kv_cache_layout.group_ids_by_store.get(
+            StoreKind.MAMBA, []
+        )
+        return [
+            self.request_hasher((attn_block_id, f"group_{group_id}"))
+            for group_id in mamba_group_ids
+        ]
+
+    def _validate_attn_hit_with_mamba(
+        self, attn_block_id: bytes
+    ) -> tuple[bool, list[bytes]]:
+        mamba_store = self.stores.get(StoreKind.MAMBA)
+        if mamba_store is None:
+            return True, []
+
+        mamba_block_ids = self._generate_mamba_block_ids(attn_block_id)
+        if not mamba_block_ids:
+            return True, []
+
+        lookup_result = mamba_store.lookup(mamba_block_ids)
+        if all(lookup_result):
+            return True, mamba_block_ids
+        return False, []
+
     def _create_store(
-        self, kv_cache_layout: Optional[KVCacheLayout]
+        self, kv_cache_layout: Optional[KVCacheLayout], store_kind: StoreKind
     ) -> UcmKVStoreBaseV1:
         if len(self.connector_configs) != 1:
             raise RuntimeError(
@@ -384,17 +487,28 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
         if "storage_backends" in config:
             backends = [path for path in config["storage_backends"].split(":")]
             config["storage_backends"] = backends
-        config["unique_id"] = f"{self.engine_id}"
+        config["unique_id"] = f"{self.engine_id}:{store_kind.value}"
         if self._role == KVConnectorRole.WORKER:
             config["device_id"] = self.local_rank
             config["tensor_size_list"] = (
-                kv_cache_layout.tensor_size_list * self.blocks_per_chunk
+                kv_cache_layout.tensor_size_list(store_kind) * self.blocks_per_chunk
             )
-            config["shard_size"] = kv_cache_layout.shard_size * self.blocks_per_chunk
-            config["block_size"] = kv_cache_layout.block_size * self.blocks_per_chunk
+            config["shard_size"] = kv_cache_layout.shard_size(store_kind) * self.blocks_per_chunk
+            config["block_size"] = kv_cache_layout.block_size(store_kind) * self.blocks_per_chunk
             config["local_rank_size"] = self.tp_size if self.is_mla else 1
         logger.info(f"create {name} with config: {config}")
         return UcmConnectorFactoryV1.create_connector(name, config, module_path)
+
+    def _create_stores(
+        self, kv_cache_layout: Optional[KVCacheLayout]
+    ) -> dict[StoreKind, UcmKVStoreBaseV1]:
+        store_kinds = (
+            kv_cache_layout.store_kinds if kv_cache_layout is not None else [StoreKind.ATTENTION]
+        )
+        return {
+            store_kind: self._create_store(kv_cache_layout, store_kind)
+            for store_kind in store_kinds
+        }
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         if has_ucm_sparse() and os.getenv("VLLM_HASH_ATTENTION") == "1":
@@ -418,14 +532,15 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
             getattr(self, "kv_cache_config", None),
         )
         self.kv_cache_layout.initialize_kv_cache_layout(self.kv_caches)
-        self.block_data_size = self.kv_cache_layout.block_size
+        self.block_data_size = self.kv_cache_layout.block_size()
 
         self.layer_name_to_id = {
             name: self._extract_layer_index(name) for name in self.kv_caches.keys()
         }
         self.first_layer_id = next(iter(self.layer_name_to_id.values()))
 
-        self.store = self._create_store(self.kv_cache_layout)
+        self.stores = self._create_stores(self.kv_cache_layout)
+        self.store = self.stores[self.kv_cache_layout.default_store_kind]
         self.device = create_device()
         if self.device is None:
             raise RuntimeError(f"Unsupported device platform for UCMDirectConnector.")
@@ -441,12 +556,23 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
         ucm_block_ids = self.generate_hash(
             self.block_size, request.all_token_ids, self._seed
         )
-
         external_block_ids = ucm_block_ids[hbm_hit_block_num:]
         if not external_block_ids:
             return 0, False
+        mamba_block_ids: list[bytes] = []
         try:
-            external_hit_blocks = self.store.lookup_on_prefix(external_block_ids) + 1
+            if self.kv_cache_layout.is_hybrid:
+                attn_store = self.stores.get(StoreKind.ATTENTION, self.store)
+                external_hit_blocks = attn_store.lookup_on_prefix(external_block_ids) + 1
+            else:
+                external_hit_blocks = self.store.lookup_on_prefix(external_block_ids) + 1
+            if self.kv_cache_layout.is_hybrid and external_hit_blocks > 0:
+                last_hit_attn_block_id = external_block_ids[external_hit_blocks - 1]
+                mamba_hit, mamba_block_ids = self._validate_attn_hit_with_mamba(
+                    last_hit_attn_block_id
+                )
+                if not mamba_hit:
+                    external_hit_blocks = 0
         except RuntimeError as e:
             external_hit_blocks = 0
             logger.error(f"request {request.request_id} look up error. {e}")
@@ -474,6 +600,7 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
 
         self.requests_meta[request.request_id] = RequestMeta(
             ucm_block_ids=ucm_block_ids,
+            mamba_block_ids=mamba_block_ids,
             hbm_hit_block_num=hbm_hit_block_num,
             total_hit_block_num=total_hit_block_num,
             num_token_ids=len(request.all_token_ids),
