@@ -62,19 +62,20 @@ class RequestMeta:
     num_token_ids: int = 0
     vllm_block_ids: list[int] = field(default_factory=list)
     token_processed: int = 0
+    ucm_block_ids_by_group: list[list[bytes]] = field(default_factory=list)
+    vllm_block_ids_by_group: list[list[int]] = field(default_factory=list)
 
-
-@dataclass
-class RequestDispatchMeta:
-    load_block_ids: tuple[
-        list[bytes], list[int]
-    ]  # [0] mean ucm_block_ids, [1] means vllm_block_ids
-    dump_block_ids: tuple[list[bytes], list[int]]
 
 class StoreKind(Enum):
     ATTENTION = "attention"
     MAMBA = "mamba"
     UNKNOWN = "unknown"
+
+
+@dataclass
+class RequestDispatchMeta:
+    load_block_ids: dict[StoreKind, tuple[list[bytes], list[list[int]]]]
+    dump_block_ids: dict[StoreKind, tuple[list[bytes], list[list[int]]]]
 
 
 @dataclass
@@ -496,6 +497,11 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
             config["shard_size"] = kv_cache_layout.shard_size(store_kind) * self.blocks_per_chunk
             config["block_size"] = kv_cache_layout.block_size(store_kind) * self.blocks_per_chunk
             config["local_rank_size"] = self.tp_size if self.is_mla else 1
+        if self.tp_rank == 0:
+            # 打印所有shard size
+            print(f"shard size of {store_kind}: {kv_cache_layout.shard_size(store_kind)}")
+            print(f"block size of {store_kind}: {kv_cache_layout.block_size(store_kind)}")
+            print(f"tensor size list of {store_kind}: {kv_cache_layout.tensor_size_list(store_kind)}")
         logger.info(f"create {name} with config: {config}")
         return UcmConnectorFactoryV1.create_connector(name, config, module_path)
 
@@ -597,10 +603,25 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
         num_total_hit_tokens = total_hit_block_num * self.block_size
         if num_total_hit_tokens == request.num_tokens:
             external_hit_tokens -= 1
+        
+        ucm_block_ids_by_group: list[list[bytes]] = []
+        group_ids_by_store = self.kv_cache_layout.group_ids_by_store
+        attn_group_ids = group_ids_by_store.get(StoreKind.ATTENTION, [])
+        mamba_group_ids = group_ids_by_store.get(StoreKind.MAMBA, [])
+        group_num = len(attn_group_ids) + len(mamba_group_ids)
+        num_blocks = len(ucm_block_ids)
+        ucm_block_ids_by_group = [None * num_blocks for _ in range(group_num)]
+        if mamba_block_ids:
+            last_idx = num_blocks - 1
+            for g, m_id in zip(mamba_group_ids, mamba_block_ids):
+                ucm_block_ids_by_group[g][last_idx] = m_id
+        for g in attn_group_ids:
+            ucm_block_ids_by_group[g] = list(ucm_block_ids)
 
         self.requests_meta[request.request_id] = RequestMeta(
             ucm_block_ids=ucm_block_ids,
             mamba_block_ids=mamba_block_ids,
+            ucm_block_ids_by_group=ucm_block_ids_by_group,
             hbm_hit_block_num=hbm_hit_block_num,
             total_hit_block_num=total_hit_block_num,
             num_token_ids=len(request.all_token_ids),
@@ -614,11 +635,32 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
     ):
         pass
 
+    def flatten_block_ids_by_group(
+        self,
+        block_ids_by_group: list[list[Any]],
+    ) -> list[Any]:
+        flattened = []
+
+        if isinstance(block_ids_by_group, dict):
+            for gid in sorted(block_ids_by_group.keys()):
+                for val in block_ids_by_group[gid]:
+                    if val is None or val == 0:
+                        continue
+                    flattened.append(val)
+        else:
+            for _gid, row in enumerate(block_ids_by_group):
+                for val in row:
+                    if val is None or val == 0:
+                        continue
+                    flattened.append(val)
+
+        return flattened
+
     def _generate_dispatch_meta(
         self,
         req_meta: RequestMeta,
         new_tokens: int,
-        vllm_block_ids: list[int],
+        vllm_block_ids: list[list[int]],
         need_load: bool = True,
     ) -> RequestDispatchMeta:
         """
@@ -635,26 +677,66 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
 
         hbm_hit_block_num = req_meta.hbm_hit_block_num
         total_hit_block_num = req_meta.total_hit_block_num
-        ucm_block_ids = req_meta.ucm_block_ids
-        req_meta.vllm_block_ids.extend(vllm_block_ids)
+        group_num = len(req_meta.ucm_block_ids_by_group)
+        if len(req_meta.vllm_block_ids_by_group) == 0:
+            req_meta.vllm_block_ids_by_group = tuple[list[int], ...]([[] for _ in range(group_num)])
+        
+        vllm_block_ids_by_group = list(vllm_block_ids_by_group)
+        for target, source in zip(req_meta.vllm_block_ids_by_group, vllm_block_ids_by_group):
+            target.extend(source)
 
-        load_ucm_block_ids, load_vllm_block_ids = [], []
-        dump_ucm_block_ids, dump_vllm_block_ids = [], []
+        load_block_ids: dict[StoreKind, tuple[list[bytes], list[list[int]]]] = {}
+        dump_block_ids: dict[StoreKind, tuple[list[bytes], list[list[int]]]] = {}
+
+        group_ids_by_store = self.kv_cache_layout.group_ids_by_store
+        attn_group_ids = group_ids_by_store.get(StoreKind.ATTENTION, [])
+        mamba_group_ids = group_ids_by_store.get(StoreKind.MAMBA, [])
+
         if need_load:
-            load_ucm_block_ids = ucm_block_ids[hbm_hit_block_num:total_hit_block_num]
-            load_vllm_block_ids = vllm_block_ids[hbm_hit_block_num:total_hit_block_num]
+            for store_kind, store in self.stores.items():
+                if store_kind == StoreKind.ATTENTION:
+                    group_ids = attn_group_ids
+                elif store_kind == StoreKind.MAMBA:
+                    group_ids = mamba_group_ids
+                ucm_block_ids = self.flatten_block_ids_by_group(
+                    [
+                        req_meta.ucm_block_ids_by_group[gid][hbm_hit_block_num:total_hit_block_num]
+                        for gid in group_ids
+                    ]
+                )
+                vllm_block_ids = self.flatten_block_ids_by_group(
+                    [
+                        vllm_block_ids_by_group[gid][hbm_hit_block_num:total_hit_block_num]
+                        for gid in group_ids
+                    ]
+                )
+                load_block_ids[store_kind] = (ucm_block_ids, vllm_block_ids)
 
         if req_meta.token_processed < req_meta.num_token_ids:
             start_idx = req_meta.token_processed // self.block_size
             end_idx = (req_meta.token_processed + new_tokens) // self.block_size
-            dump_ucm_block_ids = ucm_block_ids[start_idx:end_idx]
-            dump_vllm_block_ids = req_meta.vllm_block_ids[start_idx:end_idx]
+
+            for store_kind, store in self.stores.items():
+                if store_kind == StoreKind.ATTENTION:
+                    group_ids = attn_group_ids
+                elif store_kind == StoreKind.MAMBA:
+                    group_ids = mamba_group_ids
+                ucm_block_ids = self.flatten_block_ids_by_group(
+                    [
+                        req_meta.ucm_block_ids_by_group[gid][start_idx:end_idx]
+                        for gid in group_ids
+                    ]
+                )
+                vllm_block_ids = self.flatten_block_ids_by_group(
+                    [
+                        vllm_block_ids_by_group[gid][start_idx:end_idx]
+                        for gid in group_ids
+                    ]
+                )
+                dump_block_ids[store_kind] = (ucm_block_ids, vllm_block_ids)
             req_meta.token_processed += new_tokens
 
-        return RequestDispatchMeta(
-            (load_ucm_block_ids, load_vllm_block_ids),
-            (dump_ucm_block_ids, dump_vllm_block_ids),
-        )
+        return RequestDispatchMeta(load_block_ids, dump_block_ids)
 
     def build_connector_meta(
         self, scheduler_output: SchedulerOutput
@@ -662,13 +744,13 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
         requests_dispatch_meta = {}
         # for new request, we need to load and dump
         for request in scheduler_output.scheduled_new_reqs:
-            request_id, vllm_block_ids = request.req_id, request.block_ids[0]
+            request_id = request.req_id
             req_meta = self.requests_meta.get(request_id)
             if req_meta:
                 requests_dispatch_meta[request_id] = self._generate_dispatch_meta(
                     req_meta,
                     scheduler_output.num_scheduled_tokens[request_id],
-                    vllm_block_ids,
+                    list(request.block_ids),
                 )
 
         # for cached request, there are 3 situation:
@@ -681,9 +763,9 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
             for i, request_id in enumerate(scheduled_cached_reqs.req_ids):
                 req_meta = self.requests_meta.get(request_id)
                 if req_meta:
-                    new_block_ids = []
-                    if scheduled_cached_reqs.new_block_ids[i] != None:
-                        new_block_ids = scheduled_cached_reqs.new_block_ids[i][0]
+                    new_block_ids: list[list[int]] = []
+                    if scheduled_cached_reqs.new_block_ids[i] is not None:
+                        new_block_ids = list(scheduled_cached_reqs.new_block_ids[i])
                     if hasattr(scheduled_cached_reqs, "resumed_from_preemption"):
                         resumed_from_preemption = (
                             scheduled_cached_reqs.resumed_from_preemption[i]
@@ -706,7 +788,7 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
                     requests_dispatch_meta[request_id] = self._generate_dispatch_meta(
                         req_meta,
                         scheduler_output.num_scheduled_tokens[request_id],
-                        request.new_block_ids[0],
+                        list(request.new_block_ids),
                         request.resumed_from_preemption,
                     )
 
@@ -730,45 +812,45 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
         metadata = self._get_connector_metadata()
         assert isinstance(metadata, UCMConnectorMetadata)
 
-        request_to_task: dict[str, Task] = {}
+        pending_tasks: list[tuple["UcmKVStoreBaseV1", str, Task]] = []
         is_load = False
         num_loaded_block = 0
         num_loaded_request = 0
         load_start_time = time.perf_counter() * 1000
         for request_id, request in metadata.request_meta.items():
-            if len(request.load_block_ids[0]) == 0:
+            if not request.load_block_ids:
                 continue
             is_load = True
-            num_loaded_block += len(request.load_block_ids[0])
-            num_loaded_request += 1
+            for store_kind, (ucm_ids, vllm_ids) in request.load_block_ids.items():
+                store = self.stores.get(store_kind)
+                num_loaded_block += len(ucm_ids)
+                num_loaded_request += 1
 
-            ucm_block_ids, vllm_block_ids = request.load_block_ids
-            if self.tp_rank != 0 and not self.is_mla:
-                for i, ucm_block_id in enumerate(ucm_block_ids):
-                    ucm_block_ids[i] = self.request_hasher(ucm_block_id)
-            total_ptrs = self.kv_cache_layout.extract_block_addrs(vllm_block_ids)
-            total_ptrs = total_ptrs.reshape(total_ptrs.shape[0], -1)
-            shard_indexs = [0] * len(ucm_block_ids)
-            try:
-                task = self.store.load_data(ucm_block_ids, shard_indexs, total_ptrs)
-                request_to_task[request_id] = task
-            except RuntimeError as e:
-                logger.error(f"request {request_id} submit load task error. {e}")
-                self._invalid_block_ids.update(
-                    metadata.request_meta[request_id].load_block_ids[1]
-                )
-                num_loaded_block -= len(request.load_block_ids[0])
+                if self.tp_rank != 0 and not self.is_mla:
+                    for i, ucm_id in enumerate(ucm_ids):
+                        ucm_ids[i] = self.request_hasher(ucm_id)
 
-        for request_id, task in request_to_task.items():
+                total_ptrs = self.kv_cache_layout.extract_block_addrs(vllm_ids, store_kind)
+                total_ptrs = total_ptrs.reshape(total_ptrs.shape[0], -1)
+                shard_idxs = [0] * len(ucm_ids)
+                try:
+                    task = store.load_data(ucm_ids, shard_idxs, total_ptrs)
+                    pending_tasks.append((store, request_id, task))
+                except RuntimeError as e:
+                    logger.error(f"request {request_id} submit load task error. {e}")
+                    self._invalid_block_ids.update(vllm_ids)
+                    num_loaded_block -= len(ucm_ids)
+
+        for store, request_id, task in pending_tasks:
             try:
-                self.store.wait(task)
+                store.wait(task)
             except RuntimeError as e:
                 logger.error(f"request {request_id} wait load task error. {e}")
                 self._invalid_block_ids.update(
-                    metadata.request_meta[request_id].load_block_ids[1]
+                    metadata.request_meta[request_id].load_block_ids[store_kind][1]
                 )
                 num_loaded_block -= len(
-                    metadata.request_meta[request_id].load_block_ids[0]
+                    metadata.request_meta[request_id].load_block_ids[store_kind][0]
                 )
 
         load_end_time = time.perf_counter() * 1000
@@ -819,43 +901,42 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
         metadata = self._get_connector_metadata()
         assert isinstance(metadata, UCMConnectorMetadata)
 
-        dump_tasks: List[Task] = []
+        dump_tasks: list[tuple["UcmKVStoreBaseV1", Task]] = []
         is_save = False
         num_saved_block = 0
         num_saved_request = 0
         total_ucm_block_ids, total_vllm_block_ids = [], []
         for request_id, request in metadata.request_meta.items():
-            if len(request.dump_block_ids[0]) == 0:
+            if not request.dump_block_ids:
                 continue
-            is_save = True
-            num_saved_block += len(request.dump_block_ids[0])
-            num_saved_request += 1
+            for store_kind, (ucm_block_ids, vllm_block_ids) in request.dump_block_ids.items():
+                store = self.stores.get(store_kind, self.store)
+                is_save = True
+                num_saved_block += len(ucm_block_ids)
+                num_saved_request += 1
 
-            ucm_block_ids, vllm_block_ids = request.dump_block_ids
-            if self.tp_rank != 0:
-                for i, ucm_block_id in enumerate(ucm_block_ids):
-                    ucm_block_ids[i] = self.request_hasher(ucm_block_id)
-            total_ucm_block_ids.extend(ucm_block_ids)
-            total_vllm_block_ids.extend(vllm_block_ids)
+                ucm_ids = list(ucm_block_ids)
+                if self.tp_rank != 0:
+                    for i, ucm_block_id in enumerate(ucm_ids):
+                        ucm_ids[i] = self.request_hasher(ucm_block_id)
 
-        if is_save:
-            total_ptrs = self.kv_cache_layout.extract_block_addrs(total_vllm_block_ids)
-            total_ptrs = total_ptrs.reshape(total_ptrs.shape[0], -1)
-            shard_indexs = [0] * len(total_ucm_block_ids)
+                total_ptrs = self.kv_cache_layout.extract_block_addrs(vllm_block_ids, store_kind)
+                total_ptrs = total_ptrs.reshape(total_ptrs.shape[0], -1)
+                shard_indexs = [0] * len(ucm_ids)
+                try:
+                    event_handle = self._get_dump_event_handle()
+                    save_start_time = time.perf_counter() * 1000
+                    task = store.dump_data(
+                        ucm_ids, shard_indexs, total_ptrs, event_handle
+                    )
+                    dump_tasks.append((store, task))
+                except RuntimeError as e:
+                    logger.error(f"dump kv cache failed. {e}")
+                    return
+
             try:
-                event_handle = self._get_dump_event_handle()
-                save_start_time = time.perf_counter() * 1000
-                task = self.store.dump_data(
-                    total_ucm_block_ids, shard_indexs, total_ptrs, event_handle
-                )
-                dump_tasks.append(task)
-            except RuntimeError as e:
-                logger.error(f"dump kv cache failed. {e}")
-                return
-
-            try:
-                for task in dump_tasks:
-                    self.store.wait(task)
+                for store, task in dump_tasks:
+                    store.wait(task)
                 save_end_time = time.perf_counter() * 1000
             except RuntimeError as e:
                 logger.error(f"wait for dump kv cache failed.{e}")
