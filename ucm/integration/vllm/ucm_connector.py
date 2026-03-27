@@ -147,7 +147,7 @@ class KVCacheLayout:
         if isinstance(kv_cache_spec, AttentionSpec):
             return StoreKind.ATTENTION
         return StoreKind.UNKNOWN
-
+ 
     def _initialize_kv_cache_config(self):
         discovered_store_kinds: list[StoreKind] = []
         for group_id, kv_cache_group_spec in enumerate(self.kv_cache_config.kv_cache_groups):
@@ -292,6 +292,14 @@ class KVCacheLayout:
                 f"stride_lists {layout.stride_lists.shape}, "
                 f"tensor_size_lists {layout.tensor_size_lists.shape}"
             )
+        
+        if torch.distributed.get_rank() == 0:
+            # 打印每个store_kind的base_ptrs, stride_lists, tensor_size_lists
+            for store_kind, layout in self.layouts.items():
+                logger.info(f"store_kind: {store_kind}")
+                logger.info(f"base_ptrs: {layout.base_ptrs}")
+                logger.info(f"stride_lists: {layout.stride_lists}")
+                logger.info(f"tensor_size_lists: {layout.tensor_size_lists}")
 
     def get_layout(self, store_kind: Optional[StoreKind] = None) -> SingleStoreLayout:
         resolved_store_kind = store_kind or self.default_store_kind
@@ -357,6 +365,7 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
         )
         self.tp_size = self._vllm_config.parallel_config.tensor_parallel_size
         self.kv_cache_dtype: torch.dtype = None
+        self.kv_cache_config = kv_cache_config
 
         if current_platform.is_cuda_alike():
             logger.info("CUDA device is available.")
@@ -396,8 +405,9 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
             scheduler_layout = KVCacheLayout(
                 self._vllm_config,
                 self.use_layerwise,
-                getattr(self, "kv_cache_config", None),
+                self.kv_cache_config,
             )
+            self.kv_cache_layout = scheduler_layout
             self.stores = self._create_stores(scheduler_layout)
             self.store = self.stores[scheduler_layout.default_store_kind]
         else:
@@ -445,8 +455,6 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
         return ret
 
     def _generate_mamba_block_ids(self, attn_block_id: bytes) -> list[bytes]:
-        if not hasattr(self, "kv_cache_layout"):
-            return []
         mamba_group_ids = self.kv_cache_layout.group_ids_by_store.get(
             StoreKind.MAMBA, []
         )
@@ -455,21 +463,19 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
             for group_id in mamba_group_ids
         ]
 
-    def _validate_attn_hit_with_mamba(
-        self, attn_block_id: bytes
-    ) -> tuple[bool, list[bytes]]:
+    def _validate_attn_hit_with_mamba(self, attn_block_id: bytes) -> bool:
         mamba_store = self.stores.get(StoreKind.MAMBA)
         if mamba_store is None:
-            return True, []
+            return True
 
         mamba_block_ids = self._generate_mamba_block_ids(attn_block_id)
         if not mamba_block_ids:
-            return True, []
+            return True
 
         lookup_result = mamba_store.lookup(mamba_block_ids)
         if all(lookup_result):
-            return True, mamba_block_ids
-        return False, []
+            return True
+        return False
 
     def _create_store(
         self, kv_cache_layout: Optional[KVCacheLayout], store_kind: StoreKind
@@ -497,11 +503,14 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
             config["shard_size"] = kv_cache_layout.shard_size(store_kind) * self.blocks_per_chunk
             config["block_size"] = kv_cache_layout.block_size(store_kind) * self.blocks_per_chunk
             config["local_rank_size"] = self.tp_size if self.is_mla else 1
-        if self.tp_rank == 0:
-            # 打印所有shard size
-            print(f"shard size of {store_kind}: {kv_cache_layout.shard_size(store_kind)}")
-            print(f"block size of {store_kind}: {kv_cache_layout.block_size(store_kind)}")
-            print(f"tensor size list of {store_kind}: {kv_cache_layout.tensor_size_list(store_kind)}")
+            if self.tp_rank == 0 and store_kind in kv_cache_layout.layouts:
+                logger.info(
+                    "layout[%s]: shard size=%s, block size=%s, tensor size list=%s",
+                    store_kind,
+                    kv_cache_layout.shard_size(store_kind),
+                    kv_cache_layout.block_size(store_kind),
+                    kv_cache_layout.tensor_size_list(store_kind),
+                )
         logger.info(f"create {name} with config: {config}")
         return UcmConnectorFactoryV1.create_connector(name, config, module_path)
 
@@ -535,7 +544,7 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
         self.kv_cache_layout = KVCacheLayout(
             self._vllm_config,
             self.use_layerwise,
-            getattr(self, "kv_cache_config", None),
+            self.kv_cache_config,
         )
         self.kv_cache_layout.initialize_kv_cache_layout(self.kv_caches)
         self.block_data_size = self.kv_cache_layout.block_size()
@@ -562,10 +571,28 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
         ucm_block_ids = self.generate_hash(
             self.block_size, request.all_token_ids, self._seed
         )
+        mamba_block_ids: list[bytes] = []
+        if self.kv_cache_layout.is_hybrid:
+            last_block_id = ucm_block_ids[-1]
+            mamba_block_ids = self._generate_mamba_block_ids(last_block_id)
+            ucm_block_ids_by_group: list[list[bytes]] = []
+        group_ids_by_store = self.kv_cache_layout.group_ids_by_store
+        attn_group_ids = group_ids_by_store.get(StoreKind.ATTENTION, [])
+        mamba_group_ids = group_ids_by_store.get(StoreKind.MAMBA, [])
+        group_num = len(attn_group_ids) + len(mamba_group_ids)
+        num_blocks = len(ucm_block_ids)
+        ucm_block_ids_by_group = [[None] * num_blocks for _ in range(group_num)]
+        if mamba_block_ids:
+            last_idx = num_blocks - 1
+            for g, m_id in zip(mamba_group_ids, mamba_block_ids):
+                ucm_block_ids_by_group[g][last_idx] = m_id
+        for g in attn_group_ids:
+            ucm_block_ids_by_group[g] = list(ucm_block_ids)
+
         external_block_ids = ucm_block_ids[hbm_hit_block_num:]
         if not external_block_ids:
             return 0, False
-        mamba_block_ids: list[bytes] = []
+        
         try:
             if self.kv_cache_layout.is_hybrid:
                 attn_store = self.stores.get(StoreKind.ATTENTION, self.store)
@@ -574,9 +601,7 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
                 external_hit_blocks = self.store.lookup_on_prefix(external_block_ids) + 1
             if self.kv_cache_layout.is_hybrid and external_hit_blocks > 0:
                 last_hit_attn_block_id = external_block_ids[external_hit_blocks - 1]
-                mamba_hit, mamba_block_ids = self._validate_attn_hit_with_mamba(
-                    last_hit_attn_block_id
-                )
+                mamba_hit = self._validate_attn_hit_with_mamba(last_hit_attn_block_id)
                 if not mamba_hit:
                     external_hit_blocks = 0
         except RuntimeError as e:
@@ -603,20 +628,6 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
         num_total_hit_tokens = total_hit_block_num * self.block_size
         if num_total_hit_tokens == request.num_tokens:
             external_hit_tokens -= 1
-        
-        ucm_block_ids_by_group: list[list[bytes]] = []
-        group_ids_by_store = self.kv_cache_layout.group_ids_by_store
-        attn_group_ids = group_ids_by_store.get(StoreKind.ATTENTION, [])
-        mamba_group_ids = group_ids_by_store.get(StoreKind.MAMBA, [])
-        group_num = len(attn_group_ids) + len(mamba_group_ids)
-        num_blocks = len(ucm_block_ids)
-        ucm_block_ids_by_group = [None * num_blocks for _ in range(group_num)]
-        if mamba_block_ids:
-            last_idx = num_blocks - 1
-            for g, m_id in zip(mamba_group_ids, mamba_block_ids):
-                ucm_block_ids_by_group[g][last_idx] = m_id
-        for g in attn_group_ids:
-            ucm_block_ids_by_group[g] = list(ucm_block_ids)
 
         self.requests_meta[request.request_id] = RequestMeta(
             ucm_block_ids=ucm_block_ids,
@@ -679,9 +690,9 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
         total_hit_block_num = req_meta.total_hit_block_num
         group_num = len(req_meta.ucm_block_ids_by_group)
         if len(req_meta.vllm_block_ids_by_group) == 0:
-            req_meta.vllm_block_ids_by_group = tuple[list[int], ...]([[] for _ in range(group_num)])
-        
-        vllm_block_ids_by_group = list(vllm_block_ids_by_group)
+            req_meta.vllm_block_ids_by_group = [[] for _ in range(group_num)]
+
+        vllm_block_ids_by_group = list(vllm_block_ids)
         for target, source in zip(req_meta.vllm_block_ids_by_group, vllm_block_ids_by_group):
             target.extend(source)
 
@@ -710,7 +721,8 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
                         for gid in group_ids
                     ]
                 )
-                load_block_ids[store_kind] = (ucm_block_ids, vllm_block_ids)
+                if ucm_block_ids and vllm_block_ids:
+                    load_block_ids[store_kind] = (ucm_block_ids, vllm_block_ids)
 
         if req_meta.token_processed < req_meta.num_token_ids:
             start_idx = req_meta.token_processed // self.block_size
@@ -733,7 +745,8 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
                         for gid in group_ids
                     ]
                 )
-                dump_block_ids[store_kind] = (ucm_block_ids, vllm_block_ids)
+                if ucm_block_ids and vllm_block_ids:
+                    dump_block_ids[store_kind] = (ucm_block_ids, vllm_block_ids)
             req_meta.token_processed += new_tokens
 
         return RequestDispatchMeta(load_block_ids, dump_block_ids)
@@ -823,6 +836,14 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
             is_load = True
             for store_kind, (ucm_ids, vllm_ids) in request.load_block_ids.items():
                 store = self.stores.get(store_kind)
+                # if self.tp_rank == 0 and (len(ucm_ids) == 0 or len(vllm_ids) == 0):
+                #     logger.info(
+                #         "skip empty load blocks for request %s, store %s, ucm_ids=%s, vllm_ids=%s",
+                #         request_id,
+                #         store_kind,
+                #         ucm_ids,
+                #         vllm_ids,
+                #     )
                 num_loaded_block += len(ucm_ids)
                 num_loaded_request += 1
 
@@ -831,6 +852,10 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
                         ucm_ids[i] = self.request_hasher(ucm_id)
 
                 total_ptrs = self.kv_cache_layout.extract_block_addrs(vllm_ids, store_kind)
+                if self.tp_rank == 0:
+                    logger.info(f"load vllm block ids: {vllm_ids}")
+                    logger.info(f"load ucm block ids: {ucm_ids}")
+                    logger.info(f"total_ptrs: {total_ptrs}")
                 total_ptrs = total_ptrs.reshape(total_ptrs.shape[0], -1)
                 shard_idxs = [0] * len(ucm_ids)
                 try:
@@ -905,7 +930,7 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
         is_save = False
         num_saved_block = 0
         num_saved_request = 0
-        total_ucm_block_ids, total_vllm_block_ids = [], []
+        save_start_time = 0.0
         for request_id, request in metadata.request_meta.items():
             if not request.dump_block_ids:
                 continue
@@ -921,6 +946,11 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
                         ucm_ids[i] = self.request_hasher(ucm_block_id)
 
                 total_ptrs = self.kv_cache_layout.extract_block_addrs(vllm_block_ids, store_kind)
+                if self.tp_rank == 0:
+                    logger.info(f"save vllm block ids: {vllm_block_ids}")
+                    logger.info(f"save ucm block ids: {ucm_ids}")
+                    logger.info(f"total_ptrs: {total_ptrs}")
+
                 total_ptrs = total_ptrs.reshape(total_ptrs.shape[0], -1)
                 shard_indexs = [0] * len(ucm_ids)
                 try:
@@ -934,6 +964,7 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
                     logger.error(f"dump kv cache failed. {e}")
                     return
 
+        if is_save:
             try:
                 for store, task in dump_tasks:
                     store.wait(task)
@@ -949,6 +980,13 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
                 / 1024
                 / 1024
             )  # GB/s
+            logger.info(
+                "dump finished: requests=%s, blocks=%s, duration_ms=%s, speed_MBps=%s",
+                num_saved_request,
+                num_saved_block,
+                save_end_time - save_start_time,
+                save_speed,
+            )
             if self.metrics_config:
                 ucmmetrics.update_stats(
                     {
@@ -1400,7 +1438,7 @@ class UCMConnector(KVConnectorBase_V1, SupportsHMA):
         ):
             self.connector = UCMLayerWiseConnector(vllm_config, role)
         else:
-            self.connector = UCMDirectConnector(vllm_config, role)
+            self.connector = UCMDirectConnector(vllm_config, role, kv_cache_config)
 
     def get_num_new_matched_tokens(
         self,
