@@ -22,6 +22,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 #
+import mmap
 import os
 import secrets
 import tempfile
@@ -30,6 +31,21 @@ import time
 import numpy as np
 
 from ucm.store.pipeline.connector import UcmPipelineStore
+
+
+DIRECT_IO_ALIGNMENT = 4096
+
+
+def make_aligned_buffer(
+    size: int,
+    alignment: int = DIRECT_IO_ALIGNMENT,
+) -> np.ndarray:
+    mapping = mmap.mmap(-1, size + alignment)
+    raw = np.frombuffer(mapping, dtype=np.uint8)
+    offset = (-raw.ctypes.data) % alignment
+    buffer = raw[offset : offset + size]
+    assert buffer.ctypes.data % alignment == 0
+    return buffer
 
 
 def make_host_buffers(block_number: int, tensor_sizes: list[int]):
@@ -61,7 +77,7 @@ def make_cache_store(
         "cache_dump_from_host": True,
         "cache_buffer_capacity_gb": 1,
         "share_buffer_enable": True,
-        "io_direct": False,
+        "io_direct": True,
         "waiting_queue_depth": 16,
         "running_queue_depth": 1024,
         "timeout_ms": 10000,
@@ -83,7 +99,7 @@ def make_posix_reader(
         "tensor_size": shard_size,
         "shard_size": shard_size,
         "block_size": shard_size,
-        "io_direct": False,
+        "io_direct": True,
         "timeout_ms": 10000,
         "posix_data_trans_concurrency": 4,
         "posix_lookup_concurrency": 4,
@@ -108,6 +124,7 @@ def main():
     device_id = int(os.environ.get("UCM_TEST_DEVICE_ID", "0"))
     tensor_sizes = [4096, 8192, 16384]
     shard_size = sum(tensor_sizes)
+    assert shard_size % DIRECT_IO_ALIGNMENT == 0
     block_number = 8
     block_ids = [secrets.token_bytes(16) for _ in range(block_number)]
     shard_indexes = [0] * block_number
@@ -126,7 +143,7 @@ def main():
         wait_until_committed(posix_reader, block_ids)
 
         destination_buffers = [
-            np.zeros(shard_size, dtype=np.uint8) for _ in range(block_number)
+            make_aligned_buffer(shard_size) for _ in range(block_number)
         ]
         destination_addrs = [[buffer.ctypes.data] for buffer in destination_buffers]
         load_task = posix_reader.load_data(
