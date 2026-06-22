@@ -22,6 +22,7 @@
  * SOFTWARE.
  * */
 #include "posix_file.h"
+#include <cstring>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/xattr.h>
@@ -136,8 +137,10 @@ Status PosixFile::Read(void* buffer, size_t size, off64_t offset)
     }
     auto eno = errno;
     if (nBytes != static_cast<ssize_t>(size)) {
-        UC_ERROR("Failed to read file, path: {}, size: {}, offset: {}, errno: {}.", this->Path(),
-                 size, offset, eno);
+        UC_ERROR(
+            "Failed to read file, path: {}, buffer: {}, size: {}, offset: {}, result: {}, "
+            "errno: {}({}).",
+            this->Path(), buffer, size, offset, nBytes, eno, std::strerror(eno));
         return Status::OsApiError();
     }
     return Status::OK();
@@ -153,8 +156,10 @@ Status PosixFile::Write(const void* buffer, size_t size, off64_t offset)
     }
     auto eno = errno;
     if (nBytes != static_cast<ssize_t>(size)) {
-        UC_ERROR("Failed to write file, path: {}, size: {}, offset: {}, errno: {}.", this->Path(),
-                 size, offset, eno);
+        UC_ERROR(
+            "Failed to write file, path: {}, buffer: {}, size: {}, offset: {}, result: {}, "
+            "errno: {}({}).",
+            this->Path(), buffer, size, offset, nBytes, eno, std::strerror(eno));
         return Status::OsApiError();
     }
     return Status::OK();

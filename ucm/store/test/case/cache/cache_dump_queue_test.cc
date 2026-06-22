@@ -21,6 +21,8 @@
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
  * SOFTWARE.
  * */
+#include <array>
+#include <cstring>
 #include <gtest/gtest.h>
 #include "cache/cc/dump_queue.h"
 #include "detail/data_generator.h"
@@ -115,4 +117,64 @@ TEST_F(UCCacheDumpQueueTest, DumpBlockWhileBackendSubmitFailed)
     dumpQ.Submit(task, waiter);
     waiter->Wait();
     ASSERT_TRUE(failureSet.Contains(task->id));
+}
+
+TEST_F(UCCacheDumpQueueTest, DumpHostBuffers)
+{
+    using namespace UC::CacheStore;
+    constexpr size_t firstSize = 4096;
+    constexpr size_t secondSize = 8192;
+    std::array<std::byte, firstSize> first;
+    std::array<std::byte, secondSize> second;
+    first.fill(std::byte{0x12});
+    second.fill(std::byte{0x34});
+
+    UC::Test::Detail::MockStore backend;
+    EXPECT_CALL(backend, Dump)
+        .WillOnce(testing::Invoke([&](UC::Detail::TaskDesc task) {
+            EXPECT_EQ(task.size(), 1);
+            EXPECT_EQ(task[0].addrs.size(), 1);
+            auto* gathered = static_cast<std::byte*>(task[0].addrs[0]);
+            EXPECT_EQ(std::memcmp(gathered, first.data(), first.size()), 0);
+            EXPECT_EQ(std::memcmp(gathered + first.size(), second.data(), second.size()), 0);
+            return NextId();
+        }));
+    UC::Latch finish{};
+    finish.Up();
+    EXPECT_CALL(backend, Wait).WillOnce(testing::Invoke([&finish](UC::Detail::TaskHandle) {
+        finish.Done();
+        return UC::Status::OK();
+    }));
+
+    UC::HashSet<UC::Detail::TaskHandle> failureSet;
+    Config config;
+    config.storeBackend = &backend;
+    config.tensorSizes = {firstSize, secondSize};
+    config.shardSize = firstSize + secondSize;
+    config.blockSize = config.shardSize;
+    config.deviceId = 0;
+    config.bufferCapacity = config.shardSize * 1024;
+    config.uniqueId = rd.RandomString(10);
+    config.shareBufferEnable = true;
+    config.dumpFromHost = true;
+
+    TransBuffer buffer;
+    DumpQueue dumpQ;
+    auto s = buffer.Setup(config);
+    ASSERT_EQ(s, UC::Status::OK());
+    s = dumpQ.Setup(config, &failureSet, &buffer);
+    ASSERT_EQ(s, UC::Status::OK());
+
+    auto blockId = UC::Test::Detail::TypesHelper::MakeBlockId(
+        "a1b2c3d4e5f6789012345678901234ab");
+    UC::Detail::TaskDesc desc{
+        {blockId, 0, {first.data(), second.data()}}
+    };
+    auto task = std::make_shared<TransTask>(TransTask::Type::DUMP, desc);
+    auto waiter = std::make_shared<UC::Latch>();
+    dumpQ.Submit(task, waiter);
+    waiter->Wait();
+
+    ASSERT_FALSE(failureSet.Contains(task->id));
+    finish.Wait();
 }

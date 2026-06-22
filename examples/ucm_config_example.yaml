@@ -19,6 +19,11 @@ ucm_connectors:
       # cache_buffer_capacity_gb: 256
       # posix_capacity_gb: 1024
 
+      # Set to true when dump_data() receives host pointers. CacheStore gathers
+      # the buffers described by tensor_size/tensor_size_list into TransBuffer
+      # before dumping the contiguous shard to PosixStore.
+      # cache_dump_from_host: false
+
       # Enable GPUDirect RDMA transfers for CacheStore/PcStore H2D and D2H copies.
       # This requires an RDMA-capable NIC, a working GPUDirect RDMA environment,
       # and building UCM with ENABLE_GDR=1.

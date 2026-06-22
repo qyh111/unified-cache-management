@@ -1,6 +1,7 @@
 import copy
 import math
 import os
+import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Optional, Sequence, Tuple
 
@@ -253,6 +254,11 @@ class FAWALoadTask:
     store: UcmKVStoreBaseV1
     task: Task
     key_count: int
+    payload_bytes: int
+    transfer_bytes: int
+    submit_ms: float
+    wait_ms: float = 0.0
+    succeeded: bool = True
 
 
 @dataclass
@@ -301,6 +307,8 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
         self._init_group_metas()
         self.fa_store: Optional[UcmKVStoreBaseV1] = None
         self.wa_store: Optional[UcmKVStoreBaseV1] = None
+        self.load_row_payload_bytes: dict[str, int] = {"FA": 0, "WA": 0}
+        self.load_row_transfer_bytes: dict[str, int] = {"FA": 0, "WA": 0}
         self.requests_meta: dict[str, FAWARequestMeta] = {}
         self.tp_dump_tasks: dict[tuple, list[FAWADumpTask]] = {}
         self.wa_dump_block_wise = self.launch_config.get("wa_dump_block_wise", True)
@@ -641,6 +649,21 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
         self.store = self._create_fa_store(self.group_layouts, store_cores)
         self.fa_store = self.store
         self.wa_store = self._create_wa_store(self.group_layouts, store_cores)
+        self.load_row_payload_bytes["FA"] = sum(
+            self._store_tensor_size_list(self.group_layouts, self.fa_group_ids)
+        )
+        self.load_row_payload_bytes["WA"] = sum(
+            self._store_tensor_size_list(self.group_layouts, self.window_group_ids)
+        )
+        self.load_row_transfer_bytes = {
+            label: round_up(size, 4096)
+            for label, size in self.load_row_payload_bytes.items()
+        }
+        logger.info(
+            "[FAWA_LOAD] event=row_size, "
+            f"payload_bytes={self.load_row_payload_bytes}, "
+            f"transfer_bytes={self.load_row_transfer_bytes}"
+        )
 
         if worker_cores:
             try:
@@ -961,13 +984,26 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
         """Submit one store load and retain block ids for failure reporting."""
 
         shard_indices = [0] * len(keys)
+        submit_start = time.perf_counter()
         task = store.load_data(keys, shard_indices, ptrs)
+        submit_ms = (time.perf_counter() - submit_start) * 1000
+        payload_bytes = self.load_row_payload_bytes[label] * len(keys)
+        transfer_bytes = self.load_row_transfer_bytes[label] * len(keys)
+        logger.info(
+            "[FAWA_LOAD] event=submit, "
+            f"request_id={request_id}, label={label}, keys={len(keys)}, "
+            f"ptr_shape={tuple(ptrs.shape)}, payload_bytes={payload_bytes}, "
+            f"transfer_bytes={transfer_bytes}, submit_ms={submit_ms:.3f}"
+        )
         return FAWALoadTask(
             request_id=request_id,
             label=label,
             store=store,
             task=task,
             key_count=len(keys),
+            payload_bytes=payload_bytes,
+            transfer_bytes=transfer_bytes,
+            submit_ms=submit_ms,
         )
 
     def _wait_load_task(
@@ -976,9 +1012,11 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
     ) -> None:
         """Wait a load task and mark its anchor blocks invalid on failure."""
 
+        wait_start = time.perf_counter()
         try:
             load_task.store.wait(load_task.task)
         except Exception as e:
+            load_task.succeeded = False
             logger.error(
                 f"request {load_task.request_id} wait FAWA load "
                 f"task label={load_task.label} error. {type(e).__name__}: {e}"
@@ -989,6 +1027,14 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
                 affected_block_ids,
             )
             self._connector_worker_meta.mark_failed(load_task.request_id)
+        finally:
+            load_task.wait_ms = (time.perf_counter() - wait_start) * 1000
+            logger.info(
+                "[FAWA_LOAD] event=wait, "
+                f"request_id={load_task.request_id}, label={load_task.label}, "
+                f"keys={load_task.key_count}, wait_ms={load_task.wait_ms:.3f}, "
+                f"succeeded={load_task.succeeded}"
+            )
 
     def get_block_ids_with_load_errors(self) -> set[int]:
         res = self._invalid_block_ids
@@ -1092,6 +1138,7 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
         return all_group_vllm_block_ids
 
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
+        load_start = time.perf_counter()
         metadata = self._get_connector_metadata()
         if not isinstance(metadata, UCMFAWAConnectorMetadata):
             raise RuntimeError(f"Unexpected FAWA metadata type: {type(metadata)}")
@@ -1152,6 +1199,35 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
 
         for load_task in tasks:
             self._wait_load_task(load_task)
+
+        if tasks:
+            total_ms = (time.perf_counter() - load_start) * 1000
+            payload_bytes = sum(task.payload_bytes for task in tasks)
+            transfer_bytes = sum(task.transfer_bytes for task in tasks)
+            effective_gbps = (
+                transfer_bytes / (total_ms / 1000) / 1e9
+                if total_ms > 0
+                else 0.0
+            )
+            task_details = tuple(
+                (
+                    task.request_id,
+                    task.label,
+                    task.key_count,
+                    round(task.submit_ms, 3),
+                    round(task.wait_ms, 3),
+                    task.succeeded,
+                )
+                for task in tasks
+            )
+            logger.info(
+                "[FAWA_LOAD] event=complete, "
+                f"requests={len({task.request_id for task in tasks})}, "
+                f"tasks={len(tasks)}, payload_bytes={payload_bytes}, "
+                f"transfer_bytes={transfer_bytes}, total_ms={total_ms:.3f}, "
+                f"effective_gbps={effective_gbps:.3f}, "
+                f"task_details={task_details}"
+            )
 
     def wait_for_save(self) -> None:
         metadata = self._get_connector_metadata()
