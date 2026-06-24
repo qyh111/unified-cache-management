@@ -22,6 +22,9 @@
  * SOFTWARE.
  * */
 #include <gtest/gtest.h>
+#include <array>
+#include <cstdint>
+#include <cstring>
 #include "cache/cc/load_queue.h"
 #include "detail/data_generator.h"
 #include "detail/mock_store.h"
@@ -153,4 +156,66 @@ TEST_F(UCCacheLoadQueueTest, LoadWhileBackendWaitFailed)
     loadQ.Submit(task, waiter);
     waiter->Wait();
     ASSERT_TRUE(failureSet.Contains(task->id));
+}
+
+TEST_F(UCCacheLoadQueueTest, LoadHostBuffers)
+{
+    using namespace UC::CacheStore;
+    using namespace testing;
+    constexpr size_t tensorSize0 = 4096;
+    constexpr size_t tensorSize1 = 8192;
+    std::array<uint8_t, tensorSize0> expected0{};
+    std::array<uint8_t, tensorSize1> expected1{};
+    for (size_t i = 0; i < expected0.size(); i++) {
+        expected0[i] = static_cast<uint8_t>((i + 3) & 0xff);
+    }
+    for (size_t i = 0; i < expected1.size(); i++) {
+        expected1[i] = static_cast<uint8_t>((i + 29) & 0xff);
+    }
+    std::array<uint8_t, tensorSize0> dst0{};
+    std::array<uint8_t, tensorSize1> dst1{};
+
+    UC::Test::Detail::MockStore backend;
+    EXPECT_CALL(backend, Load).WillOnce(Invoke([&](UC::Detail::TaskDesc task) {
+        EXPECT_EQ(task.size(), 1);
+        EXPECT_EQ(task[0].addrs.size(), 1);
+        auto data = static_cast<uint8_t*>(task[0].addrs[0]);
+        EXPECT_NE(data, nullptr);
+        if (data != nullptr) {
+            std::memcpy(data, expected0.data(), expected0.size());
+            std::memcpy(data + expected0.size(), expected1.data(), expected1.size());
+        }
+        return NextId();
+    }));
+    EXPECT_CALL(backend, Wait).WillOnce(Return(UC::Status::OK()));
+
+    UC::HashSet<UC::Detail::TaskHandle> failureSet;
+    Config config;
+    config.storeBackend = &backend;
+    config.tensorSizes = {tensorSize0, tensorSize1};
+    config.shardSize = tensorSize0 + tensorSize1;
+    config.blockSize = config.shardSize;
+    config.deviceId = 0;
+    config.bufferCapacity = config.shardSize * 1024;
+    config.uniqueId = rd.RandomString(10);
+    config.shareBufferEnable = true;
+    config.useHostBuffer = true;
+    TransBuffer buffer;
+    LoadQueue loadQ;
+    auto s = buffer.Setup(config);
+    ASSERT_EQ(s, UC::Status::OK());
+    s = loadQ.Setup(config, &failureSet, &buffer);
+    ASSERT_EQ(s, UC::Status::OK());
+    auto blockId = UC::Test::Detail::TypesHelper::MakeBlockId("a1b2c3d4e5f6789012345678901234ab");
+    constexpr size_t shardIdx = 0;
+    UC::Detail::TaskDesc desc{
+        {blockId, shardIdx, {dst0.data(), dst1.data()}}
+    };
+    auto task = std::make_shared<TransTask>(TransTask::Type::LOAD, desc);
+    auto waiter = std::make_shared<UC::Latch>();
+    loadQ.Submit(task, waiter);
+    waiter->Wait();
+    ASSERT_FALSE(failureSet.Contains(task->id));
+    EXPECT_EQ(std::memcmp(dst0.data(), expected0.data(), expected0.size()), 0);
+    EXPECT_EQ(std::memcmp(dst1.data(), expected1.data(), expected1.size()), 0);
 }

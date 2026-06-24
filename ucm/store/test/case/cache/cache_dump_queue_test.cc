@@ -22,6 +22,7 @@
  * SOFTWARE.
  * */
 #include <array>
+#include <cstdint>
 #include <cstring>
 #include <gtest/gtest.h>
 #include "cache/cc/dump_queue.h"
@@ -122,26 +123,29 @@ TEST_F(UCCacheDumpQueueTest, DumpBlockWhileBackendSubmitFailed)
 TEST_F(UCCacheDumpQueueTest, DumpHostBuffers)
 {
     using namespace UC::CacheStore;
-    constexpr size_t firstSize = 4096;
-    constexpr size_t secondSize = 8192;
-    std::array<std::byte, firstSize> first;
-    std::array<std::byte, secondSize> second;
-    first.fill(std::byte{0x12});
-    second.fill(std::byte{0x34});
+    using namespace testing;
+    constexpr size_t tensorSize0 = 4096;
+    constexpr size_t tensorSize1 = 8192;
+    std::array<uint8_t, tensorSize0> src0{};
+    std::array<uint8_t, tensorSize1> src1{};
+    for (size_t i = 0; i < src0.size(); i++) { src0[i] = static_cast<uint8_t>(i & 0xff); }
+    for (size_t i = 0; i < src1.size(); i++) { src1[i] = static_cast<uint8_t>((i + 17) & 0xff); }
 
     UC::Test::Detail::MockStore backend;
-    EXPECT_CALL(backend, Dump)
-        .WillOnce(testing::Invoke([&](UC::Detail::TaskDesc task) {
-            EXPECT_EQ(task.size(), 1);
-            EXPECT_EQ(task[0].addrs.size(), 1);
-            auto* gathered = static_cast<std::byte*>(task[0].addrs[0]);
-            EXPECT_EQ(std::memcmp(gathered, first.data(), first.size()), 0);
-            EXPECT_EQ(std::memcmp(gathered + first.size(), second.data(), second.size()), 0);
-            return NextId();
-        }));
+    EXPECT_CALL(backend, Dump).WillOnce(Invoke([&](UC::Detail::TaskDesc task) {
+        EXPECT_EQ(task.size(), 1);
+        EXPECT_EQ(task[0].addrs.size(), 1);
+        auto data = static_cast<uint8_t*>(task[0].addrs[0]);
+        EXPECT_NE(data, nullptr);
+        if (data != nullptr) {
+            EXPECT_EQ(std::memcmp(data, src0.data(), src0.size()), 0);
+            EXPECT_EQ(std::memcmp(data + src0.size(), src1.data(), src1.size()), 0);
+        }
+        return NextId();
+    }));
     UC::Latch finish{};
     finish.Up();
-    EXPECT_CALL(backend, Wait).WillOnce(testing::Invoke([&finish](UC::Detail::TaskHandle) {
+    EXPECT_CALL(backend, Wait).WillOnce(Invoke([&](UC::Detail::TaskHandle) {
         finish.Done();
         return UC::Status::OK();
     }));
@@ -149,32 +153,29 @@ TEST_F(UCCacheDumpQueueTest, DumpHostBuffers)
     UC::HashSet<UC::Detail::TaskHandle> failureSet;
     Config config;
     config.storeBackend = &backend;
-    config.tensorSizes = {firstSize, secondSize};
-    config.shardSize = firstSize + secondSize;
+    config.tensorSizes = {tensorSize0, tensorSize1};
+    config.shardSize = tensorSize0 + tensorSize1;
     config.blockSize = config.shardSize;
     config.deviceId = 0;
     config.bufferCapacity = config.shardSize * 1024;
     config.uniqueId = rd.RandomString(10);
     config.shareBufferEnable = true;
-    config.dumpFromHost = true;
-
+    config.useHostBuffer = true;
     TransBuffer buffer;
     DumpQueue dumpQ;
     auto s = buffer.Setup(config);
     ASSERT_EQ(s, UC::Status::OK());
     s = dumpQ.Setup(config, &failureSet, &buffer);
     ASSERT_EQ(s, UC::Status::OK());
-
-    auto blockId = UC::Test::Detail::TypesHelper::MakeBlockId(
-        "a1b2c3d4e5f6789012345678901234ab");
+    auto blockId = UC::Test::Detail::TypesHelper::MakeBlockId("a1b2c3d4e5f6789012345678901234ab");
+    constexpr size_t shardIdx = 0;
     UC::Detail::TaskDesc desc{
-        {blockId, 0, {first.data(), second.data()}}
+        {blockId, shardIdx, {src0.data(), src1.data()}}
     };
     auto task = std::make_shared<TransTask>(TransTask::Type::DUMP, desc);
     auto waiter = std::make_shared<UC::Latch>();
     dumpQ.Submit(task, waiter);
     waiter->Wait();
-
     ASSERT_FALSE(failureSet.Contains(task->id));
     finish.Wait();
 }

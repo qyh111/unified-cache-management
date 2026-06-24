@@ -22,6 +22,7 @@
  * SOFTWARE.
  * */
 #include "dump_queue.h"
+#include <cstddef>
 #include <cstring>
 #include "logger/logger.h"
 #include "metrics_api.h"
@@ -45,7 +46,7 @@ Status DumpQueue::Setup(const Config& config, TaskIdSet* failureSet, TransBuffer
     tensorSizes_ = config.tensorSizes;
     streamNumber_ = config.streamNumber;
     useGdr_ = config.useGdr;
-    dumpFromHost_ = config.dumpFromHost;
+    useHostBuffer_ = config.useHostBuffer;
     cpuAffinityCores_ = config.cpuAffinityCores;
     waiting_.Setup(config.waitingQueueDepth);
     dumping_.Setup(config.runningQueueDepth);
@@ -70,7 +71,7 @@ void DumpQueue::Submit(TaskPtr task, WaiterPtr waiter)
 void DumpQueue::DispatchStage(std::promise<Status>& started)
 {
     CopyStream stream;
-    auto s = stream.Setup(deviceId_, streamNumber_, useGdr_);
+    auto s = useHostBuffer_ ? Status::OK() : stream.Setup(deviceId_, streamNumber_, useGdr_);
     started.set_value(s);
     if (s.Failure()) [[unlikely]] { return; }
     if (!cpuAffinityCores_.empty()) {
@@ -103,19 +104,8 @@ Status DumpQueue::DumpOneTask(CopyStream& stream, TaskPtr task)
     UC_DEBUG("Try to dump ({}) shards.", nShard);
     DumpCtx dumpCtx;
     dumpCtx.taskHandle = task->id;
-    if (dumpFromHost_ && task->desc.prerequisiteHandle != 0) {
-        return Status::InvalidParam("prerequisite handle is unsupported for host dump");
-    }
-    if (dumpFromHost_) {
-        for (const auto& shard : task->desc) {
-            if (shard.addrs.size() != tensorSizes_.size()) {
-                return Status::InvalidParam("invalid host buffer number({}), expected({})",
-                                            shard.addrs.size(), tensorSizes_.size());
-            }
-            for (size_t i = 0; i < shard.addrs.size(); ++i) {
-                if (!shard.addrs[i]) { return Status::InvalidParam("null host source({})", i); }
-            }
-        }
+    if (useHostBuffer_ && task->desc.prerequisiteHandle != 0) {
+        return Status::InvalidParam("prerequisite handle is unsupported for host buffer dump");
     }
     if (task->desc.prerequisiteHandle != 0) {
         auto s = stream.WaitEvent(reinterpret_cast<void*>(task->desc.prerequisiteHandle));
@@ -127,17 +117,21 @@ Status DumpQueue::DumpOneTask(CopyStream& stream, TaskPtr task)
     }
     for (size_t i = 0; i < nShard; i++) {
         auto& shard = task->desc[i];
+        if (useHostBuffer_) {
+            auto s = ValidateHostAddrs(shard);
+            if (s.Failure()) [[unlikely]] { return s; }
+        }
         auto handle = buffer_->Get(shard.owner, shard.index);
         if (!handle.Owner()) { continue; }
-        if (!handle.Ready()) {
-            auto s = dumpFromHost_
+        if (useHostBuffer_ || !handle.Ready()) {
+            auto s = useHostBuffer_
                          ? HostToHostGather(shard.addrs, handle.Data())
                          : DeviceToHostGatherAsync(stream.NextStream(), shard.addrs.data(),
                                                    handle.Data());
             if (s.Failure()) [[unlikely]] {
                 UC_ERROR("Failed({}) to gather {} buffers for task({}).", s,
-                         dumpFromHost_ ? "host" : "device", task->id);
-                if (!dumpFromHost_) {
+                         useHostBuffer_ ? "host" : "device", task->id);
+                if (!useHostBuffer_) {
                     UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("cache_d2h_errors_total"), 1.0);
                 }
                 return s;
@@ -152,7 +146,7 @@ Status DumpQueue::DumpOneTask(CopyStream& stream, TaskPtr task)
     UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("cache_dump_backend_shards_total"),
                              static_cast<double>(backendTaskDesc.size()));
     if (backendTaskDesc.empty()) { return Status::OK(); }
-    if (!dumpFromHost_) {
+    if (!useHostBuffer_) {
         auto s = stream.Synchronize();
         if (s.Failure()) [[unlikely]] {
             UC_ERROR("Failed({}) to sync on stream for task({}).", s, task->id);
@@ -176,7 +170,7 @@ Status DumpQueue::DumpOneTask(CopyStream& stream, TaskPtr task)
              (tpEnd - tpSyncStream) * 1e3);
     UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("cache_dump_mkbuf_duration_ms"),
                              (tpMakeBuffer - tp) * 1e3);
-    if (!dumpFromHost_) {
+    if (!useHostBuffer_) {
         UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("cache_d2h_duration_ms"),
                                  (tpSyncStream - tpMakeBuffer) * 1e3);
     }
@@ -205,17 +199,26 @@ Status DumpQueue::DeviceToHostGatherAsync(std::shared_ptr<Trans::Stream> stream,
 
 Status DumpQueue::HostToHostGather(const std::vector<void*>& sources, void* destination)
 {
-    if (sources.size() != tensorSizes_.size()) {
-        return Status::InvalidParam("invalid host buffer number({}), expected({})", sources.size(),
-                                    tensorSizes_.size());
-    }
+    auto s = ValidateHostAddrs(Detail::Shard{{}, 0, sources});
+    if (s.Failure()) [[unlikely]] { return s; }
     if (!destination) { return Status::InvalidParam("null host destination"); }
     auto* destinationBytes = static_cast<std::byte*>(destination);
     size_t offset = 0;
     for (size_t i = 0; i < tensorSizes_.size(); ++i) {
-        if (!sources[i]) { return Status::InvalidParam("null host source({})", i); }
         std::memcpy(destinationBytes + offset, sources[i], tensorSizes_[i]);
         offset += tensorSizes_[i];
+    }
+    return Status::OK();
+}
+
+Status DumpQueue::ValidateHostAddrs(const Detail::Shard& shard) const
+{
+    if (shard.addrs.size() != tensorSizes_.size()) {
+        return Status::InvalidParam("invalid host buffer number({}), expected({})",
+                                    shard.addrs.size(), tensorSizes_.size());
+    }
+    for (size_t i = 0; i < shard.addrs.size(); ++i) {
+        if (!shard.addrs[i]) { return Status::InvalidParam("null host source({})", i); }
     }
     return Status::OK();
 }

@@ -146,13 +146,14 @@ class UcmKVStoreBaseV1(ABC):
         shard_index: List[int],
         dst_addr: List[List[int]] | np.ndarray,
     ) -> Task:
-        """Low-level fetch: copy KV data to device pointers.
+        """Low-level fetch: copy KV data to raw destination pointers.
 
         Args:
             block_ids: Block hashes to load.
             shard_index: Shard index for each block.
-            dst_addr: Double-list of ``int`` pointers (as Python ``int``) to
-                pre-allocated device buffers.
+            dst_addr: Double-list of ``int`` pointers (as Python ``int``). CacheStore
+                treats them as device pointers by default, or as host pointers when
+                ``cache_use_host_buffer`` is enabled.
 
         Returns:
             A ``Task`` handle for the asynchronous copy.
@@ -167,17 +168,17 @@ class UcmKVStoreBaseV1(ABC):
         src_addr: List[List[int]] | np.ndarray,
         prerequisite_handle: int = 0,
     ) -> Task:
-        """Low-level dump: copy KV data from source pointers.
+        """Low-level dump: copy KV data from raw source pointers.
 
         Args:
             block_ids: Block hashes to store.
             shard_index: Shard index for each block.
-            src_addr: Double-list of ``int`` pointers. These are device pointers
-                by default. CacheStore treats them as host pointers when
-                ``cache_dump_from_host`` is enabled.
+            src_addr: Double-list of ``int`` pointers. CacheStore treats them as
+                device pointers by default, or as host pointers when
+                ``cache_use_host_buffer`` is enabled.
             prerequisite_handle: Optional event handle for Python-C++ stream sync.
-                When non-zero, cache stream waits for this event before D2H.
-                It must be zero when dumping from host pointers.
+                When non-zero, cache stream waits for this event before D2H. Host
+                dump mode does not support prerequisite events.
 
         Returns:
             A ``Task`` handle for the asynchronous copy.

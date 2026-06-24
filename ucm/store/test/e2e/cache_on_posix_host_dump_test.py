@@ -74,7 +74,7 @@ def make_cache_store(
         "tensor_size_list": tensor_sizes,
         "shard_size": shard_size,
         "block_size": shard_size,
-        "cache_dump_from_host": True,
+        "cache_use_host_buffer": True,
         "cache_buffer_capacity_gb": 1,
         "share_buffer_enable": True,
         "io_direct": True,

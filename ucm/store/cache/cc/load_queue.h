@@ -58,6 +58,7 @@ private:
     std::vector<size_t> tensorSizes_{};
     size_t streamNumber_{1};
     bool useGdr_{false};
+    bool useHostBuffer_{false};
     std::vector<ssize_t> cpuAffinityCores_{};
     SpscRingQueue<TaskPair> waiting_;
     SpscRingQueue<ShardTask> running_;
@@ -78,6 +79,8 @@ private:
     Status WaitBackendTaskReady(ShardTask& task);
     Status HostToDeviceScatterAsync(std::shared_ptr<Trans::Stream> stream, void* host,
                                     void** device);
+    Status HostToHostScatter(void* hostSrc, void** hostDst);
+    Status ValidateHostAddrs(const Detail::Shard& shard) const;
 };
 
 }  // namespace UC::CacheStore

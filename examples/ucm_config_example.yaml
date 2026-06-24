@@ -16,13 +16,10 @@ ucm_connectors:
       store_pipeline: "Cache|Posix"
       storage_backends: "/mnt/test"
       io_direct: false
+      # Treat dump_data src_addr and load_data dst_addr as HostBuffer pointers.
+      # cache_use_host_buffer: false
       # cache_buffer_capacity_gb: 256
       # posix_capacity_gb: 1024
-
-      # Set to true when dump_data() receives host pointers. CacheStore gathers
-      # the buffers described by tensor_size/tensor_size_list into TransBuffer
-      # before dumping the contiguous shard to PosixStore.
-      # cache_dump_from_host: false
 
       # Enable GPUDirect RDMA transfers for CacheStore/PcStore H2D and D2H copies.
       # This requires an RDMA-capable NIC, a working GPUDirect RDMA environment,
