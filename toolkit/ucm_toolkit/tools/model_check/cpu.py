@@ -89,7 +89,7 @@ def _factory_kwargs_redirect_to_meta(kwargs: dict[str, Any]) -> dict[str, Any]:
 
 
 def make_config() -> Any:
-    return make_common_config(
+    vllm_config = make_common_config(
         model,
         tokens,
         block_size,
@@ -102,6 +102,11 @@ def make_config() -> Any:
         use_layerwise,
         "cpu",
     )
+    # CPU 平台对 MLA 模型强制禁用 prefix caching（vllm/platforms/cpu.py），
+    # 这与 UCM 的部署形态一致（UCM 接管前缀查找，本地 HBM 命中反而会绕过
+    # UCM 的 external load）。保持 False，让调度器前缀全部走 connector。
+    vllm_config.cache_config.enable_prefix_caching = False
+    return vllm_config
 
 
 # ---------------------------------------------------------------------------
@@ -141,7 +146,12 @@ def _patch_cpu_runtime() -> None:
             return None
 
     class _FakeBuilder(AttentionMetadataBuilder):
-        pass
+        def __init__(self, *a, **k):
+            pass
+
+        def build(self, *a, **k):
+            # model-check 只做 schedule（无 forward），metadata 不会被消费
+            return None
 
     class _FakeBackend(AttentionBackend):
         _mla = False
@@ -158,10 +168,12 @@ def _patch_cpu_runtime() -> None:
         def get_builder_cls(cls) -> type:
             return _FakeBuilder
 
-        @classmethod
-        def get_kv_cache_shape(cls, num_heads: int, head_size: int,
-                               num_kv_heads: int) -> tuple[int, ...]:
-            return (num_heads, num_kv_heads, head_size)
+        @staticmethod
+        def get_kv_cache_shape(num_blocks: int, block_size: int,
+                               num_kv_heads: int, head_size: int,
+                               cache_dtype_str: str = "auto",
+                               **kwargs) -> tuple[int, ...]:
+            return (num_blocks, block_size, num_kv_heads, head_size)
 
         @classmethod
         def is_mla(cls) -> bool:
