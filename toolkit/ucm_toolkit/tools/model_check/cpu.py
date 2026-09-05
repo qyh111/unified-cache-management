@@ -109,8 +109,156 @@ def make_config() -> Any:
 # ---------------------------------------------------------------------------
 
 
+def _patch_cpu_runtime() -> None:
+    """官方 vLLM CPU 构建没有 MLA/GQA attention backend 与 MLA prefill backend，
+    CPU 平台还会拒绝 torch.cuda 系列调用。布局捕获不需要 backend 实现，
+    在模型构造前注入假 backend 与占位即可（与 capture_mocked --variant official 相同）。"""
+
+    from vllm.v1.attention.backend import (
+        AttentionBackend, AttentionImpl, AttentionMetadataBuilder)
+
+    class _FakeImpl(AttentionImpl):
+        def __init__(self, num_heads, head_size, scale, num_kv_heads=None,
+                     alibi_slopes=None, sliding_window=None, kv_cache_dtype="auto",
+                     logits_soft_cap=None, attn_type="decoder",
+                     kv_sharing_target_layer_name=None, **kwargs):
+            self.num_heads = num_heads
+            self.head_size = head_size
+            self.scale = scale
+            self.num_kv_heads = num_kv_heads if num_kv_heads is not None else num_heads
+            self.alibi_slopes = alibi_slopes
+            self.sliding_window = sliding_window
+            self.kv_cache_dtype = kv_cache_dtype
+            self.logits_soft_cap = logits_soft_cap
+            self.attn_type = attn_type
+            self.q_pad_num_heads = None
+            self.is_sparse = False
+
+        def forward(self, *a, **k):
+            raise NotImplementedError("fake backend for layout capture only")
+
+        def build_kv_cache(self, *a, **k):
+            return None
+
+    class _FakeBuilder(AttentionMetadataBuilder):
+        pass
+
+    class _FakeBackend(AttentionBackend):
+        _mla = False
+
+        @classmethod
+        def get_name(cls) -> str:
+            return "FAKE_MLA" if cls._mla else "FAKE_GQA"
+
+        @classmethod
+        def get_impl_cls(cls) -> type:
+            return _FakeImpl
+
+        @classmethod
+        def get_builder_cls(cls) -> type:
+            return _FakeBuilder
+
+        @classmethod
+        def get_kv_cache_shape(cls, num_heads: int, head_size: int,
+                               num_kv_heads: int) -> tuple[int, ...]:
+            return (num_heads, num_kv_heads, head_size)
+
+        @classmethod
+        def is_mla(cls) -> bool:
+            return cls._mla
+
+        @staticmethod
+        def get_required_kv_cache_layout():
+            return None
+
+    class _FakeMLABackend(_FakeBackend):
+        _mla = True
+
+    class _FakeGQABackend(_FakeBackend):
+        _mla = False
+
+    import vllm.v1.attention.selector as sel
+
+    def _fake_get_attn_backend(head_size, dtype, kv_cache_dtype,
+                               use_mla=False, **kwargs):
+        return _FakeMLABackend if use_mla else _FakeGQABackend
+
+    sel.get_attn_backend = _fake_get_attn_backend
+    sel._cached_get_attn_backend = lambda backend, attn_selector_config, num_heads=None: (
+        _FakeMLABackend if attn_selector_config.use_mla else _FakeGQABackend)
+
+    try:
+        import vllm.v1.attention.backends.mla.prefill.selector as _sel_mod
+        import vllm.v1.attention.backends.mla.prefill as _pf_mod
+    except Exception:
+        _sel_mod = _pf_mod = None
+
+    class _FakePrefillBackend:
+        def __init__(self, *a, **k):
+            pass
+
+    if _sel_mod is not None:
+        _sel_mod.get_mla_prefill_backend = lambda *a, **k: _FakePrefillBackend
+        _pf_mod.get_mla_prefill_backend = lambda *a, **k: _FakePrefillBackend
+        import vllm.model_executor.layers.attention.mla_attention as _mla_attn_mod
+
+        _mla_attn_mod.get_mla_prefill_backend = lambda *a, **k: _FakePrefillBackend
+
+    # torch.cuda / platform capability 占位（官方模型构造会建 Stream/Event，
+    # DSV4 的 fp8 einsum recipe 查平台 capability）
+    import torch as _torch
+
+    class _FakeStream:
+        def __init__(self, *a, **k):
+            pass
+
+        def wait_stream(self, *a, **k):
+            pass
+
+        def record_stream(self, *a, **k):
+            pass
+
+        def synchronize(self, *a, **k):
+            pass
+
+        def query(self):
+            return True
+
+    class _FakeEvent:
+        def __init__(self, *a, **k):
+            pass
+
+        def record(self, *a, **k):
+            pass
+
+        def wait(self, *a, **k):
+            pass
+
+        def synchronize(self, *a, **k):
+            pass
+
+        def query(self):
+            return True
+
+    _torch.cuda.Stream = _FakeStream  # type: ignore[misc]
+    _torch.cuda.current_stream = lambda *a, **k: _FakeStream()  # type: ignore[misc]
+    _torch.cuda.Event = _FakeEvent  # type: ignore[misc]
+    _torch.cuda.current_event = lambda *a, **k: _FakeEvent()  # type: ignore[misc]
+    _torch.cuda.get_device_capability = lambda *a, **k: (10, 0)  # type: ignore[misc]
+    _torch.cuda.get_device_name = lambda *a, **k: "FAKE-CPU-SM100"  # type: ignore[misc]
+
+    from collections import namedtuple
+    from vllm.platforms import current_platform as _plat
+
+    _Cap = namedtuple("_Cap", "major minor")
+
+    _plat.get_device_capability = lambda: _Cap(10, 0)  # type: ignore[method-assign]
+
+
 def make_model(vllm_config: Any) -> tuple[Any, Any]:
     """Build the production model structure on the meta device (official vLLM)."""
+
+    _patch_cpu_runtime()
 
     from vllm.model_executor.model_loader.utils import initialize_model
 
