@@ -41,6 +41,12 @@ def _detect_platform() -> str:
     if importlib.util.find_spec("vllm_ascend") is not None:
         return "ascend"
     if importlib.util.find_spec("vllm") is not None:
+        try:
+            from importlib.metadata import version as _pkg_version
+            if "+cpu" in _pkg_version("vllm"):
+                return "cpu"
+        except Exception:
+            pass
         return "cuda"
     raise ToolkitError(
         "model-check cannot detect an installed vLLM or vLLM-Ascend stack"
@@ -129,12 +135,11 @@ class ModelCheckTool(ToolAdapter):
         if args.layerwise is not None:
             env[USE_LAYERWISE_ENV] = str(args.layerwise).lower()
         env[DEVICE_ENV] = args.device_id
-        visible_devices_env = (
-            "CUDA_VISIBLE_DEVICES"
-            if platform == "cuda"
-            else "ASCEND_RT_VISIBLE_DEVICES"
-        )
-        env[visible_devices_env] = args.device_id
+        if platform == "cuda":
+            env["CUDA_VISIBLE_DEVICES"] = args.device_id
+        elif platform == "ascend":
+            env["ASCEND_RT_VISIBLE_DEVICES"] = args.device_id
+        # cpu: no device-visibility variable needed
         module = f"{__package__}.{platform}"
         return run_command([sys.executable, "-m", module], env=env)
 
