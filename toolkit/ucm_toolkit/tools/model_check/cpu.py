@@ -88,6 +88,15 @@ def _factory_kwargs_redirect_to_meta(kwargs: dict[str, Any]) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
+def _model_uses_mamba(vllm_config: Any) -> bool:
+    """Kimi-K3 等 hybrid（mamba+MLA）模型必须保持 prefix caching 开启：
+    vllm 0.27 的 VllmConfig 校验要求 ``mamba_block_size`` 与 prefix caching
+    同时存在，且 mamba 'align' 模式本身依赖 prefix caching（与官方
+    capture 的布局一致）。hybrid 判定以 ModelConfig.is_hybrid 为准
+    （hf config 里不一定有 mamba_block_size 字段）。"""
+    return bool(getattr(getattr(vllm_config, "model_config", None), "is_hybrid", False))
+
+
 def make_config() -> Any:
     vllm_config = make_common_config(
         model,
@@ -102,10 +111,13 @@ def make_config() -> Any:
         use_layerwise,
         "cpu",
     )
-    # CPU 平台对 MLA 模型强制禁用 prefix caching（vllm/platforms/cpu.py），
-    # 这与 UCM 的部署形态一致（UCM 接管前缀查找，本地 HBM 命中反而会绕过
-    # UCM 的 external load）。保持 False，让调度器前缀全部走 connector。
-    vllm_config.cache_config.enable_prefix_caching = False
+    # CPU 平台对 MLA 模型强制禁用 chunked prefill（vllm/platforms/cpu.py），
+    # prefix caching 需与 UCM 的部署形态一致（UCM 接管前缀查找，本地 HBM
+    # 命中反而会绕过 UCM 的 external load）——对 MLA 模型默认关闭。
+    # 例外：带 mamba_block_size 的模型（Kimi-K3）必须显式开启（vllm 0.27
+    # VllmConfig 校验：mamba-block-size 只能与 prefix caching 同时设置，
+    # 且 mamba 'align' 模式本身依赖 prefix caching）。
+    vllm_config.cache_config.enable_prefix_caching = _model_uses_mamba(vllm_config)
     return vllm_config
 
 
@@ -168,12 +180,15 @@ def _patch_cpu_runtime() -> None:
         def get_builder_cls(cls) -> type:
             return _FakeBuilder
 
-        @staticmethod
-        def get_kv_cache_shape(num_blocks: int, block_size: int,
-                               num_kv_heads: int, head_size: int,
-                               cache_dtype_str: str = "auto",
-                               **kwargs) -> tuple[int, ...]:
-            return (num_blocks, block_size, num_kv_heads, head_size)
+        @classmethod
+        def get_kv_cache_shape(cls, num_blocks, block_size,
+                               num_kv_heads, head_size,
+                               cache_dtype_str="auto", **kwargs):
+            # vllm 0.27 按 backend 的 shape 创建 KV 缓冲：GQA 是 K/V 合并 5D
+            # （与官方 FLASH_ATTN 一致），MLA 是 4D。
+            if cls._mla:
+                return (num_blocks, block_size, num_kv_heads, head_size)
+            return (num_blocks, 2, block_size, num_kv_heads, head_size)
 
         @classmethod
         def is_mla(cls) -> bool:
@@ -188,6 +203,12 @@ def _patch_cpu_runtime() -> None:
 
     class _FakeGQABackend(_FakeBackend):
         _mla = False
+
+        @classmethod
+        def get_name(cls) -> str:
+            # vllm 0.27 会把 backend 名转成 AttentionBackendEnum 校验；
+            # CPU_ATTN 是合法枚举名（0.26 不校验名字，同样安全）。
+            return "CPU_ATTN"
 
     import vllm.v1.attention.selector as sel
 
@@ -215,6 +236,15 @@ def _patch_cpu_runtime() -> None:
         import vllm.model_executor.layers.attention.mla_attention as _mla_attn_mod
 
         _mla_attn_mod.get_mla_prefill_backend = lambda *a, **k: _FakePrefillBackend
+        try:
+            # 0.27 起官方 Kimi-K3 有自己的 MLA 模块（module-level 绑定 prefill 入口）
+            import vllm.models.kimi_k3.nvidia.mla as _kimi_mla_mod
+
+            _kimi_mla_mod.get_mla_prefill_backend = (
+                lambda *a, **k: _FakePrefillBackend
+            )
+        except Exception:
+            pass
 
     # torch.cuda / platform capability 占位（官方模型构造会建 Stream/Event，
     # DSV4 的 fp8 einsum recipe 查平台 capability）

@@ -10,6 +10,7 @@ cache stream waits for event before D2H. This avoids blocking the CPU.
 import os
 import re
 import subprocess
+import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from itertools import accumulate
