@@ -192,8 +192,8 @@ class KVCacheGroupLayout:
         # "which rows belong to model layer N" without a ragged array.
         self.layer_names: tuple[str, ...] = tuple(layer_names)
         self.layer_ids = np.asarray(layer_ids, dtype=np.int64)
-        self.base_ptrs = np.asarray(base_ptrs, dtype=np.int64)
-        self.block_strides = np.asarray(block_strides, dtype=np.int64)
+        self.base_ptrs = np.asarray(base_ptrs, dtype=np.uint64)
+        self.block_strides = np.asarray(block_strides, dtype=np.uint64)
         self.state_strides = np.asarray(state_strides, dtype=np.int64)
         self.states_per_block = np.asarray(states_per_block, dtype=np.int64)
         self.payload_bytes = np.asarray(payload_bytes, dtype=np.int64)
@@ -244,7 +244,7 @@ class KVCacheGroupLayout:
         rows = max(self.window_blocks, 1)
         template_offsets = np.zeros((rows, views), dtype=np.int64)
         template_sizes = np.zeros((rows, views), dtype=np.int64)
-        template_extras = np.zeros((rows, views), dtype=np.int64)
+        template_extras = np.zeros((rows, views), dtype=np.uint64)
         if span:
             template_sizes[0] = self._span_view_sizes(span)
             template_offsets[0] = (
@@ -364,7 +364,8 @@ class KVCacheGroupLayout:
                 f"A window head at token {head_tokens} is not "
                 "representable by tensor layout"
             )
-        return (states // self.token_block_size) * self.state_strides
+        offsets = (states // self.token_block_size) * self.state_strides
+        return offsets.astype(np.uint64, copy=False)
 
     def span_head_offsets(self, head_tokens: np.ndarray) -> np.ndarray:
         """Per-(key, view) byte offsets of FA sub-span heads."""
@@ -375,7 +376,8 @@ class KVCacheGroupLayout:
                 "Full-attention sub-span heads are not representable "
                 "by tensor layout"
             )
-        return (states // self.token_block_size) * self.state_strides[None, :]
+        offsets = (states // self.token_block_size) * self.state_strides[None, :]
+        return offsets.astype(np.uint64, copy=False)
 
     def view_count(self, mask: "np.ndarray | None") -> int:
         return len(self.layer_names) if mask is None else int(mask.sum())

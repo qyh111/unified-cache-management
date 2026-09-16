@@ -546,6 +546,11 @@ class UCMKVCacheLayout:
         self.group_layouts: Mapping[int, "KVCacheGroupLayout"] = build_group_layouts(
             spec, kv_caches
         )
+        # Per-kind participating groups, in dispatch_routes() order -- the
+        # plan's windows array is positional over this order.
+        self._routes_by_kind: Mapping[str, tuple["UCMKVCacheGroupInfo", ...]] = {
+            kind: groups for kind, groups in spec.dispatch_routes()
+        }
         # A callback may name only attention, while indexer and other caches
         # of the same model layer have distinct registered names/groups.
         self.layer_id_by_name = {
@@ -626,8 +631,12 @@ class UCMKVCacheLayout:
                 ptrs.append(group_ptrs)
                 sizes.append(group_sizes)
         if not keys:
-            empty = np.empty(0, dtype=np.int64)
-            return UCMProxyBatch((), empty, empty, empty)
+            return UCMProxyBatch(
+                (),
+                np.empty(0, dtype=np.int64),
+                np.empty(0, dtype=np.uint64),
+                np.empty(0, dtype=np.int64),
+            )
         return UCMProxyBatch(
             tuple(keys),
             np.concatenate(offsets),
@@ -655,31 +664,36 @@ class UCMKVCacheLayout:
 
         if not plan.keys:
             return
+        physical_groups = self._routes_by_kind[plan.hash_group]
+        if len(plan.windows) != len(physical_groups):
+            raise ValueError(
+                f"{plan.hash_group} plan carries {len(plan.windows)} windows "
+                f"for {len(physical_groups)} groups"
+            )
         if LAYOUT_DEBUG:
             layout_debug(
                 f"plan hash_group={plan.hash_group} "
                 f"tokens=[{plan.token_start},{plan.token_end}) "
                 f"keys={len(plan.keys)} "
-                f"groups={[window.group_id for window in plan.windows]}"
+                f"groups={[group.group_id for group in physical_groups]}"
             )
         key_count = len(plan.keys)
         group_base = 0
-        for window in plan.windows:
-            group_layout = self.group_layouts[window.group_id]
+        for group, blocks in zip(physical_groups, plan.windows):
+            group_layout = self.group_layouts[group.group_id]
             per_key = group_layout.window_blocks
             total = key_count * per_key
-            if len(window.blocks) != total:
+            if len(blocks) != total:
                 raise ValueError(
-                    f"Plan window for group {window.group_id} carries "
-                    f"{len(window.blocks)} blocks for {key_count} keys x "
+                    f"Plan window for group {group.group_id} carries "
+                    f"{len(blocks)} blocks for {key_count} keys x "
                     f"{per_key} blocks each"
                 )
-            blocks = window.blocks
             if len(blocks) and (
                 blocks.min() < 0 or blocks.max() >= group_layout.num_blocks
             ):
                 raise ValueError(
-                    f"Plan window for group {window.group_id} carries "
+                    f"Plan window for group {group.group_id} carries "
                     f"vLLM block IDs outside [0, {group_layout.num_blocks})"
                 )
             mask = (
@@ -740,7 +754,7 @@ class UCMKVCacheLayout:
                 entries_per_key = per_key * group_layout.view_count(mask)
             if LAYOUT_DEBUG:
                 layout_debug(
-                    f"record group={window.group_id} keys={key_count} "
+                    f"record group={group.group_id} keys={key_count} "
                     f"blocks={total} entries={len(ptrs)} "
                     f"record_size={group_base + group_layout.window_record_bytes}"
                 )

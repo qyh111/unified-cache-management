@@ -72,25 +72,15 @@ class RequestState:
 
 
 @dataclass(frozen=True)
-class UCMGroupWindows:
-    """One group's window blocks for a plan's keys, as a flat ndarray.
-
-    ``blocks`` holds the physical ids in (key, in-window) order -- the
-    group's static shape (``group_window_shape``) plus the plan's token
-    range carries everything else, so nothing but the ids travels.
-    """
-
-    group_id: int
-    blocks: "np.ndarray"
-
-
-@dataclass(frozen=True)
 class UCMGroupDispatchPlan:
     hash_group: Literal["FA", "WA", "State"]
     keys: tuple[bytes, ...]
     token_start: int
     token_end: int
-    windows: tuple[UCMGroupWindows, ...]
+    # Window block ids per participating group, in dispatch_routes()
+    # order -- the static window shape lives in the spec (see
+    # ``group_window_shape``), so only the ids travel.
+    windows: tuple[np.ndarray, ...]
 
 
 @dataclass(frozen=True)
@@ -354,32 +344,28 @@ class UCMDispatcher:
         ucm_block_size = self.spec.ucm_cache_block_size
         for route_index, (hash_group, physical_groups) in enumerate(self._routes):
             keys_available = state.group_ucm_block_ids[route_index]
-            if hash_group in ("WA", "State") and is_dump:
-                # Chunk-wise boundary store (HMA's fetch_wa_block_wise=False):
-                # record only the tail/state at the newest boundary this
-                # step completed.  A step may straddle boundaries without
-                # ending on one, so completion is "token_end passed it",
-                # not "token_end equals it"; the step range (which starts
-                # where the previous step ended) keeps each boundary from
-                # being recorded twice.
+            if hash_group in ("WA", "State"):
+                # One boundary record per plan.  A dump keeps the newest
+                # boundary the step completed -- a step may straddle
+                # boundaries without ending on one, so completion is
+                # "token_end passed it" (the step range, which starts
+                # where the previous step ended, keeps each boundary from
+                # being recorded twice); a step completing no new boundary
+                # stores nothing.  A load restores the boundary load_end
+                # ends on (always cache-aligned).
+                if is_dump:
+                    if token_end // ucm_block_size <= token_start // ucm_block_size:
+                        continue
+                elif token_end % ucm_block_size:
+                    continue
+                boundary = token_end // ucm_block_size
+                start = max(boundary - 1, 0)
+                end = boundary
+            else:
                 start = token_start // ucm_block_size
                 end = token_end // ucm_block_size
                 if end <= start:
                     continue
-                start = end - 1
-                end = start + 1
-            elif hash_group in ("WA", "State"):
-                # A load restores one boundary record: the latest complete
-                # one in the range (load_end is always cache-aligned).
-                if token_end % ucm_block_size:
-                    continue
-                start = max(token_end // ucm_block_size - 1, 0)
-                end = start + 1
-            else:
-                start = token_start // ucm_block_size
-                end = token_end // ucm_block_size
-            if end <= start:
-                continue
             if hash_group == "WA":
                 # A tail window is only worth storing once it is
                 # complete: an early boundary shorter than the chain's
@@ -387,38 +373,37 @@ class UCMDispatcher:
                 # the request's own prefix, which a restore recomputes
                 # anyway.  Skipping keeps every dumped key's record
                 # complete, so reverse lookup never selects a partial
-                # one (the load gate below is the same check).
-                boundary = end * ucm_block_size
-                if boundary < max(
+                # one (the load branch above cannot select one either).
+                if end * ucm_block_size < max(
                     group.tail_tokens or 0 for group in physical_groups
                 ):
                     continue
-            selected_keys = tuple(keys_available[start:end])
-            windows = tuple(
-                self._group_windows(hash_group, group, state, start, end)
-                for group in physical_groups
-            )
             plans.append(
                 UCMGroupDispatchPlan(
                     hash_group,
-                    selected_keys,
+                    tuple(keys_available[start:end]),
                     start * ucm_block_size,
                     end * ucm_block_size,
-                    windows,
+                    tuple(
+                        self._group_blocks(hash_group, group, state, start, end)
+                        for group in physical_groups
+                    ),
                 )
             )
         return tuple(plans)
 
-    def _group_windows(
+    def _group_blocks(
         self,
         hash_group: Literal["FA", "WA", "State"],
         group: UCMKVCacheGroupInfo,
         state: RequestState,
         start: int,
         end: int,
-    ) -> UCMGroupWindows:
-        """One group's window blocks for the plan's keys, vectorized.
+    ) -> np.ndarray:
+        """One group's window block ids for the plan's keys, vectorized.
 
+        The static half of the window (block count, sub-span shape) lives
+        in ``group_window_shape``; only these ids travel in the plan.
         FA keys each span one whole unit: whole blocks when the unit is
         the larger side, the containing block per key otherwise.  A WA
         plan's single boundary key keeps the tail window's blocks (the
@@ -432,33 +417,26 @@ class UCMDispatcher:
         token_block = group.token_block_size
         if hash_group == "State":
             last = (end * ucm_block_size - 1) // token_block
-            return UCMGroupWindows(
-                group.group_id, np.asarray(table[last : last + 1], dtype=np.int64)
-            )
+            return np.asarray(table[last : last + 1], dtype=np.uint64)
         if hash_group == "WA":
+            assert group.tail_tokens  # WA chains only carry tail-storing groups
             boundary = end * ucm_block_size
-            first = (boundary - (group.tail_tokens or 0)) // token_block
-            return UCMGroupWindows(
-                group.group_id,
-                np.asarray(
-                    table[first : boundary // token_block], dtype=np.int64
-                ),
+            first = (boundary - group.tail_tokens) // token_block
+            return np.asarray(
+                table[first : boundary // token_block], dtype=np.uint64
             )
         if ucm_block_size % token_block == 0:
             # Whole blocks: one table slice carries every key's span.
-            return UCMGroupWindows(
-                group.group_id,
-                np.asarray(
-                    table[
-                        start * ucm_block_size // token_block : end
-                        * ucm_block_size
-                        // token_block
-                    ],
-                    dtype=np.int64,
-                ),
+            return np.asarray(
+                table[
+                    start * ucm_block_size // token_block : end
+                    * ucm_block_size
+                    // token_block
+                ],
+                dtype=np.uint64,
             )
         # Several keys share one block: the containing block per key (the
         # table is short here -- token_block spans at least two units).
-        table_ids = np.asarray(table, dtype=np.int64)
+        table_ids = np.asarray(table, dtype=np.uint64)
         ordinals = np.arange(start, end, dtype=np.int64) * ucm_block_size
-        return UCMGroupWindows(group.group_id, table_ids[ordinals // token_block])
+        return table_ids[ordinals // token_block]

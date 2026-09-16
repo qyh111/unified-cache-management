@@ -345,8 +345,8 @@ class UCMConnector(KVConnectorBase_V1, SupportsHMA):
                 self._invalid_block_ids.update(
                     int(block_id)
                     for plan in request.load_plans
-                    for group in plan.windows
-                    for block_id in group.blocks.tolist()
+                    for blocks in plan.windows
+                    for block_id in blocks.tolist()
                 )
         # Synchronous load errors are returned through vLLM's invalid-block and
         # worker-metadata channels; aborting here would bypass those channels.
