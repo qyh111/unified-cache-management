@@ -8,10 +8,9 @@ proxy batches with deterministic record offsets.
 
 from __future__ import annotations
 
-import math
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Literal, NamedTuple
+from typing import TYPE_CHECKING, Literal
 
 import numpy as np
 from vllm.model_executor.models.utils import extract_layer_index
@@ -484,6 +483,22 @@ def parse_kv_cache_config(
     else:
         selected_block = scheduler_block_size
 
+    # Flat plan windows need a uniform per-key block count on FA chains:
+    # every FA group's token span must divide, or be divided by, the
+    # cache block -- otherwise a key straddles blocks and the window
+    # shape varies per key.
+    for group in groups:
+        if not (group.is_attention and not group.is_sliding_window):
+            continue
+        if selected_block % group.token_block_size and (
+            group.token_block_size % selected_block
+        ):
+            raise ValueError(
+                f"Full-attention group {group.group_id} token_block_size "
+                f"{group.token_block_size} neither divides nor is a "
+                f"multiple of ucm_cache_block_size {selected_block}"
+            )
+
     if LAYOUT_DEBUG:
         for group in groups:
             kind_names = ",".join(sorted(kind.value for kind in group.kinds))
@@ -504,19 +519,6 @@ def parse_kv_cache_config(
         ucm_cache_block_size=selected_block,
         device_type=device_type,
     )
-
-
-class _GroupWindows(NamedTuple):
-    """One key's hash window over one group, as per-block windows.
-
-    ``block_ids`` are physical ids carrying the windows in logical order;
-    ``whole`` marks a window that covers every block entirely.
-    """
-
-    block_ids: list[int]
-    local_starts: list[int]
-    local_ends: list[int]
-    whole: bool
 
 
 class UCMKVCacheLayout:
@@ -617,60 +619,40 @@ class UCMKVCacheLayout:
         plan: "UCMGroupDispatchPlan",
         layer_names: frozenset[str] | None,
     ) -> Iterator[tuple[bytes, list[int], list[int], list[int]]]:
-        """Scheduler shell around the group layouts' column addressing.
+        """Turn a plan's self-describing windows into proxy segments.
 
-        This layer owns the dispatch semantics -- key splitting, block-map
-        resolution, WA tail windows, state-block selection -- and the
-        per-hash-block record ledger.  Layouts only answer (ptr, size)
-        grids; this shell places them in one key's record: each group's
-        contribution starts at the running block_offset, and the next
-        group continues after it.
+        The scheduler already resolved every key's blocks and token
+        windows; this shell only places each group's contribution inside
+        one key's record: a group's segments start at the running
+        block_offset and the next group continues after its record bytes.
+        Layouts answer (ptr, size) grids; nothing here re-derives
+        scheduling facts.
         """
 
-        if not plan.keys:
-            return
-        token_count = plan.token_end - plan.token_start
-        if token_count <= 0 or token_count % len(plan.keys):
-            raise ValueError("Dispatch token range must divide evenly across keys")
-        key_tokens = token_count // len(plan.keys)
-        block_maps = {
-            selection.group_id: {
-                selection.start_block_index + index: block_id
-                for index, block_id in enumerate(selection.block_ids)
-            }
-            for selection in plan.vllm_blocks
-        }
         if LAYOUT_DEBUG:
-            for group_id in sorted(block_maps):
-                block_map = block_maps[group_id]
-                pairs = sorted(block_map.items())
-                shown = ",".join(f"{k}->{v}" for k, v in pairs[:8])
-                more = "" if len(pairs) <= 8 else ",..."
-                layout_debug(
-                    f"plan hash_group={plan.hash_group} group={group_id} "
-                    f"tokens=[{plan.token_start},{plan.token_end}) "
-                    f"keys={len(plan.keys)} vllm_blocks {{{shown}{more}}}"
-                )
+            layout_debug(
+                f"plan hash_group={plan.hash_group} "
+                f"tokens=[{plan.token_start},{plan.token_end}) "
+                f"keys={len(plan.keys)} "
+                f"groups={[group.group_id for group in plan.windows]}"
+            )
         for key_index, key in enumerate(plan.keys):
             block_offset = 0
-            key_start = plan.token_start + key_index * key_tokens
-            key_end = key_start + key_tokens
-            for group_id in sorted(block_maps):
-                group_info = self.spec.groups[group_id]
-                if plan.hash_group == "WA" and not group_info.tail_tokens:
-                    continue
-                group_layout = self.group_layouts[group_id]
-                windows = self._key_windows(
-                    plan, group_info, group_layout, block_maps[group_id],
-                    key_start, key_end,
-                )
+            for group in plan.windows:
+                group_layout = self.group_layouts[group.group_id]
                 mask = (
                     None
                     if layer_names is None
                     else group_layout.view_mask(layer_names=layer_names)
                 )
+                lo = key_index * group.per_key
+                hi = lo + group.per_key
                 ptrs, sizes, offsets, record_bytes = self._group_record(
-                    group_layout, windows, mask
+                    group_layout,
+                    group.blocks[lo:hi],
+                    None if group.whole else group.local_starts[lo:hi],
+                    None if group.whole else group.local_ends[lo:hi],
+                    mask,
                 )
                 if ptrs:
                     yield (
@@ -682,59 +664,22 @@ class UCMKVCacheLayout:
                 block_offset += record_bytes
             if LAYOUT_DEBUG:
                 layout_debug(
-                    f"record key={key.hex()[:16]}... tokens="
-                    f"[{key_start},{key_end}) groups={sorted(block_maps)} "
+                    f"record key={key.hex()[:16]}... "
                     f"record_size={block_offset}"
                 )
-
-    def _key_windows(
-        self,
-        plan: "UCMGroupDispatchPlan",
-        group_info: UCMKVCacheGroupInfo,
-        group_layout: "KVCacheGroupLayout",
-        block_map: Mapping[int, int],
-        key_start: int,
-        key_end: int,
-    ) -> "_GroupWindows":
-        """One key's hash window over one group, as per-block windows.
-
-        Logical block ordinals carry the record; physical ids only
-        address.  A state snapshot contributes the last complete block
-        as one indivisible page; a WA group stores only its tail window.
-        """
-
-        token_block = group_layout.token_block_size
-        if group_info.is_state_snapshot:
-            logical = max((key_end - 1) // token_block, 0)
-            return _GroupWindows([block_map[logical]], [0], [token_block], True)
-        window_start = key_start
-        if plan.hash_group == "WA":
-            window_start = max(key_end - (group_info.tail_tokens or 0), 0)
-        first = window_start // token_block
-        stop = (key_end - 1) // token_block + 1
-        block_ids = [block_map[logical] for logical in range(first, stop)]
-        starts = [
-            max(window_start - (first + ordinal) * token_block, 0)
-            for ordinal in range(stop - first)
-        ]
-        ends = [
-            min(key_end - (first + ordinal) * token_block, token_block)
-            for ordinal in range(stop - first)
-        ]
-        whole = all(
-            start == 0 and end == token_block for start, end in zip(starts, ends)
-        )
-        return _GroupWindows(block_ids, starts, ends, whole)
 
     def _group_record(
         self,
         group_layout: "KVCacheGroupLayout",
-        windows: "_GroupWindows",
+        block_ids: Sequence[int],
+        local_starts: Sequence[int] | None,
+        local_ends: Sequence[int] | None,
         mask: "np.ndarray | None",
     ) -> tuple[list[int], list[int], list[int], int]:
-        """Place one group's windows in the key's record.
+        """Place one group's key window in the key's record.
 
-        Three ledgers, one per group shape:
+        ``local_starts``/``local_ends`` None means whole blocks.  Three
+        ledgers, one per group shape:
 
         - Block First, whole and unfiltered: the block slot is one IO
           span, paddings riding inside (``block_first_segments``).
@@ -752,30 +697,35 @@ class UCMKVCacheLayout:
         size -- the block_offset the next group continues from.
         """
 
-        span = group_layout.block_first if windows.whole else None
+        whole = local_starts is None
+        span = group_layout.block_first if whole else None
         if span is not None and mask is None:
-            ptrs, sizes = group_layout.block_first_segments(windows.block_ids)
+            ptrs, sizes = group_layout.block_first_segments(block_ids)
             offsets = (
-                np.arange(len(windows.block_ids), dtype=np.int64)
+                np.arange(len(block_ids), dtype=np.int64)
                 * group_layout.block_size_bytes
             )
             return (
                 ptrs.tolist(),
                 sizes.tolist(),
                 offsets.tolist(),
-                len(windows.block_ids) * group_layout.block_size_bytes,
+                len(block_ids) * group_layout.block_size_bytes,
             )
-        ptrs, sizes = group_layout.extract_segments(
-            windows.block_ids, windows.local_starts, windows.local_ends
-        )
+        if local_starts is None or local_ends is None:
+            starts = [0] * len(block_ids)
+            ends = [group_layout.token_block_size] * len(block_ids)
+        else:
+            starts = list(local_starts)
+            ends = list(local_ends)
+        ptrs, sizes = group_layout.extract_segments(block_ids, starts, ends)
         if span is not None:
             # Slot-image ledger: block-major rows at their anchors.
             offsets = (
-                np.arange(len(windows.block_ids), dtype=np.int64)[:, None]
+                np.arange(len(block_ids), dtype=np.int64)[:, None]
                 * group_layout.block_size_bytes
                 + group_layout.block_slots
             )
-            record_bytes = len(windows.block_ids) * group_layout.block_size_bytes
+            record_bytes = len(block_ids) * group_layout.block_size_bytes
         else:
             # Layer-major ledger: view slots by window bytes, blocks
             # packed inside each view's slot.

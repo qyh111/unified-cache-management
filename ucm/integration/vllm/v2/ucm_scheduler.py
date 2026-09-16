@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import hashlib
-import math
 import pickle
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
@@ -56,7 +55,6 @@ class RequestHasher:
 @dataclass(frozen=True)
 class UCMLookupResult:
     external_hit_tokens: int
-    restore_end_tokens: int
     group_ucm_block_ids: tuple[tuple[bytes, ...], ...]
 
 
@@ -64,7 +62,6 @@ class UCMLookupResult:
 class RequestState:
     hbm_hit_tokens: int = 0
     external_hit_tokens: int = 0
-    restore_end_tokens: int = 0
     num_token_ids: int = 0
     token_processed: int = 0
     group_ucm_block_ids: tuple[tuple[bytes, ...], ...] = ()
@@ -73,20 +70,32 @@ class RequestState:
 
 
 @dataclass(frozen=True)
-class UCMGroupBlockIds:
+class UCMGroupWindows:
+    """One group's windows for a plan's keys, flat and self-describing.
+
+    ``blocks`` are physical ids in (key, in-window) order -- ``per_key``
+    per key, so the worker slices them without re-deriving anything.
+    ``whole`` marks every block fully covered (local spans constant
+    ``(0, token_block_size)``; starts/ends stay empty).  A non-whole
+    group carries each block's token span in ``local_starts`` /
+    ``local_ends``.
+    """
+
     group_id: int
-    start_block_index: int
-    block_ids: tuple[int, ...]
+    per_key: int
+    whole: bool
+    blocks: tuple[int, ...]
+    local_starts: tuple[int, ...]
+    local_ends: tuple[int, ...]
 
 
 @dataclass(frozen=True)
 class UCMGroupDispatchPlan:
     hash_group: Literal["FA", "WA", "State"]
     keys: tuple[bytes, ...]
-    key_start_index: int
     token_start: int
     token_end: int
-    vllm_blocks: tuple[UCMGroupBlockIds, ...]
+    windows: tuple[UCMGroupWindows, ...]
 
 
 @dataclass(frozen=True)
@@ -104,12 +113,8 @@ class UCMConnectorMetadata(KVConnectorMetadata):
 
 
 def _token_ids(request: "Request") -> tuple[int, ...]:
-    values = getattr(request, "all_token_ids", None)
-    if values is None:
-        values = getattr(request, "prompt_token_ids", None)
-    if values is None:
-        raise ValueError("Request does not expose all_token_ids")
-    return tuple(int(value) for value in values)
+    # int() normalizes numpy scalars so the hash chain pickles stably.
+    return tuple(int(value) for value in request.all_token_ids)
 
 
 _KEY_TYPE_BITS: Mapping[str, int] = {"FA": 0, "WA": 1, "State": 2}
@@ -118,7 +123,7 @@ _KEY_TYPE_BITS: Mapping[str, int] = {"FA": 0, "WA": 1, "State": 2}
 def _key_tag(chain: str, tp_rank: int = 0, pp_rank: int = 0) -> bytes:
     """The 2-byte suffix of a UCM key, big-endian bit layout:
 
-    type(2) group(2) tp_rank(5) pp_rank(4) reserved(3).  Every group of a
+    type(2) group(4) tp_rank(4) pp_rank(4) reserved(2).  Every group of a
     chain shares one record, so no group bits are set today; the layout
     keeps them for a future per-group split.  Ranks default to the
     logical rank-0 key namespace the scheduler hashes in.
@@ -126,13 +131,20 @@ def _key_tag(chain: str, tp_rank: int = 0, pp_rank: int = 0) -> bytes:
 
     value = (
         (_KEY_TYPE_BITS[chain] << 14)
-        | ((tp_rank & 0b11111) << 7)
-        | ((pp_rank & 0b1111) << 3)
+        | ((tp_rank & 0b1111) << 6)
+        | ((pp_rank & 0b1111) << 2)
     )
     return value.to_bytes(2, "big")
 
 
-class UCMLookupCoordinator:
+class UCMDispatcher:
+    """Scheduler-side lookup, request state, and dispatch planning.
+
+    ``lookup`` probes the external cache and records the per-request
+    snapshot; ``build_from_scheduler_output`` then maintains block tables
+    from vLLM's SchedulerOutput and produces pointer-free plans.
+    """
+
     def __init__(
         self,
         kv_cache_spec: UCMKVCacheSpec,
@@ -151,9 +163,10 @@ class UCMLookupCoordinator:
         self.base_seed = base_seed
         self.load_threshold_tokens = max(int(load_threshold_tokens), 0)
         self.recompute_tokens = max(int(recompute_tokens), 0)
-        self.chains = kv_cache_spec.dispatch_chains()
+        self.requests: dict[str, RequestState] = {}
         self._chain_tags = tuple(
-            (label, _key_tag(label, tp_rank, pp_rank)) for label, _ in self.chains
+            (label, _key_tag(label, tp_rank, pp_rank))
+            for label, _ in kv_cache_spec.dispatch_chains()
         )
 
     def _chain(
@@ -187,40 +200,22 @@ class UCMLookupCoordinator:
             for _label, tag in self._chain_tags
         )
 
-    def _prefix_end(
-        self,
-        keys: Sequence[bytes],
-        key_tokens: int,
-        hbm_tokens: int,
-        candidate_end: int,
-    ) -> int:
-        """The FA prefix end, probed through the proxy's prefix scan.
-
-        The proxy scans the keys after the HBM boundary and stops at the
-        first miss.  A miss in the key that straddles an HBM-only prefix
-        means "no new external progress"; it must never reduce the
-        already computed HBM boundary to the previous key boundary.
-        """
-
-        if candidate_end <= hbm_tokens:
-            return hbm_tokens
-        first = hbm_tokens // key_tokens
-        last = candidate_end // key_tokens
-        hits = self.proxy.lookup_on_prefix(keys[first:last])
-        end = (first + hits + 1) * key_tokens if hits >= 0 else hbm_tokens
-        return min(max(end, hbm_tokens), candidate_end)
-
     def lookup(self, request: "Request", num_computed_tokens: int) -> UCMLookupResult:
-        if num_computed_tokens < 0:
-            raise ValueError("num_computed_tokens must not be negative")
+        """Probe the external cache and record the request snapshot."""
         token_ids = _token_ids(request)
         result = self._lookup(token_ids, num_computed_tokens)
         if result.external_hit_tokens <= self.load_threshold_tokens:
-            return UCMLookupResult(0, num_computed_tokens, result.group_ucm_block_ids)
+            result = UCMLookupResult(0, result.group_ucm_block_ids)
+        self.requests[str(request.request_id)] = RequestState(
+            hbm_hit_tokens=num_computed_tokens,
+            external_hit_tokens=result.external_hit_tokens,
+            num_token_ids=len(token_ids),
+            token_processed=num_computed_tokens + result.external_hit_tokens,
+            group_ucm_block_ids=result.group_ucm_block_ids,
+            group_vllm_block_ids=tuple([] for _ in self.spec.groups),
+            load_pending=result.external_hit_tokens > 0,
+        )
         return result
-
-    def _cacheable_end(self, length: int, unit: int) -> int:
-        return max(length - self.recompute_tokens, 0) // unit * unit
 
     def _lookup(
         self, token_ids: Sequence[int], hbm: int
@@ -228,7 +223,7 @@ class UCMLookupCoordinator:
         """FA prefix restore; WA/State additionally need their boundary.
 
         All chains share one hash chain at ucm_cache_block_size, so every
-        chain has a key at the same boundaries.  The FA chain is a prefix
+        chain has a key at the same boundary.  The FA chain is a prefix
         requirement; the WA (window tail) and State (mamba snapshot)
         chains are boundary records -- restoring requires a complete FA
         prefix up to some boundary and that boundary's tail or snapshot.
@@ -237,74 +232,31 @@ class UCMLookupCoordinator:
         where every chain hits), never past the FA prefix.
         """
 
-        unit = self.spec.ucm_cache_block_size
-        keys_per_chain = self._chain_keys(token_ids)
-        # A pure-FA restore may load the block the recompute margin sits
-        # in (its KV just gets overwritten); a boundary restore must stop
-        # one complete block earlier, leaving the margin's block to
-        # recompute against the restored boundary record.
-        has_boundary = any(label != "FA" for label, _tag in self._chain_tags)
-        candidate = (
-            self._cacheable_end(len(token_ids), unit)
-            if has_boundary
-            else len(token_ids)
-        )
+        ucm_block_size = self.spec.ucm_cache_block_size
+        group_ucm_block_ids = self._chain_keys(token_ids)
+        # Every chain scans up to the last complete block below the
+        # recompute margin; the margin's block is left to recompute (v1
+        # semantics -- a full hit still recomputes recompute_tokens).
+        last = max(len(token_ids) - self.recompute_tokens, 0) // ucm_block_size
+        first = hbm // ucm_block_size
         fa_end = hbm
-        boundary_keys: list[tuple[bytes, ...]] = []
-        for (label, _tag), keys in zip(self._chain_tags, keys_per_chain):
+        for (label, _tag), keys in zip(self._chain_tags, group_ucm_block_ids):
             if label == "FA":
-                fa_end = self._prefix_end(keys, unit, hbm, candidate)
-            else:
-                boundary_keys.append(keys)
+                hits = self.proxy.lookup_on_prefix(keys[first:last])
+                if hits >= 0:
+                    fa_end = max((first + hits + 1) * ucm_block_size, hbm)
+                break
         restore_end = fa_end
-        if boundary_keys:
-            restore_end = hbm
-            first = max(math.ceil((hbm + 1) / unit), 1)
-            last = fa_end // unit
-            if last >= first:
-                latest: int | None = None
-                for keys in boundary_keys:
-                    hit = self.proxy.lookup_on_reverse(keys[first - 1 : last])
-                    if hit < 0:
-                        latest = None
-                        break
-                    boundary_index = first - 1 + hit
-                    latest = (
-                        boundary_index
-                        if latest is None
-                        else min(latest, boundary_index)
-                    )
-                if latest is not None:
-                    restore_end = (latest + 1) * unit
-        visible_end = min(restore_end, max(len(token_ids) - self.recompute_tokens, 0))
-        return UCMLookupResult(
-            max(visible_end - hbm, 0), restore_end, keys_per_chain
-        )
+        for (label, _tag), keys in zip(self._chain_tags, group_ucm_block_ids):
+            if label == "FA":
+                continue
+            hits = self.proxy.lookup_on_reverse(keys[first : fa_end // ucm_block_size])
+            if hits < 0:
+                restore_end = hbm  # no boundary record: nothing may restore
+                break
+            restore_end = min(restore_end, (first + hits + 1) * ucm_block_size)
+        return UCMLookupResult(max(restore_end - hbm, 0), group_ucm_block_ids)
 
-
-class UCMDispatcher:
-    """Own scheduler request snapshots and produce pointer-free plans."""
-
-    def __init__(self, spec: UCMKVCacheSpec) -> None:
-        self.spec = spec
-        self.requests: dict[str, RequestState] = {}
-
-    def record_lookup(
-        self, request: "Request", hbm_hit_tokens: int, result: UCMLookupResult
-    ) -> RequestState:
-        request_id = str(request.request_id)
-        state = RequestState(
-            hbm_hit_tokens=hbm_hit_tokens,
-            external_hit_tokens=result.external_hit_tokens,
-            restore_end_tokens=result.restore_end_tokens,
-            num_token_ids=len(_token_ids(request)),
-            token_processed=hbm_hit_tokens + result.external_hit_tokens,
-            group_ucm_block_ids=result.group_ucm_block_ids,
-            group_vllm_block_ids=tuple([] for _ in self.spec.groups),
-            load_pending=result.restore_end_tokens > hbm_hit_tokens,
-        )
-        self.requests[request_id] = state
-        return state
 
     def update_blocks(
         self,
@@ -323,12 +275,6 @@ class UCMDispatcher:
             state.group_vllm_block_ids = tuple(
                 [int(value) for value in source] for source in group_block_ids
             )
-
-    def finish(self, request_id: str) -> None:
-        self.requests.pop(request_id, None)
-
-    def preempt(self, request_id: str) -> None:
-        self.requests.pop(request_id, None)
 
     def build_metadata(
         self,
@@ -379,12 +325,6 @@ class UCMDispatcher:
             resumed = request_id in cached.resumed_req_ids
             if incoming is not None:
                 self.update_blocks(request_id, incoming, append=not resumed)
-            elif resumed:
-                self.update_blocks(
-                    request_id,
-                    tuple([] for _ in self.spec.groups),
-                    append=False,
-                )
 
         return self.build_metadata(
             scheduler_output.num_scheduled_tokens,
@@ -397,8 +337,8 @@ class UCMDispatcher:
     ) -> RequestDispatchMeta:
         step_end = min(state.token_processed + scheduled_tokens, state.num_token_ids)
         should_load = state.load_pending and scheduled_tokens > 0
-        load_start = state.hbm_hit_tokens if should_load else state.restore_end_tokens
-        load_end = state.restore_end_tokens
+        load_end = state.hbm_hit_tokens + state.external_hit_tokens
+        load_start = state.hbm_hit_tokens if should_load else load_end
         dump_start = state.token_processed
         dump_end = step_end
         load = self._plans(state, load_start, load_end, is_dump=False)
@@ -414,7 +354,7 @@ class UCMDispatcher:
         plans: list[UCMGroupDispatchPlan] = []
         if token_end <= token_start:
             return ()
-        unit = self.spec.ucm_cache_block_size
+        ucm_block_size = self.spec.ucm_cache_block_size
         chains = self.spec.dispatch_chains()
         for chain_index, (hash_group, physical_groups) in enumerate(chains):
             keys_available = state.group_ucm_block_ids[chain_index]
@@ -426,64 +366,131 @@ class UCMDispatcher:
                 # not "token_end equals it"; the step range (which starts
                 # where the previous step ended) keeps each boundary from
                 # being recorded twice.
-                start = token_start // unit
-                end = token_end // unit
+                start = token_start // ucm_block_size
+                end = token_end // ucm_block_size
                 if end <= start:
                     continue
                 start = end - 1
                 end = start + 1
             elif hash_group in ("WA", "State"):
                 # A load restores one boundary record: the latest complete
-                # one in the range (restore_end is always cache-aligned).
-                if token_end % unit:
+                # one in the range (load_end is always cache-aligned).
+                if token_end % ucm_block_size:
                     continue
-                start = max(token_end // unit - 1, 0)
+                start = max(token_end // ucm_block_size - 1, 0)
                 end = start + 1
             else:
-                start = token_start // unit
-                end = token_end // unit
+                start = token_start // ucm_block_size
+                end = token_end // ucm_block_size
             if end <= start:
                 continue
             selected_keys = tuple(keys_available[start:end])
-            if not selected_keys:
-                continue
-            selections: list[UCMGroupBlockIds] = []
-            for group in physical_groups:
-                table = state.group_vllm_block_ids[group.group_id]
-                if hash_group == "WA":
-                    boundary = end * unit
-                    tail_tokens = group.tail_tokens
-                    assert tail_tokens is not None  # WA chains store tails
-                    window_start = max(boundary - tail_tokens, 0)
-                    block_start = window_start // group.token_block_size
-                    block_end = math.ceil(boundary / group.token_block_size)
-                elif hash_group == "State":
-                    # A state snapshot lives in the last complete block of
-                    # the boundary (end * unit, not the step's token_end --
-                    # a dump step may end past the boundary).
-                    boundary = end * unit
-                    block_start = max(
-                        (boundary - 1) // group.token_block_size, 0
-                    )
-                    block_end = block_start + 1
-                else:
-                    block_start = start * unit // group.token_block_size
-                    block_end = math.ceil(end * unit / group.token_block_size)
-                selections.append(
-                    UCMGroupBlockIds(
-                        group.group_id,
-                        block_start,
-                        tuple(table[block_start:block_end]),
-                    )
-                )
+            windows = tuple(
+                self._group_windows(hash_group, group, state, start, end)
+                for group in physical_groups
+            )
             plans.append(
                 UCMGroupDispatchPlan(
                     hash_group,
                     selected_keys,
-                    start,
-                    start * unit,
-                    end * unit,
-                    tuple(selections),
+                    start * ucm_block_size,
+                    end * ucm_block_size,
+                    windows,
                 )
             )
         return tuple(plans)
+
+    def _group_windows(
+        self,
+        hash_group: Literal["FA", "WA", "State"],
+        group: UCMKVCacheGroupInfo,
+        state: RequestState,
+        start: int,
+        end: int,
+    ) -> UCMGroupWindows:
+        """One group's flat windows for the plan's keys, fully resolved.
+
+        The plan is self-describing: the worker slices ``blocks`` per key
+        and never re-derives token windows.  FA keys each span one whole
+        unit (the parse-time divisibility check keeps the per-key block
+        count uniform: whole blocks when the unit is the larger side, one
+        fixed-length sub-span otherwise); a WA or State plan carries a
+        single key -- the boundary -- whose window may be any shape.
+        """
+
+        ucm_block_size = self.spec.ucm_cache_block_size
+        table = state.group_vllm_block_ids[group.group_id]
+        token_block = group.token_block_size
+        if hash_group == "State":
+            # A state snapshot is one indivisible page: the block holding
+            # the boundary's last token.
+            boundary = end * ucm_block_size
+            logical = (boundary - 1) // token_block
+            return UCMGroupWindows(
+                group_id=group.group_id,
+                per_key=1,
+                whole=True,
+                blocks=(table[logical],),
+                local_starts=(),
+                local_ends=(),
+            )
+        if hash_group == "WA":
+            # The tail window anchors at the boundary (its newest end).
+            boundary = end * ucm_block_size
+            window_start = max(boundary - (group.tail_tokens or 0), 0)
+            first = window_start // token_block
+            stop = (boundary - 1) // token_block + 1
+            starts = tuple(
+                max(window_start - (first + ordinal) * token_block, 0)
+                for ordinal in range(stop - first)
+            )
+            ends = tuple(
+                min(boundary - (first + ordinal) * token_block, token_block)
+                for ordinal in range(stop - first)
+            )
+            whole = all(
+                s == 0 and e == token_block for s, e in zip(starts, ends)
+            )
+            return UCMGroupWindows(
+                group_id=group.group_id,
+                per_key=stop - first,
+                whole=whole,
+                blocks=tuple(table[first:stop]),
+                local_starts=() if whole else starts,
+                local_ends=() if whole else ends,
+            )
+        if ucm_block_size % token_block == 0:
+            # 1:1 / 1:N: every key covers whole consecutive blocks.
+            return UCMGroupWindows(
+                group_id=group.group_id,
+                per_key=ucm_block_size // token_block,
+                whole=True,
+                blocks=tuple(
+                    table[
+                        start * ucm_block_size // token_block : end
+                        * ucm_block_size
+                        // token_block
+                    ]
+                ),
+                local_starts=(),
+                local_ends=(),
+            )
+        # N:1: several keys share one block; each key is one fixed-length
+        # sub-span at an arithmetic offset.
+        return UCMGroupWindows(
+            group_id=group.group_id,
+            per_key=1,
+            whole=False,
+            blocks=tuple(
+                table[key * ucm_block_size // token_block]
+                for key in range(start, end)
+            ),
+            local_starts=tuple(
+                key * ucm_block_size % token_block
+                for key in range(start, end)
+            ),
+            local_ends=tuple(
+                key * ucm_block_size % token_block + ucm_block_size
+                for key in range(start, end)
+            ),
+        )

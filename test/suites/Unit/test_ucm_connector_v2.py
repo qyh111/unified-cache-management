@@ -252,10 +252,10 @@ from ucm.integration.vllm.v2.ucm_proxy import (  # noqa: E402
 )
 from ucm.integration.vllm.v2.ucm_scheduler import (  # noqa: E402
     RequestHasher,
+    RequestState,
     UCMConnectorMetadata,
     UCMDispatcher,
-    UCMLookupResult,
-    UCMLookupCoordinator,
+    UCMGroupWindows,
 )
 
 
@@ -390,6 +390,38 @@ class FakeRequest:
     def __init__(self, request_id, token_count):
         self.request_id = request_id
         self.all_token_ids = list(range(token_count))
+
+
+def make_dispatcher(parsed, proxy=None, hasher=None, **kwargs):
+    """A UCMDispatcher for dispatch-only tests (lookup never runs)."""
+    return UCMDispatcher(
+        parsed,
+        UCMProxyAdapter(proxy or FakeProxy()),
+        hasher or RequestHasher(vllm_config(), 0),
+        b"seed",
+        **kwargs,
+    )
+
+
+def seed_request_state(
+    dispatcher,
+    request,
+    external_hit_tokens=0,
+    group_ucm_block_ids=(),
+    hbm_hit_tokens=0,
+):
+    """Record a synthetic lookup result the way UCMDispatcher.lookup would."""
+    state = RequestState(
+        hbm_hit_tokens=hbm_hit_tokens,
+        external_hit_tokens=external_hit_tokens,
+        num_token_ids=len(request.all_token_ids),
+        token_processed=hbm_hit_tokens + external_hit_tokens,
+        group_ucm_block_ids=group_ucm_block_ids,
+        group_vllm_block_ids=tuple([] for _ in dispatcher.spec.groups),
+        load_pending=external_hit_tokens > 0,
+    )
+    dispatcher.requests[str(request.request_id)] = state
+    return state
 
 
 class FakeProxy:
@@ -569,11 +601,11 @@ class KVCacheSpecTest(unittest.TestCase):
                 group(["model.layers.2.attn"], AscendMLAAttentionSpec(128, compress_ratio=4)),
                 group(
                     ["model.layers.0.swa_cache"],
-                    AscendSlidingWindowMLASpec(128, 1, 4096),
+                    AscendSlidingWindowMLASpec(128, 1, 128),
                 ),
                 group(
                     ["model.layers.2.compressor.state_cache"],
-                    AscendSlidingWindowMLASpec(128, 4, 4096),
+                    AscendSlidingWindowMLASpec(128, 4, 128),
                 ),
             ),
             scheduler_block_size=16,
@@ -587,6 +619,21 @@ class KVCacheSpecTest(unittest.TestCase):
         )
         self.assertTrue(parsed.groups[2].is_attention)
         self.assertTrue(parsed.groups[2].is_sliding_window)
+
+    def test_parse_rejects_non_divisible_fa_token_blocks(self):
+        # Flat plan windows need a uniform per-key block count; an FA group
+        # whose token block neither divides nor is divided by the cache
+        # block would make keys straddle blocks. Fail at startup.
+        with self.assertRaisesRegex(
+            ValueError, "neither divides nor is a multiple"
+        ):
+            parse_kv_cache_config(
+                config(
+                    group(["model.layers.0.attn"], FullAttentionSpec(512)),
+                    group(["model.layers.1.attn"], FullAttentionSpec(768)),
+                ),
+                scheduler_block_size=256,
+            )
 
     def test_full_attention_with_window_metadata_is_not_sliding(self):
         parsed = parse_kv_cache_config(
@@ -875,13 +922,13 @@ class HashAndLookupTest(unittest.TestCase):
     def test_key_tag_bit_layout(self):
         from ucm.integration.vllm.v2.ucm_scheduler import _key_tag
 
-        # type(2) group(2) tp_rank(5) pp_rank(4) reserved(3), big-endian.
+        # type(2) group(4) tp_rank(4) pp_rank(4) reserved(2), big-endian.
         self.assertEqual(_key_tag("FA"), b"\x00\x00")
         self.assertEqual(_key_tag("WA"), b"\x40\x00")
         self.assertEqual(_key_tag("State"), b"\x80\x00")
-        self.assertEqual(_key_tag("FA", tp_rank=1), b"\x00\x80")
-        self.assertEqual(_key_tag("FA", pp_rank=1), b"\x00\x08")
-        self.assertEqual(_key_tag("WA", tp_rank=31, pp_rank=15), b"\x4f\xf8")
+        self.assertEqual(_key_tag("FA", tp_rank=1), b"\x00\x40")
+        self.assertEqual(_key_tag("FA", pp_rank=1), b"\x00\x04")
+        self.assertEqual(_key_tag("WA", tp_rank=15, pp_rank=15), b"\x43\xfc")
 
     def test_chain_keys_share_one_chain_and_differ_only_by_tag(self):
         parsed = parse_kv_cache_config(
@@ -891,7 +938,7 @@ class HashAndLookupTest(unittest.TestCase):
             ),
             scheduler_block_size=128,
         )
-        coordinator = UCMLookupCoordinator(
+        coordinator = UCMDispatcher(
             parsed, UCMProxyAdapter(FakeProxy()), self.hasher, b"seed"
         )
         request = FakeRequest("r", 512)
@@ -911,7 +958,7 @@ class HashAndLookupTest(unittest.TestCase):
             ucm_cache_block_size=512,
         )
         proxy = FakeProxy()
-        coordinator = UCMLookupCoordinator(
+        coordinator = UCMDispatcher(
             parsed, UCMProxyAdapter(proxy), self.hasher, b"seed", recompute_tokens=0
         )
         request = FakeRequest("r", 1024)
@@ -929,7 +976,7 @@ class HashAndLookupTest(unittest.TestCase):
             scheduler_block_size=128,
         )
         proxy = FakeProxy()
-        coordinator = UCMLookupCoordinator(
+        coordinator = UCMDispatcher(
             parsed, UCMProxyAdapter(proxy), self.hasher, b"seed", recompute_tokens=0
         )
         request = FakeRequest("r", 512)
@@ -947,7 +994,7 @@ class HashAndLookupTest(unittest.TestCase):
             ucm_cache_block_size=512,
         )
         proxy = FakeProxy()
-        coordinator = UCMLookupCoordinator(
+        coordinator = UCMDispatcher(
             parsed,
             UCMProxyAdapter(proxy),
             RequestHasher(vllm_config(), 0),
@@ -957,15 +1004,14 @@ class HashAndLookupTest(unittest.TestCase):
         result = coordinator.lookup(FakeRequest("unaligned", 1024), 128)
 
         self.assertEqual(result.external_hit_tokens, 0)
-        self.assertEqual(result.restore_end_tokens, 128)
 
-    def test_direct_full_hit_loads_last_block_but_reports_one_less_token(self):
+    def test_direct_full_hit_leaves_the_recompute_margin_block(self):
         parsed = parse_kv_cache_config(
             config(group(["model.layers.0.attn"], FullAttentionSpec(128))),
             scheduler_block_size=128,
         )
         proxy = FakeProxy()
-        coordinator = UCMLookupCoordinator(
+        coordinator = UCMDispatcher(
             parsed, UCMProxyAdapter(proxy), self.hasher, b"seed"
         )
         request = FakeRequest("r", 512)
@@ -974,8 +1020,9 @@ class HashAndLookupTest(unittest.TestCase):
 
         result = coordinator.lookup(request, 0)
 
-        self.assertEqual(result.restore_end_tokens, 512)
-        self.assertEqual(result.external_hit_tokens, 511)
+        # The scan ends at the last complete block below the recompute
+        # margin (v1 semantics): 384 restored, the last 128 recomputed.
+        self.assertEqual(result.external_hit_tokens, 384)
 
     def test_hybrid_reverse_selects_latest_common_state(self):
         parsed = parse_kv_cache_config(
@@ -986,7 +1033,7 @@ class HashAndLookupTest(unittest.TestCase):
             scheduler_block_size=128,
         )
         proxy = FakeProxy()
-        coordinator = UCMLookupCoordinator(
+        coordinator = UCMDispatcher(
             parsed, UCMProxyAdapter(proxy), self.hasher, b"seed", recompute_tokens=0
         )
         request = FakeRequest("r", 1024)
@@ -996,7 +1043,6 @@ class HashAndLookupTest(unittest.TestCase):
 
         result = coordinator.lookup(request, 0)
 
-        self.assertEqual(result.restore_end_tokens, 512)
         self.assertEqual(result.external_hit_tokens, 512)
 
     def test_hybrid_full_hit_leaves_one_complete_state_alignment_block(self):
@@ -1008,7 +1054,7 @@ class HashAndLookupTest(unittest.TestCase):
             scheduler_block_size=128,
         )
         proxy = FakeProxy()
-        coordinator = UCMLookupCoordinator(
+        coordinator = UCMDispatcher(
             parsed, UCMProxyAdapter(proxy), self.hasher, b"seed"
         )
         request = FakeRequest("r", 1024)
@@ -1017,7 +1063,6 @@ class HashAndLookupTest(unittest.TestCase):
 
         result = coordinator.lookup(request, 0)
 
-        self.assertEqual(result.restore_end_tokens, 896)
         self.assertEqual(result.external_hit_tokens, 896)
 
     def test_hybrid_miss_still_returns_state_keys_for_later_dump(self):
@@ -1028,7 +1073,7 @@ class HashAndLookupTest(unittest.TestCase):
             ),
             scheduler_block_size=128,
         )
-        coordinator = UCMLookupCoordinator(
+        coordinator = UCMDispatcher(
             parsed,
             UCMProxyAdapter(FakeProxy()),
             self.hasher,
@@ -1048,14 +1093,14 @@ class HashAndLookupTest(unittest.TestCase):
                 group(["model.layers.2.attn"], AscendMLAAttentionSpec(128, compress_ratio=4)),
                 group(
                     ["model.layers.0.swa_cache"],
-                    AscendSlidingWindowMLASpec(128, 1, 4096),
+                    AscendSlidingWindowMLASpec(128, 1, 128),
                 ),
                 num_blocks=4,
             ),
             scheduler_block_size=16,
         )
         proxy = FakeProxy()
-        coordinator = UCMLookupCoordinator(
+        coordinator = UCMDispatcher(
             parsed, UCMProxyAdapter(proxy), self.hasher, b"seed", recompute_tokens=0
         )
         request = FakeRequest("r", 1536)
@@ -1065,7 +1110,7 @@ class HashAndLookupTest(unittest.TestCase):
 
         result = coordinator.lookup(request, 0)
 
-        self.assertEqual(result.restore_end_tokens, 1024)
+        self.assertEqual(result.external_hit_tokens, 1024)
         self.assertEqual(result.group_ucm_block_ids, (fa_keys, wa_keys))
 
     def test_dsv4_full_hit_leaves_one_complete_canonical_block(self):
@@ -1074,14 +1119,14 @@ class HashAndLookupTest(unittest.TestCase):
                 group(["model.layers.2.attn"], AscendMLAAttentionSpec(128, compress_ratio=4)),
                 group(
                     ["model.layers.0.swa_cache"],
-                    AscendSlidingWindowMLASpec(128, 1, 4096),
+                    AscendSlidingWindowMLASpec(128, 1, 128),
                 ),
                 num_blocks=4,
             ),
             scheduler_block_size=16,
         )
         proxy = FakeProxy()
-        coordinator = UCMLookupCoordinator(
+        coordinator = UCMDispatcher(
             parsed, UCMProxyAdapter(proxy), self.hasher, b"seed"
         )
         request = FakeRequest("r", 1536)
@@ -1090,7 +1135,6 @@ class HashAndLookupTest(unittest.TestCase):
 
         result = coordinator.lookup(request, 0)
 
-        self.assertEqual(result.restore_end_tokens, 1024)
         self.assertEqual(result.external_hit_tokens, 1024)
 
 
@@ -1239,17 +1283,16 @@ class ProxyAdapterTest(unittest.TestCase):
         )
         from ucm.integration.vllm.v2.ucm_scheduler import (
             RequestDispatchMeta,
-            UCMGroupBlockIds,
             UCMGroupDispatchPlan,
+            UCMGroupWindows,
         )
 
         plan = UCMGroupDispatchPlan(
             0,
             (b"x" * 16,),
             0,
-            0,
             4,
-            (UCMGroupBlockIds(0, 0, (5,)),),
+            (UCMGroupWindows(0, 1, True, (5,), (), ()),),
         )
         connector.bind_connector_metadata(
             UCMConnectorMetadata(
@@ -1288,8 +1331,8 @@ class ProxyAdapterTest(unittest.TestCase):
         )
         from ucm.integration.vllm.v2.ucm_scheduler import (
             RequestDispatchMeta,
-            UCMGroupBlockIds,
             UCMGroupDispatchPlan,
+            UCMGroupWindows,
         )
 
         def request_meta(request_id, key, block_id):
@@ -1297,9 +1340,8 @@ class ProxyAdapterTest(unittest.TestCase):
                 0,
                 (key,),
                 0,
-                0,
                 4,
-                (UCMGroupBlockIds(0, 0, (block_id,)),),
+                (UCMGroupWindows(0, 1, True, (block_id,), (), ()),),
             )
             return RequestDispatchMeta(request_id, (plan,))
 
@@ -1327,7 +1369,7 @@ class DispatcherLifecycleTest(unittest.TestCase):
             config(group(["model.layers.0.attn"], FullAttentionSpec(128))),
             scheduler_block_size=128,
         )
-        self.dispatcher = UCMDispatcher(self.parsed)
+        self.dispatcher = make_dispatcher(self.parsed)
 
     @staticmethod
     def scheduler_output(
@@ -1355,7 +1397,9 @@ class DispatcherLifecycleTest(unittest.TestCase):
     def add_state(self, request_id="r"):
         request = FakeRequest(request_id, 512)
         keys = tuple(bytes([index]) * 16 for index in range(4))
-        return self.dispatcher.record_lookup(request, 0, UCMLookupResult(0, 0, (keys,)))
+        return seed_request_state(
+            self.dispatcher, request, group_ucm_block_ids=(keys,)
+        )
 
     def test_new_replaces_and_cached_appends_block_tables(self):
         state = self.add_state()
@@ -1412,10 +1456,10 @@ class DispatcherLifecycleTest(unittest.TestCase):
             scheduler_block_size=128,
             ucm_cache_block_size=512,
         )
-        dispatcher = UCMDispatcher(parsed)
+        dispatcher = make_dispatcher(parsed)
         request = FakeRequest("chunked", 1024)
         keys = (b"a" * 16, b"b" * 16)
-        state = dispatcher.record_lookup(request, 0, UCMLookupResult(0, 0, (keys,)))
+        state = seed_request_state(dispatcher, request, group_ucm_block_ids=(keys,))
         state.group_vllm_block_ids = ([1, 2, 3, 4, 5, 6, 7, 8],)
 
         first = dispatcher.build_metadata({"chunked": 128})
@@ -1428,18 +1472,20 @@ class DispatcherLifecycleTest(unittest.TestCase):
             (second_plan.keys, second_plan.token_start, second_plan.token_end),
             ((keys[0],), 0, 512),
         )
-        self.assertEqual(second_plan.vllm_blocks[0].block_ids, (1, 2, 3, 4))
+        self.assertEqual(
+            second_plan.windows[0].blocks,
+            (1, 2, 3, 4),
+        )
         third_plan = third.requests["chunked"].dump_plans[0]
         self.assertEqual(
             (third_plan.keys, third_plan.token_start, third_plan.token_end),
             ((keys[1],), 512, 1024),
         )
-        self.assertEqual(third_plan.vllm_blocks[0].block_ids, (5, 6, 7, 8))
+        self.assertEqual(third_plan.windows[0].blocks, (5, 6, 7, 8))
 
     def test_external_load_plan_is_consumed_after_first_scheduled_step(self):
         state = self.add_state()
         state.external_hit_tokens = 128
-        state.restore_end_tokens = 128
         state.token_processed = 128
         state.load_pending = True
         state.group_vllm_block_ids = ([3, 4, 5, 6],)
@@ -1465,12 +1511,12 @@ class DispatcherLifecycleTest(unittest.TestCase):
             ),
             scheduler_block_size=128,
         )
-        dispatcher = UCMDispatcher(parsed)
+        dispatcher = make_dispatcher(parsed)
         request = FakeRequest("r", 2048)
         fa_keys = tuple(bytes([index]) * 16 for index in range(16))
         state_keys = tuple(bytes([index + 32]) * 16 for index in range(16))
-        dispatcher.record_lookup(
-            request, 0, UCMLookupResult(0, 0, (fa_keys, state_keys))
+        seed_request_state(
+            dispatcher, request, group_ucm_block_ids=(fa_keys, state_keys)
         )
         for request_id, state in dispatcher.requests.items():
             state.group_vllm_block_ids = (list(range(16)), list(range(16)))
@@ -1495,7 +1541,7 @@ class DispatcherLifecycleTest(unittest.TestCase):
         self.assertEqual(state_plan.token_end, 1024)
         # The snapshot block is the boundary's (1024th token's) block,
         # not the step end's (1100th token's) block.
-        self.assertEqual(state_plan.vllm_blocks[0].block_ids, (7,))
+        self.assertEqual(state_plan.windows[0].blocks, (7,))
 
         # [1100, 1124) completes no new boundary: nothing more to record.
         third = dispatcher.build_metadata({"r": 24})
@@ -1526,12 +1572,12 @@ class DispatcherLifecycleTest(unittest.TestCase):
             ),
             scheduler_block_size=8,
         )
-        dispatcher = UCMDispatcher(parsed)
+        dispatcher = make_dispatcher(parsed)
         request = FakeRequest("dsv4", 1024)
         fa_keys = (b"a" * 16, b"b" * 16)
         wa_keys = (b"c" * 16, b"d" * 16)
-        state = dispatcher.record_lookup(
-            request, 0, UCMLookupResult(1024, 1024, (fa_keys, wa_keys))
+        state = seed_request_state(
+            dispatcher, request, 1024, (fa_keys, wa_keys)
         )
         state.group_vllm_block_ids = (
             [1, 2],
@@ -1553,15 +1599,95 @@ class DispatcherLifecycleTest(unittest.TestCase):
             if plan.hash_group == "WA"
         )
 
-        self.assertEqual(tuple(item.group_id for item in fa_plan.vllm_blocks), (0, 1))
+        self.assertEqual(tuple(item.group_id for item in fa_plan.windows), (0, 1))
         self.assertEqual(wa_plan.keys, (wa_keys[1],))
         self.assertEqual(
             tuple(
-                (item.group_id, item.start_block_index, item.block_ids)
-                for item in wa_plan.vllm_blocks
+                (
+                    window.group_id,
+                    window.per_key,
+                    window.whole,
+                    window.blocks,
+                    window.local_starts,
+                    window.local_ends,
+                )
+                for window in wa_plan.windows
             ),
-            ((2, 7, (7,)), (3, 127, (127,))),
+            (
+                # swa tail: exactly one whole 128-token block.
+                (2, 1, True, (7,), (), ()),
+                # C4 compressor tail: half a block, the [4, 8) sub-span.
+                (3, 1, False, (127,), (4,), (8,)),
+            ),
         )
+
+    def test_dsv4_fa_windows_encode_n_to_one_keys_flat(self):
+        parsed = parse_kv_cache_config(
+            config(
+                group(["model.layers.2.attn"], AscendMLAAttentionSpec(128, compress_ratio=4)),
+                group(["model.layers.3.attn"], AscendMLAAttentionSpec(128, compress_ratio=128)),
+            ),
+            scheduler_block_size=16,
+        )
+        dispatcher = make_dispatcher(parsed)
+        request = FakeRequest("r", 2048)
+        c4_keys = tuple(bytes([index]) * 16 for index in range(4))
+        c128_keys = tuple(bytes([index + 16]) * 16 for index in range(4))
+        seed_request_state(
+            dispatcher, request, group_ucm_block_ids=(c4_keys, c128_keys)
+        )
+        dispatcher.requests["r"].group_vllm_block_ids = ([1, 2, 3, 4], [5, 6])
+
+        metadata = dispatcher.build_metadata({"r": 2048})
+        plan = metadata.requests["r"].dump_plans[0]
+
+        # Group 0 (token block 512 == unit): one whole block per key.
+        self.assertEqual(
+            plan.windows[0],
+            UCMGroupWindows(0, 1, True, (1, 2, 3, 4), (), ()),
+        )
+        # Group 1 (token block 16384): four keys share one page; each key
+        # is one 512-token sub-span at an arithmetic offset -- flat, not
+        # one nested object per key.
+        self.assertEqual(
+            plan.windows[1],
+            UCMGroupWindows(
+                1,
+                1,
+                False,
+                (5, 5, 5, 5),
+                (0, 512, 1024, 1536),
+                (512, 1024, 1536, 2048),
+            ),
+        )
+
+    def test_large_prefill_plan_stays_flat_and_compact(self):
+        # 8192 keys in one step (unit 128 => a 1M-token prefill): the
+        # flat encoding keeps the pickled metadata well under a megabyte.
+        parsed = parse_kv_cache_config(
+            config(group(["model.layers.0.attn"], FullAttentionSpec(128))),
+            scheduler_block_size=128,
+        )
+        dispatcher = make_dispatcher(parsed)
+        keys = tuple(bytes([index % 256]) * 16 for index in range(8192))
+        state = seed_request_state(
+            dispatcher,
+            FakeRequest("r", 8192 * 128),
+            group_ucm_block_ids=(keys,),
+        )
+        state.group_vllm_block_ids = (list(range(8192)),)
+
+        metadata = dispatcher.build_metadata({"r": 8192 * 128})
+        plan = metadata.requests["r"].dump_plans[0]
+
+        self.assertEqual(len(plan.keys), 8192)
+        self.assertEqual(plan.windows[0].per_key, 1)
+        self.assertTrue(plan.windows[0].whole)
+        self.assertEqual(len(plan.windows[0].blocks), 8192)
+
+        import pickle
+
+        self.assertLess(len(pickle.dumps(metadata)), 1024 * 1024)
 
 
 class RaggedLayoutTest(unittest.TestCase):
@@ -1648,13 +1774,17 @@ class RaggedLayoutTest(unittest.TestCase):
 
         from ucm.integration.vllm.v2.ucm_scheduler import (
             RequestDispatchMeta,
-            UCMGroupBlockIds,
             UCMGroupDispatchPlan,
+            UCMGroupWindows,
         )
 
         key = b"m" * 16
         plan = UCMGroupDispatchPlan(
-            "State", (key,), 0, 0, 4, (UCMGroupBlockIds(1, 0, (3,)),)
+            "State",
+            (key,),
+            0,
+            4,
+            (UCMGroupWindows(1, 1, True, (3,), (), ()),),
         )
         metadata = UCMConnectorMetadata(
             requests={"r": RequestDispatchMeta("r", load_plans=(plan,))}
@@ -1750,18 +1880,19 @@ class RaggedLayoutTest(unittest.TestCase):
 
         from ucm.integration.vllm.v2.ucm_scheduler import (
             RequestDispatchMeta,
-            UCMGroupBlockIds,
             UCMGroupDispatchPlan,
+            UCMGroupWindows,
         )
 
         key = b"p" * 16
+        # One key straddling two half blocks: the tail of block 2 and the
+        # head of block 3, spelled out in the plan.
         plan = UCMGroupDispatchPlan(
             0,
             (key,),
-            0,
             64,
             192,
-            (UCMGroupBlockIds(0, 0, (2, 3)),),
+            (UCMGroupWindows(0, 2, False, (2, 3), (64, 0), (128, 64)),),
         )
         metadata = UCMConnectorMetadata(
             requests={"r": RequestDispatchMeta("r", load_plans=(plan,))}
@@ -1790,8 +1921,8 @@ class RaggedLayoutTest(unittest.TestCase):
         )
         from ucm.integration.vllm.v2.ucm_scheduler import (
             RequestDispatchMeta,
-            UCMGroupBlockIds,
             UCMGroupDispatchPlan,
+            UCMGroupWindows,
         )
 
         key = b"p" * 16
@@ -1800,10 +1931,13 @@ class RaggedLayoutTest(unittest.TestCase):
             plan = UCMGroupDispatchPlan(
                 0,
                 (key,),
-                0,
                 64,
                 192,
-                (UCMGroupBlockIds(0, 0, block_ids),),
+                (
+                    UCMGroupWindows(
+                        0, 2, False, block_ids, (64, 0), (128, 64)
+                    ),
+                ),
             )
             metadata = UCMConnectorMetadata(
                 requests={
@@ -1863,14 +1997,18 @@ class RaggedLayoutTest(unittest.TestCase):
         from ucm.integration.vllm.v2.ucm_proxy import UCMProxyAdapter
         from ucm.integration.vllm.v2.ucm_scheduler import (
             RequestDispatchMeta,
-            UCMGroupBlockIds,
             UCMGroupDispatchPlan,
+            UCMGroupWindows,
         )
 
         key = b"d" * 16
         adapter = UCMProxyAdapter(InMemoryByteProxy(memory))
         dump_plan = UCMGroupDispatchPlan(
-            0, (key,), 0, 0, 16, (UCMGroupBlockIds(0, 0, (3, 4)),)
+            0,
+            (key,),
+            0,
+            16,
+            (UCMGroupWindows(0, 2, True, (3, 4), (), ()),),
         )
         dump_meta = UCMConnectorMetadata(
             requests={"r": RequestDispatchMeta("r", dump_plans=(dump_plan,))}
@@ -1882,7 +2020,11 @@ class RaggedLayoutTest(unittest.TestCase):
         # The load lands on scattered blocks; the record positions of both
         # logical blocks stay where the dump put them.
         load_plan = UCMGroupDispatchPlan(
-            0, (key,), 0, 0, 16, (UCMGroupBlockIds(0, 0, (6, 2)),)
+            0,
+            (key,),
+            0,
+            16,
+            (UCMGroupWindows(0, 2, True, (6, 2), (), ()),),
         )
         load_meta = UCMConnectorMetadata(
             requests={"r": RequestDispatchMeta("r", load_plans=(load_plan,))}
@@ -1935,12 +2077,16 @@ class RaggedLayoutTest(unittest.TestCase):
         key = b"k" * 16
         from ucm.integration.vllm.v2.ucm_scheduler import (
             RequestDispatchMeta,
-            UCMGroupBlockIds,
             UCMGroupDispatchPlan,
+            UCMGroupWindows,
         )
 
         plan = UCMGroupDispatchPlan(
-            0, (key,), 0, 0, 768, (UCMGroupBlockIds(0, 0, (1,)),)
+            0,
+            (key,),
+            0,
+            768,
+            (UCMGroupWindows(0, 1, True, (1,), (), ()),),
         )
         metadata = UCMConnectorMetadata(
             requests={"r": RequestDispatchMeta("r", load_plans=(plan,))}
@@ -1996,12 +2142,16 @@ class RaggedLayoutTest(unittest.TestCase):
         key = b"s" * 16
         from ucm.integration.vllm.v2.ucm_scheduler import (
             RequestDispatchMeta,
-            UCMGroupBlockIds,
             UCMGroupDispatchPlan,
+            UCMGroupWindows,
         )
 
         plan = UCMGroupDispatchPlan(
-            0, (key,), 0, 1536, 2304, (UCMGroupBlockIds(1, 2, (1,)),)
+            0,
+            (key,),
+            1536,
+            2304,
+            (UCMGroupWindows(1, 1, True, (1,), (), ()),),
         )
         metadata = UCMConnectorMetadata(
             requests={"r": RequestDispatchMeta("r", load_plans=(plan,))}
@@ -2042,7 +2192,7 @@ class RaggedLayoutTest(unittest.TestCase):
         }
         layout = UCMKVCacheLayout(parsed, caches)
         proxy = FakeProxy()
-        coordinator = UCMLookupCoordinator(
+        coordinator = UCMDispatcher(
             parsed,
             UCMProxyAdapter(proxy),
             RequestHasher(vllm_config(), 0),
@@ -2050,12 +2200,11 @@ class RaggedLayoutTest(unittest.TestCase):
             recompute_tokens=0,
         )
         request = FakeRequest("r", 256)
-        result = coordinator.lookup(request, 0)
-        dispatcher = UCMDispatcher(parsed)
-        state = dispatcher.record_lookup(request, 0, result)
+        dispatcher = coordinator
+        result = dispatcher.lookup(request, 0)
+        state = dispatcher.requests["r"]
         state.group_vllm_block_ids = ([2, 5],)
         state.external_hit_tokens = 256
-        state.restore_end_tokens = 256
         state.load_pending = True
         metadata = dispatcher.build_metadata({"r": 1})
 
@@ -2142,13 +2291,17 @@ class RaggedLayoutTest(unittest.TestCase):
 
         from ucm.integration.vllm.v2.ucm_scheduler import (
             RequestDispatchMeta,
-            UCMGroupBlockIds,
             UCMGroupDispatchPlan,
+            UCMGroupWindows,
         )
 
         key = b"b" * 16
         plan = UCMGroupDispatchPlan(
-            0, (key,), 0, 0, 256, (UCMGroupBlockIds(0, 0, (2,)),)
+            0,
+            (key,),
+            0,
+            256,
+            (UCMGroupWindows(0, 1, True, (2,), (), ()),),
         )
         metadata = UCMConnectorMetadata(
             requests={"r": RequestDispatchMeta("r", load_plans=(plan,))}
@@ -2274,13 +2427,17 @@ class RaggedLayoutTest(unittest.TestCase):
         # layer 1's attention lands at its tile-slot record offset.
         from ucm.integration.vllm.v2.ucm_scheduler import (
             RequestDispatchMeta,
-            UCMGroupBlockIds,
             UCMGroupDispatchPlan,
+            UCMGroupWindows,
         )
 
         key = b"c" * 16
         plan = UCMGroupDispatchPlan(
-            0, (key,), 0, 0, 256, (UCMGroupBlockIds(0, 0, (3,)),)
+            0,
+            (key,),
+            0,
+            256,
+            (UCMGroupWindows(0, 1, True, (3,), (), ()),),
         )
         metadata = UCMConnectorMetadata(
             requests={"r": RequestDispatchMeta("r", load_plans=(plan,))}
@@ -2341,13 +2498,17 @@ class RaggedLayoutTest(unittest.TestCase):
 
         from ucm.integration.vllm.v2.ucm_scheduler import (
             RequestDispatchMeta,
-            UCMGroupBlockIds,
             UCMGroupDispatchPlan,
+            UCMGroupWindows,
         )
 
         key = b"r" * 16
         plan = UCMGroupDispatchPlan(
-            0, (key,), 0, 0, 8, (UCMGroupBlockIds(0, 0, (2, 5)),)
+            0,
+            (key,),
+            0,
+            8,
+            (UCMGroupWindows(0, 2, True, (2, 5), (), ()),),
         )
         metadata = UCMConnectorMetadata(
             requests={"r": RequestDispatchMeta("r", load_plans=(plan,))}
@@ -2415,13 +2576,17 @@ class RaggedLayoutTest(unittest.TestCase):
         layout = UCMKVCacheLayout(parsed, caches)
         from ucm.integration.vllm.v2.ucm_scheduler import (
             RequestDispatchMeta,
-            UCMGroupBlockIds,
             UCMGroupDispatchPlan,
+            UCMGroupWindows,
         )
 
         key = b"t" * 16
         plan = UCMGroupDispatchPlan(
-            0, (key,), 0, 0, 256, (UCMGroupBlockIds(0, 0, (2, 5)),)
+            0,
+            (key,),
+            0,
+            256,
+            (UCMGroupWindows(0, 2, True, (2, 5), (), ()),),
         )
         metadata = UCMConnectorMetadata(
             requests={"r": RequestDispatchMeta("r", load_plans=(plan,))}
@@ -2471,12 +2636,16 @@ class RaggedLayoutTest(unittest.TestCase):
         key = b"g" * 16
         from ucm.integration.vllm.v2.ucm_scheduler import (
             RequestDispatchMeta,
-            UCMGroupBlockIds,
             UCMGroupDispatchPlan,
+            UCMGroupWindows,
         )
 
         plan = UCMGroupDispatchPlan(
-            0, (key,), 0, 0, 128, (UCMGroupBlockIds(0, 0, (2,)),)
+            0,
+            (key,),
+            0,
+            128,
+            (UCMGroupWindows(0, 1, True, (2,), (), ()),),
         )
         metadata = UCMConnectorMetadata(
             requests={"r": RequestDispatchMeta("r", load_plans=(plan,))}
@@ -2491,8 +2660,8 @@ class RaggedLayoutTest(unittest.TestCase):
     def test_model_layer_selection_spans_cache_names_and_groups(self):
         from ucm.integration.vllm.v2.ucm_scheduler import (
             RequestDispatchMeta,
-            UCMGroupBlockIds,
             UCMGroupDispatchPlan,
+            UCMGroupWindows,
         )
 
         packed_names = [
@@ -2543,13 +2712,23 @@ class RaggedLayoutTest(unittest.TestCase):
         )
 
         def metadata(block0, block1, start, end):
+            # One key whose window is [start, end): a whole block, or the
+            # sub-block span the old token range used to imply.
+            whole = start == 0 and end == 4
+            local_starts = () if whole else (start,)
+            local_ends = () if whole else (end,)
+
+            def group_window(group_id, block_id):
+                return UCMGroupWindows(
+                    group_id, 1, whole, (block_id,), local_starts, local_ends
+                )
+
             plan = UCMGroupDispatchPlan(
                 "FA",
                 (b"record",),
-                0,
                 start,
                 end,
-                (UCMGroupBlockIds(0, 0, (block0,)), UCMGroupBlockIds(1, 0, (block1,))),
+                (group_window(0, block0), group_window(1, block1)),
             )
             return UCMConnectorMetadata(
                 requests={
@@ -2626,7 +2805,7 @@ class RaggedLayoutTest(unittest.TestCase):
                 group(["model.layers.3.attn"], AscendMLAAttentionSpec(128, compress_ratio=128)),
                 group(
                     ["model.layers.0.swa_cache"],
-                    AscendSlidingWindowMLASpec(128, 1, 4096),
+                    AscendSlidingWindowMLASpec(128, 1, 128),
                 ),
                 num_blocks=4,
             ),
@@ -2658,17 +2837,18 @@ class RaggedLayoutTest(unittest.TestCase):
         key = b"k" * 16
         from ucm.integration.vllm.v2.ucm_scheduler import (
             RequestDispatchMeta,
-            UCMGroupBlockIds,
             UCMGroupDispatchPlan,
+            UCMGroupWindows,
         )
 
         plan = UCMGroupDispatchPlan(
             "FA",
             (key,),
-            1,
             512,
             1024,
-            (UCMGroupBlockIds(1, 0, (2,)),),
+            # N:1: the key is one 512-token sub-span inside a 16384-token
+            # page, spelled out instead of re-derived from the token range.
+            (UCMGroupWindows(1, 1, False, (2,), (512,), (1024,)),),
         )
         metadata = UCMConnectorMetadata(
             requests={"r": RequestDispatchMeta("r", load_plans=(plan,))}
@@ -2692,16 +2872,13 @@ class RaggedLayoutTest(unittest.TestCase):
             "model.layers.1.mixer": FakeTensor(0x5000, (8, 64, 4), (256, 4, 1)),
         }
         layout = UCMKVCacheLayout(parsed, caches)
-        dispatcher = UCMDispatcher(parsed)
+        dispatcher = make_dispatcher(parsed)
         request = FakeRequest("r", 512)
-        state = dispatcher.record_lookup(
+        state = seed_request_state(
+            dispatcher,
             request,
-            0,
-            UCMLookupResult(
-                512,
-                512,
-                ((b"a" * 16,) * 4, (b"s" * 16,) * 4),
-            ),
+            512,
+            ((b"a" * 16,) * 4, (b"s" * 16,) * 4),
         )
         state.group_vllm_block_ids = ([1, 2, 3, 4], [0, 1, 2, 6])
 
@@ -2730,15 +2907,15 @@ class RaggedLayoutTest(unittest.TestCase):
         key = b"z" * 16
         from ucm.integration.vllm.v2.ucm_scheduler import (
             RequestDispatchMeta,
-            UCMGroupBlockIds,
             UCMGroupDispatchPlan,
+            UCMGroupWindows,
         )
 
         dump_plan = UCMGroupDispatchPlan(
-            0, (key,), 0, 0, 4, (UCMGroupBlockIds(0, 0, (1,)),)
+            0, (key,), 0, 4, (UCMGroupWindows(0, 1, True, (1,), (), ()),)
         )
         load_plan = UCMGroupDispatchPlan(
-            0, (key,), 0, 0, 4, (UCMGroupBlockIds(0, 0, (6,)),)
+            0, (key,), 0, 4, (UCMGroupWindows(0, 1, True, (6,), (), ()),)
         )
         dump_meta = UCMConnectorMetadata(
             requests={"r": RequestDispatchMeta("r", dump_plans=(dump_plan,))}
@@ -2796,7 +2973,7 @@ class RaggedLayoutTest(unittest.TestCase):
             dump_batch.sizes,
         )
         deferred_load_plan = UCMGroupDispatchPlan(
-            0, (key,), 0, 0, 4, (UCMGroupBlockIds(0, 0, (7,)),)
+            0, (key,), 0, 4, (UCMGroupWindows(0, 1, True, (7,), (), ()),)
         )
         deferred_load_meta = UCMConnectorMetadata(
             requests={"r": RequestDispatchMeta("r", load_plans=(deferred_load_plan,))}

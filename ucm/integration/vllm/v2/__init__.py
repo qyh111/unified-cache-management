@@ -17,7 +17,7 @@ from .ucm_proxy import (
     UCMProxy,
     UCMProxyAdapter,
 )
-from .ucm_scheduler import UCMLookupCoordinator, UCMDispatcher
+from .ucm_scheduler import UCMDispatcher
 
 __all__ = [
     "UCMConnector",
@@ -25,7 +25,6 @@ __all__ = [
     "UCMDispatcher",
     "UCMKVCacheLayout",
     "UCMKVCacheSpec",
-    "UCMLookupCoordinator",
     "UCMProxy",
     "UCMProxyAdapter",
     "UCMByteAccess",
