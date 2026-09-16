@@ -131,6 +131,9 @@ class TorchTensorByteAccess:
                 npu.synchronize(device)
 
     def _view(self, ptr: int, size: int) -> torch.Tensor:
+        # Callers hand us numpy scalars (the batch arrays are uint64);
+        # torch slicing wants plain ints.
+        ptr, size = int(ptr), int(size)
         for base, end, tensor in self._buffers:
             if base <= ptr and ptr + size <= end:
                 offset = ptr - base
