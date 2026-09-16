@@ -140,30 +140,30 @@ class UCMKVCacheSpec:
     def wa_groups(self) -> tuple[UCMKVCacheGroupInfo, ...]:
         return tuple(group for group in self.groups if group.is_sliding_window)
 
-    def dispatch_chains(
+    def dispatch_routes(
         self,
     ) -> tuple[tuple[Literal["FA", "WA", "State"], tuple["UCMKVCacheGroupInfo", ...]], ...]:
-        """The chains every dump/load works over, in key order: FA, WA, State.
+        """The routing table every dump/load works over: key kind -> groups.
 
         FA holds the full-attention groups; WA the sliding groups that
         re-store a window tail (tail 0 groups store nothing); State the
-        mamba snapshot groups. Empty chains are absent, and
+        mamba snapshot groups. Empty kinds are absent, and
         ``group_ucm_block_ids`` / dispatch plans index these in order.
         """
 
-        chains: list[
-            tuple[Literal["FA", "WA", "State"], tuple[UCMKVCacheGroupInfo, ...]]
+        routes: list[
+            tuple[Literal["FA", "WA", "State"], tuple["UCMKVCacheGroupInfo", ...]]
         ] = []
         if self.fa_groups:
-            chains.append(("FA", self.fa_groups))
+            routes.append(("FA", self.fa_groups))
         wa_stored = tuple(
             group for group in self.wa_groups if (group.tail_tokens or 0) > 0
         )
         if wa_stored:
-            chains.append(("WA", wa_stored))
+            routes.append(("WA", wa_stored))
         if self.state_groups:
-            chains.append(("State", self.state_groups))
-        return tuple(chains)
+            routes.append(("State", self.state_groups))
+        return tuple(routes)
 
     @property
     def layer_to_group(self) -> Mapping[str, int]:
