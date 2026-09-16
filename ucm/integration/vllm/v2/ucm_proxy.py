@@ -50,10 +50,6 @@ class UCMProxy(Protocol):
     ) -> object | None: ...
 
 
-_INT64_DTYPE = np.int64
-_UINT64_DTYPE = np.uint64
-
-
 @runtime_checkable
 class UCMProxyWaiter(Protocol):
     def wait(self, task: object) -> None: ...
@@ -368,10 +364,11 @@ class UCMProxyAdapter:
         sizes: Sequence[int] | np.ndarray,
     ) -> UCMProxyBatch:
         keys = self._keys(block_ids)
-        normalized_offsets = np.asarray(offsets, dtype=np.int64)
-        normalized_sizes = np.asarray(sizes, dtype=np.int64)
-        # Addresses and ids are unsigned; everything else stays int64 so
-        # the two axes never mix in arithmetic.
+        # One unsigned dtype for every axis: ids, addresses, offsets and
+        # sizes are counts that never go negative, and mixed dtypes would
+        # silently promote to float64 in arithmetic.
+        normalized_offsets = np.asarray(offsets, dtype=np.uint64)
+        normalized_sizes = np.asarray(sizes, dtype=np.uint64)
         normalized_ptrs = np.asarray(ptrs, dtype=np.uint64)
         lengths = {
             len(keys),
@@ -384,9 +381,8 @@ class UCMProxyAdapter:
                 "block_ids, offsets, ptrs and sizes must have identical lengths"
             )
         for name, values, invalid in (
-            ("offset", normalized_offsets, normalized_offsets < 0),
             ("ptr", normalized_ptrs, normalized_ptrs == 0),
-            ("size", normalized_sizes, normalized_sizes <= 0),
+            ("size", normalized_sizes, normalized_sizes == 0),
         ):
             if invalid.any():
                 index = int(np.argmax(invalid))

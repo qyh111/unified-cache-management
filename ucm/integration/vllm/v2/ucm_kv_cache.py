@@ -633,9 +633,9 @@ class UCMKVCacheLayout:
         if not keys:
             return UCMProxyBatch(
                 (),
-                np.empty(0, dtype=np.int64),
                 np.empty(0, dtype=np.uint64),
-                np.empty(0, dtype=np.int64),
+                np.empty(0, dtype=np.uint64),
+                np.empty(0, dtype=np.uint64),
             )
         return UCMProxyBatch(
             tuple(keys),
@@ -681,6 +681,9 @@ class UCMKVCacheLayout:
         group_base = 0
         for group, blocks in zip(physical_groups, plan.windows):
             group_layout = self.group_layouts[group.group_id]
+            # Normalize at the pickle boundary: int64 ids mixed into the
+            # uint64 stride arithmetic below would silently promote.
+            blocks = np.asarray(blocks, dtype=np.uint64)
             per_key = group_layout.window_blocks
             total = key_count * per_key
             if len(blocks) != total:
@@ -689,9 +692,7 @@ class UCMKVCacheLayout:
                     f"{len(blocks)} blocks for {key_count} keys x "
                     f"{per_key} blocks each"
                 )
-            if len(blocks) and (
-                blocks.min() < 0 or blocks.max() >= group_layout.num_blocks
-            ):
+            if len(blocks) and blocks.max() >= group_layout.num_blocks:
                 raise ValueError(
                     f"Plan window for group {group.group_id} carries "
                     f"vLLM block IDs outside [0, {group_layout.num_blocks})"
@@ -711,9 +712,9 @@ class UCMKVCacheLayout:
                 # Fast path: whole blocks on a Block First layout are one
                 # IO span each.
                 ptrs = span.base_ptr + blocks * span.block_stride
-                sizes = np.full(total, span.block_size_bytes, dtype=np.int64)
+                sizes = np.full(total, span.block_size_bytes, dtype=np.uint64)
                 offsets = (
-                    np.arange(total, dtype=np.int64) % per_key
+                    np.arange(total, dtype=np.uint64) % per_key
                 ) * span.block_size_bytes + group_base
                 entries_per_key = per_key
             else:
@@ -734,7 +735,7 @@ class UCMKVCacheLayout:
                     )
                     heads = (
                         np.arange(
-                            first_key, first_key + key_count, dtype=np.int64
+                            first_key, first_key + key_count, dtype=np.uint64
                         )
                         * self.spec.ucm_cache_block_size
                         % group_layout.token_block_size

@@ -191,12 +191,12 @@ class KVCacheGroupLayout:
         # Flat columns carry the arithmetic; per-layer slices answer
         # "which rows belong to model layer N" without a ragged array.
         self.layer_names: tuple[str, ...] = tuple(layer_names)
-        self.layer_ids = np.asarray(layer_ids, dtype=np.int64)
+        self.layer_ids = np.asarray(layer_ids, dtype=np.uint64)
         self.base_ptrs = np.asarray(base_ptrs, dtype=np.uint64)
         self.block_strides = np.asarray(block_strides, dtype=np.uint64)
-        self.state_strides = np.asarray(state_strides, dtype=np.int64)
-        self.states_per_block = np.asarray(states_per_block, dtype=np.int64)
-        self.payload_bytes = np.asarray(payload_bytes, dtype=np.int64)
+        self.state_strides = np.asarray(state_strides, dtype=np.uint64)
+        self.states_per_block = np.asarray(states_per_block, dtype=np.uint64)
+        self.payload_bytes = np.asarray(payload_bytes, dtype=np.uint64)
         layer_slices: dict[int, slice] = {}
         for row, layer_id in enumerate(layer_ids):
             first = layer_slices.setdefault(layer_id, slice(row, row + 1))
@@ -220,7 +220,7 @@ class KVCacheGroupLayout:
                     layer.descriptor_position * descriptor.layer_stride
                 )
                 slots.extend((anchor,) * len(views_by_name[layer.layer_name]))
-            self.block_slots = np.asarray(slots, dtype=np.int64)
+            self.block_slots = np.asarray(slots, dtype=np.uint64)
             self.block_size_bytes = self.block_first.block_size_bytes
         else:
             # Layer First record: per-view payload slots, back to back --
@@ -242,8 +242,8 @@ class KVCacheGroupLayout:
         )
         views = len(self.layer_names)
         rows = max(self.window_blocks, 1)
-        template_offsets = np.zeros((rows, views), dtype=np.int64)
-        template_sizes = np.zeros((rows, views), dtype=np.int64)
+        template_offsets = np.zeros((rows, views), dtype=np.uint64)
+        template_sizes = np.zeros((rows, views), dtype=np.uint64)
         template_extras = np.zeros((rows, views), dtype=np.uint64)
         if span:
             template_sizes[0] = self._span_view_sizes(span)
@@ -396,7 +396,7 @@ class KVCacheGroupLayout:
         if layer_names is not None and layer_ids is not None:
             raise ValueError("Specify either layer_names or layer_ids")
         if layer_ids is not None:
-            return np.isin(self.layer_ids, np.asarray(layer_ids, dtype=np.int64))
+            return np.isin(self.layer_ids, np.asarray(layer_ids, dtype=np.uint64))
         if layer_names is None:
             return None
         wanted = set(layer_names)
@@ -421,13 +421,13 @@ class KVCacheGroupLayout:
         cache name of those model layers.
         """
 
-        blocks = np.asarray(block_ids, dtype=np.int64)
+        blocks = np.asarray(block_ids, dtype=np.uint64)
         if self.is_state_snapshot:
-            starts = np.zeros(len(blocks), dtype=np.int64)
-            ends = np.full(len(blocks), self.token_block_size, dtype=np.int64)
+            starts = np.zeros(len(blocks), dtype=np.uint64)
+            ends = np.full(len(blocks), self.token_block_size, dtype=np.uint64)
         else:
-            starts = np.asarray(local_starts, dtype=np.int64)
-            ends = np.asarray(local_ends, dtype=np.int64)
+            starts = np.asarray(local_starts, dtype=np.uint64)
+            ends = np.asarray(local_ends, dtype=np.uint64)
         self._checked_blocks(blocks)
         begins = starts[:, None] * self.states_per_block[None, :]
         stops = ends[:, None] * self.states_per_block[None, :]
@@ -452,7 +452,7 @@ class KVCacheGroupLayout:
         )
         sizes = (state_end - state_begin) * self.state_strides[None, :]
         if layer_ids is not None:
-            mask = np.isin(self.layer_ids, np.asarray(layer_ids, dtype=np.int64))
+            mask = np.isin(self.layer_ids, np.asarray(layer_ids, dtype=np.uint64))
             ptrs = ptrs[:, mask]
             sizes = sizes[:, mask]
         return ptrs, sizes
@@ -469,15 +469,15 @@ class KVCacheGroupLayout:
 
         span = self.block_first
         assert span is not None  # caller checks block_first is not None
-        blocks = np.asarray(block_ids, dtype=np.int64)
+        blocks = np.asarray(block_ids, dtype=np.uint64)
         self._checked_blocks(blocks)
         ptrs = span.base_ptr + blocks * span.block_stride
-        sizes = np.full(len(blocks), span.block_size_bytes, dtype=np.int64)
+        sizes = np.full(len(blocks), span.block_size_bytes, dtype=np.uint64)
         return ptrs, sizes
 
     def _checked_blocks(self, blocks: np.ndarray) -> None:
-        if len(blocks) and ((blocks < 0) | (blocks >= self.num_blocks)).any():
-            bad = blocks[(blocks < 0) | (blocks >= self.num_blocks)][0]
+        if len(blocks) and (blocks >= self.num_blocks).any():
+            bad = blocks[blocks >= self.num_blocks][0]
             raise ValueError(
                 f"vLLM block ID {int(bad)} is outside [0, {self.num_blocks})"
             )

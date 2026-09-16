@@ -438,5 +438,5 @@ class UCMDispatcher:
         # Several keys share one block: the containing block per key (the
         # table is short here -- token_block spans at least two units).
         table_ids = np.asarray(table, dtype=np.uint64)
-        ordinals = np.arange(start, end, dtype=np.int64) * ucm_block_size
+        ordinals = np.arange(start, end, dtype=np.uint64) * ucm_block_size
         return table_ids[ordinals // token_block]
