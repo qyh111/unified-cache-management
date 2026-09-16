@@ -270,9 +270,12 @@ class UCMConnector(KVConnectorBase_V1, SupportsHMA):
             num_hidden_layers=num_layers,
         )
         dtype = str(vllm_config.model_config.dtype).rsplit(".", 1)[-1]
+        # -r2: block-major record layout and ndarray plans (records dumped
+        # by earlier revisions are not byte-compatible).
         namespace = (
             f"{self.context.device_type}-{dtype}"
-            f"-b{self.spec.scheduler_block_size}-c{self.spec.ucm_cache_block_size}"
+            f"-b{self.spec.scheduler_block_size}"
+            f"-c{self.spec.ucm_cache_block_size}-r2"
         )
         root = _storage_root(launch_config) / ".ucm-v2" / namespace
         self._proxy = UCMProxyAdapter(SimpleFileUCMProxy(root))
@@ -340,10 +343,10 @@ class UCMConnector(KVConnectorBase_V1, SupportsHMA):
             except UCMProxyError:
                 self._worker_metadata.mark_failed(request_id)
                 self._invalid_block_ids.update(
-                    block_id
+                    int(block_id)
                     for plan in request.load_plans
                     for group in plan.windows
-                    for block_id in group.blocks
+                    for block_id in group.blocks.tolist()
                 )
         # Synchronous load errors are returned through vLLM's invalid-block and
         # worker-metadata channels; aborting here would bypass those channels.

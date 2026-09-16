@@ -67,6 +67,47 @@ class TensorDescriptor:
 
 
 @dataclass(frozen=True)
+class UCMGroupShape:
+    """One group's static window shape over one ucm block.
+
+    ``blocks`` is how many vllm blocks one ucm block's window spans.
+    ``span`` > 0 marks sub-block windows: a full-attention group whose
+    token block is larger than the ucm block places each key at an
+    arithmetic offset inside its block (derived per plan from the token
+    range); a sliding tail shorter than one block stores the block's
+    trailing ``span`` tokens.  ``head`` is the first block's static
+    local start (sliding tails; full-attention sub-spans derive it per
+    key).
+    """
+
+    blocks: int
+    span: int = 0
+    head: int = 0
+
+
+def group_window_shape(
+    group: "UCMKVCacheGroupInfo", ucm_block_size: int
+) -> UCMGroupShape:
+    """The static per-group window shape; both sides derive it alike."""
+
+    token_block = group.token_block_size
+    if group.is_state_snapshot:
+        return UCMGroupShape(blocks=1)
+    if group.is_sliding_window:
+        tail = group.tail_tokens or 0
+        if tail <= 0:
+            return UCMGroupShape(blocks=0)
+        return UCMGroupShape(
+            blocks=-(-tail // token_block),
+            span=tail % token_block,
+            head=(token_block - tail % token_block) % token_block,
+        )
+    if ucm_block_size % token_block == 0:
+        return UCMGroupShape(blocks=ucm_block_size // token_block)
+    return UCMGroupShape(blocks=1, span=ucm_block_size)
+
+
+@dataclass(frozen=True)
 class BlockFirstView:
     """One group's contiguous per-block span on a Block First layout.
 
@@ -93,6 +134,7 @@ class KVCacheGroupLayout:
         self,
         group: "UCMKVCacheGroupInfo",
         kv_caches: "Mapping[str, torch.Tensor | tuple[torch.Tensor, ...] | list[torch.Tensor]]",
+        ucm_block_size: int = 0,
     ) -> None:
         self.group_id = group.group_id
         self.token_block_size = group.token_block_size
@@ -185,13 +227,64 @@ class KVCacheGroupLayout:
             # view i's slot is the sum of the payloads before it.
             self.block_slots = np.cumsum(self.payload_bytes) - self.payload_bytes
             self.block_size_bytes = int(self.payload_bytes.sum())
+        # Window template: the static half of every dispatch over this
+        # group (the plan's block ids are the dynamic half).  One ucm
+        # block's window is ``window_blocks`` vllm blocks; the template
+        # places their views in one key's record, block-major (block 0's
+        # views, block 1's views, ...).
+        self.window_shape = group_window_shape(group, ucm_block_size)
+        self.window_blocks = self.window_shape.blocks
+        span = self.window_shape.span
+        self.subspan_keys = (
+            not group.is_state_snapshot
+            and not group.is_sliding_window
+            and span > 0
+        )
+        views = len(self.layer_names)
+        rows = max(self.window_blocks, 1)
+        template_offsets = np.zeros((rows, views), dtype=np.int64)
+        template_sizes = np.zeros((rows, views), dtype=np.int64)
+        template_extras = np.zeros((rows, views), dtype=np.int64)
+        if span:
+            template_sizes[0] = self._span_view_sizes(span)
+            template_offsets[0] = (
+                np.cumsum(template_sizes[0]) - template_sizes[0]
+            )
+            if not self.subspan_keys:
+                # A sliding tail's head block starts mid-block.
+                template_extras[0] = self._head_view_offsets(
+                    self.window_shape.head
+                )
+                for row in range(1, rows):
+                    template_sizes[row] = self.payload_bytes
+                    template_offsets[row] = (
+                        int(template_sizes[0].sum())
+                        + (row - 1) * self.block_size_bytes
+                        + self.block_slots
+                    )
+        else:
+            for row in range(rows):
+                template_sizes[row] = self.payload_bytes
+                template_offsets[row] = (
+                    row * self.block_size_bytes + self.block_slots
+                )
+        self.template_offsets = template_offsets
+        self.template_sizes = template_sizes
+        self.template_ptr_extras = template_extras
+        head_bytes = int(template_sizes[0].sum()) if span else 0
+        trailing = rows - 1 if span else rows
+        self.window_record_bytes = (
+            head_bytes + trailing * self.block_size_bytes
+        )
         if LAYOUT_DEBUG:
             layout_debug(
                 f"group-layout group={self.group_id} "
                 f"layers={len(set(self.layer_names))} views={len(self.layer_names)} "
                 f"state={int(self.is_state_snapshot)} "
                 f"block-first={int(self.block_first is not None)} "
-                f"block_size_bytes={self.block_size_bytes} token_block={self.token_block_size}"
+                f"block_size_bytes={self.block_size_bytes} token_block={self.token_block_size} "
+                f"window_blocks={self.window_blocks} span={span} "
+                f"record_bytes={self.window_record_bytes}"
             )
 
     def _block_first_span(
@@ -248,6 +341,44 @@ class KVCacheGroupLayout:
     # ------------------------------------------------------------------
     # Queries
     # ------------------------------------------------------------------
+
+    def _span_view_sizes(self, span_tokens: int) -> np.ndarray:
+        """Per-view bytes of a sub-block token span; exact or error."""
+
+        states = span_tokens * self.states_per_block
+        if (states % self.token_block_size).any():
+            bad = np.nonzero(states % self.token_block_size)[0][:4]
+            names = ", ".join(self.layer_names[index] for index in bad)
+            raise ValueError(
+                f"A {span_tokens}-token span is not representable by "
+                f"tensor layout (views starting at {names})"
+            )
+        return (states // self.token_block_size) * self.state_strides
+
+    def _head_view_offsets(self, head_tokens: int) -> np.ndarray:
+        """Per-view byte offsets of a window starting mid-block."""
+
+        states = head_tokens * self.states_per_block
+        if (states % self.token_block_size).any():
+            raise ValueError(
+                f"A window head at token {head_tokens} is not "
+                "representable by tensor layout"
+            )
+        return (states // self.token_block_size) * self.state_strides
+
+    def span_head_offsets(self, head_tokens: np.ndarray) -> np.ndarray:
+        """Per-(key, view) byte offsets of FA sub-span heads."""
+
+        states = head_tokens[:, None] * self.states_per_block[None, :]
+        if (states % self.token_block_size).any():
+            raise ValueError(
+                "Full-attention sub-span heads are not representable "
+                "by tensor layout"
+            )
+        return (states // self.token_block_size) * self.state_strides[None, :]
+
+    def view_count(self, mask: "np.ndarray | None") -> int:
+        return len(self.layer_names) if mask is None else int(mask.sum())
 
     def view_mask(
         self,

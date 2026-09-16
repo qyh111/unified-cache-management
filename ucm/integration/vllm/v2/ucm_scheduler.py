@@ -8,6 +8,8 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Literal
 
+import numpy as np
+
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
 
 from .ucm_kv_cache import UCMKVCacheGroupInfo, UCMKVCacheSpec
@@ -71,22 +73,15 @@ class RequestState:
 
 @dataclass(frozen=True)
 class UCMGroupWindows:
-    """One group's windows for a plan's keys, flat and self-describing.
+    """One group's window blocks for a plan's keys, as a flat ndarray.
 
-    ``blocks`` are physical ids in (key, in-window) order -- ``per_key``
-    per key, so the worker slices them without re-deriving anything.
-    ``whole`` marks every block fully covered (local spans constant
-    ``(0, token_block_size)``; starts/ends stay empty).  A non-whole
-    group carries each block's token span in ``local_starts`` /
-    ``local_ends``.
+    ``blocks`` holds the physical ids in (key, in-window) order -- the
+    group's static shape (``group_window_shape``) plus the plan's token
+    range carries everything else, so nothing but the ids travels.
     """
 
     group_id: int
-    per_key: int
-    whole: bool
-    blocks: tuple[int, ...]
-    local_starts: tuple[int, ...]
-    local_ends: tuple[int, ...]
+    blocks: "np.ndarray"
 
 
 @dataclass(frozen=True)
@@ -385,6 +380,19 @@ class UCMDispatcher:
                 end = token_end // ucm_block_size
             if end <= start:
                 continue
+            if hash_group == "WA":
+                # A tail window is only worth storing once it is
+                # complete: an early boundary shorter than the chain's
+                # largest tail would clamp the window head to token 0 --
+                # the request's own prefix, which a restore recomputes
+                # anyway.  Skipping keeps every dumped key's record
+                # complete, so reverse lookup never selects a partial
+                # one (the load gate below is the same check).
+                boundary = end * ucm_block_size
+                if boundary < max(
+                    group.tail_tokens or 0 for group in physical_groups
+                ):
+                    continue
             selected_keys = tuple(keys_available[start:end])
             windows = tuple(
                 self._group_windows(hash_group, group, state, start, end)
@@ -409,114 +417,48 @@ class UCMDispatcher:
         start: int,
         end: int,
     ) -> UCMGroupWindows:
-        """One group's flat windows for the plan's keys, fully resolved.
+        """One group's window blocks for the plan's keys, vectorized.
 
-        Three shapes, one per key kind:
-
-        - FA: every key covers one whole unit; take all group blocks the
-          interval spans -- whole blocks when the unit is the larger side
-          (the parse-time divisibility check keeps the per-key block
-          count uniform), the containing block plus a sub-span when the
-          unit is the smaller side.
-        - WA: the single boundary key keeps the tail -- the blocks
-          covering [boundary - tail_tokens, boundary).
-        - State: the single boundary key keeps the last block, one
-          indivisible checkpoint page.
-
-        The worker slices ``blocks`` per key and never re-derives any of
-        this.
+        FA keys each span one whole unit: whole blocks when the unit is
+        the larger side, the containing block per key otherwise.  A WA
+        plan's single boundary key keeps the tail window's blocks (the
+        _plans gate guarantees the window is complete and the parse-time
+        alignment check guarantees the boundary is block-aligned).  A
+        State plan's key keeps the boundary's last block.
         """
 
         ucm_block_size = self.spec.ucm_cache_block_size
         table = state.group_vllm_block_ids[group.group_id]
         token_block = group.token_block_size
-        if hash_group == "FA":
-            if ucm_block_size % token_block == 0:
-                # The unit spans whole blocks: one table slice carries
-                # every key's blocks back to back.
-                return UCMGroupWindows(
-                    group_id=group.group_id,
-                    per_key=ucm_block_size // token_block,
-                    whole=True,
-                    blocks=tuple(
-                        table[
-                            start * ucm_block_size // token_block : end
-                            * ucm_block_size
-                            // token_block
-                        ]
-                    ),
-                    local_starts=(),
-                    local_ends=(),
-                )
-            # Several keys share one block: each key is its containing
-            # block plus one fixed-length sub-span at an arithmetic offset.
+        if hash_group == "State":
+            last = (end * ucm_block_size - 1) // token_block
             return UCMGroupWindows(
-                group_id=group.group_id,
-                per_key=1,
-                whole=False,
-                blocks=tuple(
-                    table[key * ucm_block_size // token_block]
-                    for key in range(start, end)
-                ),
-                local_starts=tuple(
-                    key * ucm_block_size % token_block
-                    for key in range(start, end)
-                ),
-                local_ends=tuple(
-                    key * ucm_block_size % token_block + ucm_block_size
-                    for key in range(start, end)
-                ),
+                group.group_id, np.asarray(table[last : last + 1], dtype=np.int64)
             )
         if hash_group == "WA":
             boundary = end * ucm_block_size
-            return self._range_windows(
+            first = (boundary - (group.tail_tokens or 0)) // token_block
+            return UCMGroupWindows(
                 group.group_id,
-                table,
-                token_block,
-                max(boundary - (group.tail_tokens or 0), 0),
-                boundary,
+                np.asarray(
+                    table[first : boundary // token_block], dtype=np.int64
+                ),
             )
-        # State: the boundary's last block, one indivisible page.
-        last = (end * ucm_block_size - 1) // token_block
-        return UCMGroupWindows(
-            group_id=group.group_id,
-            per_key=1,
-            whole=True,
-            blocks=(table[last],),
-            local_starts=(),
-            local_ends=(),
-        )
-
-    @staticmethod
-    def _range_windows(
-        group_id: int,
-        table: Sequence[int],
-        token_block: int,
-        window_start: int,
-        window_end: int,
-    ) -> UCMGroupWindows:
-        """The blocks covering token range [window_start, window_end).
-
-        Whole blocks come out as one slice; a window that starts or ends
-        mid-block carries its sub-spans in local_starts / local_ends.
-        """
-
-        first = window_start // token_block
-        stop = (window_end - 1) // token_block + 1
-        starts = tuple(
-            max(window_start - (first + ordinal) * token_block, 0)
-            for ordinal in range(stop - first)
-        )
-        ends = tuple(
-            min(window_end - (first + ordinal) * token_block, token_block)
-            for ordinal in range(stop - first)
-        )
-        whole = all(s == 0 and e == token_block for s, e in zip(starts, ends))
-        return UCMGroupWindows(
-            group_id=group_id,
-            per_key=stop - first,
-            whole=whole,
-            blocks=tuple(table[first:stop]),
-            local_starts=() if whole else starts,
-            local_ends=() if whole else ends,
-        )
+        if ucm_block_size % token_block == 0:
+            # Whole blocks: one table slice carries every key's span.
+            return UCMGroupWindows(
+                group.group_id,
+                np.asarray(
+                    table[
+                        start * ucm_block_size // token_block : end
+                        * ucm_block_size
+                        // token_block
+                    ],
+                    dtype=np.int64,
+                ),
+            )
+        # Several keys share one block: the containing block per key (the
+        # table is short here -- token_block spans at least two units).
+        table_ids = np.asarray(table, dtype=np.int64)
+        ordinals = np.arange(start, end, dtype=np.int64) * ucm_block_size
+        return UCMGroupWindows(group.group_id, table_ids[ordinals // token_block])

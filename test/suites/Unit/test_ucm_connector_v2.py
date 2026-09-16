@@ -6,6 +6,7 @@ import os
 import sys
 import tempfile
 import types
+import numpy as np
 import unittest
 from dataclasses import dataclass
 from pathlib import Path
@@ -635,6 +636,22 @@ class KVCacheSpecTest(unittest.TestCase):
                 scheduler_block_size=256,
             )
 
+    def test_parse_rejects_misaligned_sliding_groups(self):
+        # A sliding tail keeps a static window shape: the boundary must
+        # land on the group's block grid, so its token block must divide
+        # the cache block.
+        with self.assertRaisesRegex(ValueError, "must divide"):
+            parse_kv_cache_config(
+                config(
+                    group(["model.layers.0.attn"], FullAttentionSpec(128)),
+                    group(
+                        ["model.layers.1.swa_cache"],
+                        AscendSlidingWindowMLASpec(192, 1, 512),
+                    ),
+                ),
+                scheduler_block_size=128,
+            )
+
     def test_full_attention_with_window_metadata_is_not_sliding(self):
         parsed = parse_kv_cache_config(
             config(
@@ -834,7 +851,7 @@ class MtpLayerIndexTest(unittest.TestCase):
 
     def test_mtp_identity_is_shared_by_selection_ratio_and_tail(self):
         raw = config(
-            group(["model.layers.0.attn"], AscendMLAAttentionSpec(4, compress_ratio=4)),
+            group(["model.layers.0.attn"], AscendMLAAttentionSpec(4, compress_ratio=128)),
             group(["mtp.0.attn"], AscendMLAAttentionSpec(4, compress_ratio=128)),
             group(["mtp.0.swa_cache"], AscendSlidingWindowMLASpec(4, 1, 4)),
             group(
@@ -1292,7 +1309,7 @@ class ProxyAdapterTest(unittest.TestCase):
             (b"x" * 16,),
             0,
             4,
-            (UCMGroupWindows(0, 1, True, (5,), (), ()),),
+            (UCMGroupWindows(0, np.array([5,])),),
         )
         connector.bind_connector_metadata(
             UCMConnectorMetadata(
@@ -1341,7 +1358,7 @@ class ProxyAdapterTest(unittest.TestCase):
                 (key,),
                 0,
                 4,
-                (UCMGroupWindows(0, 1, True, (block_id,), (), ()),),
+                (UCMGroupWindows(0, np.array([block_id,])),),
             )
             return RequestDispatchMeta(request_id, (plan,))
 
@@ -1473,15 +1490,15 @@ class DispatcherLifecycleTest(unittest.TestCase):
             ((keys[0],), 0, 512),
         )
         self.assertEqual(
-            second_plan.windows[0].blocks,
-            (1, 2, 3, 4),
+            second_plan.windows[0].blocks.tolist(),
+            [1, 2, 3, 4],
         )
         third_plan = third.requests["chunked"].dump_plans[0]
         self.assertEqual(
             (third_plan.keys, third_plan.token_start, third_plan.token_end),
             ((keys[1],), 512, 1024),
         )
-        self.assertEqual(third_plan.windows[0].blocks, (5, 6, 7, 8))
+        self.assertEqual(third_plan.windows[0].blocks.tolist(), [5, 6, 7, 8])
 
     def test_external_load_plan_is_consumed_after_first_scheduled_step(self):
         state = self.add_state()
@@ -1541,7 +1558,7 @@ class DispatcherLifecycleTest(unittest.TestCase):
         self.assertEqual(state_plan.token_end, 1024)
         # The snapshot block is the boundary's (1024th token's) block,
         # not the step end's (1100th token's) block.
-        self.assertEqual(state_plan.windows[0].blocks, (7,))
+        self.assertEqual(state_plan.windows[0].blocks.tolist(), [7])
 
         # [1100, 1124) completes no new boundary: nothing more to record.
         third = dispatcher.build_metadata({"r": 24})
@@ -1601,25 +1618,70 @@ class DispatcherLifecycleTest(unittest.TestCase):
 
         self.assertEqual(tuple(item.group_id for item in fa_plan.windows), (0, 1))
         self.assertEqual(wa_plan.keys, (wa_keys[1],))
+        # Windows carry only block ids; the static shapes live in the spec
+        # (swa: one whole 128-token block; C4 compressor: the [4, 8)
+        # half-block sub-span) and the worker derives them from templates.
         self.assertEqual(
             tuple(
-                (
-                    window.group_id,
-                    window.per_key,
-                    window.whole,
-                    window.blocks,
-                    window.local_starts,
-                    window.local_ends,
-                )
+                (window.group_id, window.blocks.tolist())
                 for window in wa_plan.windows
             ),
-            (
-                # swa tail: exactly one whole 128-token block.
-                (2, 1, True, (7,), (), ()),
-                # C4 compressor tail: half a block, the [4, 8) sub-span.
-                (3, 1, False, (127,), (4,), (8,)),
-            ),
+            ((2, [7]), (3, [127])),
         )
+
+    def test_wa_dump_skips_incomplete_tail_windows(self):
+        # A tail window longer than the cache block clamps at the request
+        # head on early boundaries; those partial windows are the
+        # request's own prefix (restored with it), so nothing is dumped
+        # until the boundary outgrows the tail.
+        parsed = parse_kv_cache_config(
+            config(
+                group(["model.layers.0.attn"], FullAttentionSpec(128)),
+                group(
+                    ["model.layers.1.swa_cache"],
+                    AscendSlidingWindowMLASpec(128, 1, 512),
+                ),
+            ),
+            scheduler_block_size=128,
+        )
+        dispatcher = make_dispatcher(parsed)
+        request = FakeRequest("r", 1024)
+        fa_keys = tuple(bytes([index]) * 16 for index in range(8))
+        wa_keys = tuple(bytes([index + 32]) * 16 for index in range(8))
+        seed_request_state(
+            dispatcher, request, group_ucm_block_ids=(fa_keys, wa_keys)
+        )
+        dispatcher.requests["r"].group_vllm_block_ids = (
+            list(range(8)),
+            list(range(8)),
+        )
+
+        # [0, 384): every completed boundary (128..384) is shorter than
+        # the 512-token tail -- no WA record.
+        early = dispatcher.build_metadata({"r": 384})
+        self.assertTrue(
+            any(
+                plan.hash_group == "FA"
+                for plan in early.requests["r"].dump_plans
+            )
+        )
+        self.assertFalse(
+            any(
+                plan.hash_group == "WA"
+                for plan in early.requests["r"].dump_plans
+            )
+        )
+
+        # [384, 640): the newest boundary 640 outgrows the tail -- the
+        # full window [128, 640) is one WA record at that boundary.
+        later = dispatcher.build_metadata({"r": 256})
+        wa_plan = next(
+            plan
+            for plan in later.requests["r"].dump_plans
+            if plan.hash_group == "WA"
+        )
+        self.assertEqual(wa_plan.keys, (wa_keys[4],))
+        self.assertEqual(wa_plan.windows[0].blocks.tolist(), [1, 2, 3, 4])
 
     def test_dsv4_fa_windows_encode_n_to_one_keys_flat(self):
         parsed = parse_kv_cache_config(
@@ -1643,22 +1705,15 @@ class DispatcherLifecycleTest(unittest.TestCase):
 
         # Group 0 (token block 512 == unit): one whole block per key.
         self.assertEqual(
-            plan.windows[0],
-            UCMGroupWindows(0, 1, True, (1, 2, 3, 4), (), ()),
+            plan.windows[0].blocks.tolist(),
+            [1, 2, 3, 4],
         )
-        # Group 1 (token block 16384): four keys share one page; each key
-        # is one 512-token sub-span at an arithmetic offset -- flat, not
-        # one nested object per key.
+        # Group 1 (token block 16384): four keys share one page -- the
+        # same id four times, flat; each key's 512-token sub-span head is
+        # derived on the worker from the plan's token range.
         self.assertEqual(
-            plan.windows[1],
-            UCMGroupWindows(
-                1,
-                1,
-                False,
-                (5, 5, 5, 5),
-                (0, 512, 1024, 1536),
-                (512, 1024, 1536, 2048),
-            ),
+            plan.windows[1].blocks.tolist(),
+            [5, 5, 5, 5],
         )
 
     def test_large_prefill_plan_stays_flat_and_compact(self):
@@ -1681,9 +1736,7 @@ class DispatcherLifecycleTest(unittest.TestCase):
         plan = metadata.requests["r"].dump_plans[0]
 
         self.assertEqual(len(plan.keys), 8192)
-        self.assertEqual(plan.windows[0].per_key, 1)
-        self.assertTrue(plan.windows[0].whole)
-        self.assertEqual(len(plan.windows[0].blocks), 8192)
+        self.assertEqual(plan.windows[0].blocks.tolist(), list(range(8192)))
 
         import pickle
 
@@ -1784,15 +1837,15 @@ class RaggedLayoutTest(unittest.TestCase):
             (key,),
             0,
             4,
-            (UCMGroupWindows(1, 1, True, (3,), (), ()),),
+            (UCMGroupWindows(1, np.array([3,])),),
         )
         metadata = UCMConnectorMetadata(
             requests={"r": RequestDispatchMeta("r", load_plans=(plan,))}
         )
         batch = layout.build_load_batches(metadata)
-        self.assertEqual(batch.ptrs, (0x1000 + 3 * 64,))
-        self.assertEqual(batch.sizes, (16,))
-        self.assertEqual(batch.offsets, (0,))
+        self.assertEqual(batch.ptrs.tolist(), [0x1000 + 3 * 64,])
+        self.assertEqual(batch.sizes.tolist(), [16,])
+        self.assertEqual(batch.offsets.tolist(), [0,])
 
     def test_explicit_components_and_4d_ascend_view_are_supported(self):
         parsed = parse_kv_cache_config(
@@ -1864,13 +1917,18 @@ class RaggedLayoutTest(unittest.TestCase):
 
     def test_partial_range_keeps_block_wise_entries(self):
         parsed = parse_kv_cache_config(
-            config(group(["model.layers.0.attn"], FullAttentionSpec(128))),
+            config(
+                group(
+                    ["model.layers.0.swa_cache"],
+                    AscendSlidingWindowMLASpec(128, 1, 192),
+                )
+            ),
             scheduler_block_size=128,
         )
         layout = UCMKVCacheLayout(
             parsed,
             {
-                "model.layers.0.attn": FakeTensor(
+                "model.layers.0.swa_cache": FakeTensor(
                     0x1000,
                     (8, 128, 1),
                     (128, 1, 1),
@@ -1885,39 +1943,50 @@ class RaggedLayoutTest(unittest.TestCase):
         )
 
         key = b"p" * 16
-        # One key straddling two half blocks: the tail of block 2 and the
-        # head of block 3, spelled out in the plan.
+        # A WA tail shorter than two blocks: the [64, 128) half-block head
+        # of block 2 plus the whole block 3.  Only the ids travel; the
+        # static tail pattern places the sub-spans.
         plan = UCMGroupDispatchPlan(
-            0,
+            "WA",
             (key,),
-            64,
+            0,
             192,
-            (UCMGroupWindows(0, 2, False, (2, 3), (64, 0), (128, 64)),),
+            (UCMGroupWindows(0, np.array([2, 3])),),
         )
         metadata = UCMConnectorMetadata(
             requests={"r": RequestDispatchMeta("r", load_plans=(plan,))}
         )
         batch = layout.build_load_batches(metadata)
 
-        # The tail of block 2 and the head of block 3 stay separate entries
-        # even though they are contiguous in memory: record positions are a
-        # function of the logical enumeration, never of physical adjacency.
-        # Segments pack back to back -- the proxy requires a gapless record.
+        # The half-block head and the whole trailing block stay separate
+        # entries even though they are contiguous in memory: record
+        # positions are a function of the logical enumeration, never of
+        # physical adjacency.  Segments pack back to back -- the proxy
+        # requires a gapless record.
         self.assertEqual(batch.block_ids, (key, key))
-        self.assertEqual(batch.ptrs, (0x1000 + 2 * 128 + 64, 0x1000 + 3 * 128))
-        self.assertEqual(batch.sizes, (64, 64))
-        self.assertEqual(batch.offsets, (0, 64))
+        self.assertEqual(batch.ptrs.tolist(), [0x1000 + 2 * 128 + 64, 0x1000 + 3 * 128])
+        self.assertEqual(batch.sizes.tolist(), [64, 128])
+        self.assertEqual(batch.offsets.tolist(), [0, 64])
 
     def test_partial_records_roundtrip_through_real_file_proxy(self):
         # Exercise the real Proxy's complete-record contract. A memory stub
         # that silently zero-fills holes can hide incorrect file offsets.
         parsed = parse_kv_cache_config(
-            config(group(["model.layers.0.attn"], FullAttentionSpec(128))),
+            config(
+                group(
+                    ["model.layers.0.swa_cache"],
+                    AscendSlidingWindowMLASpec(128, 1, 192),
+                )
+            ),
             scheduler_block_size=128,
         )
         layout = UCMKVCacheLayout(
             parsed,
-            {"model.layers.0.attn": FakeTensor(0x1000, (8, 128, 1), (128, 1, 1))},
+            {
+                "model.layers.0.swa_cache": FakeTensor(
+                    0x1000, (8, 128, 1), (128, 1, 1)
+                )
+            },
         )
         from ucm.integration.vllm.v2.ucm_scheduler import (
             RequestDispatchMeta,
@@ -1929,15 +1998,11 @@ class RaggedLayoutTest(unittest.TestCase):
 
         def batch(phase, block_ids):
             plan = UCMGroupDispatchPlan(
-                0,
+                "WA",
                 (key,),
-                64,
+                0,
                 192,
-                (
-                    UCMGroupWindows(
-                        0, 2, False, block_ids, (64, 0), (128, 64)
-                    ),
-                ),
+                (UCMGroupWindows(0, np.array(block_ids)),),
             )
             metadata = UCMConnectorMetadata(
                 requests={
@@ -1950,7 +2015,9 @@ class RaggedLayoutTest(unittest.TestCase):
         memory.write(0x1000, b"\xef" * 1024)
         memory.write(0x1000 + 2 * 128, bytes(range(128)))
         memory.write(0x1000 + 3 * 128, bytes(range(128, 256)))
-        expected = bytes(range(64, 192))
+        # The tail record: block 2's [64, 128) half-block head plus the
+        # whole block 3.
+        expected = bytes(range(64, 256))
         dumped = batch("dump", (2, 3))
         loaded = batch("load", (7, 5))
         with tempfile.TemporaryDirectory() as directory:
@@ -1964,7 +2031,7 @@ class RaggedLayoutTest(unittest.TestCase):
             memory.read(0x1000 + 7 * 128, 128), b"\xef" * 64 + expected[:64]
         )
         self.assertEqual(
-            memory.read(0x1000 + 5 * 128, 128), expected[64:] + b"\xef" * 64
+            memory.read(0x1000 + 5 * 128, 128), expected[64:]
         )
 
     def test_dump_and_load_survive_different_physical_block_layouts(self):
@@ -2001,38 +2068,38 @@ class RaggedLayoutTest(unittest.TestCase):
             UCMGroupWindows,
         )
 
-        key = b"d" * 16
+        key_a, key_b = b"d" * 16, b"e" * 16
         adapter = UCMProxyAdapter(InMemoryByteProxy(memory))
         dump_plan = UCMGroupDispatchPlan(
             0,
-            (key,),
+            (key_a, key_b),
             0,
             16,
-            (UCMGroupWindows(0, 2, True, (3, 4), (), ()),),
+            (UCMGroupWindows(0, np.array([3, 4])),),
         )
         dump_meta = UCMConnectorMetadata(
             requests={"r": RequestDispatchMeta("r", dump_plans=(dump_plan,))}
         )
         dump_batch = layout.build_dump_batches(dump_meta)
         # Blocks 3 and 4 are enumerated separately even though adjacent.
-        self.assertEqual(dump_batch.sizes, (48, 48))
+        self.assertEqual(dump_batch.sizes.tolist(), [48, 48])
 
-        # The load lands on scattered blocks; the record positions of both
-        # logical blocks stay where the dump put them.
+        # The load lands on scattered blocks; each key's record keeps its
+        # own byte position.
         load_plan = UCMGroupDispatchPlan(
             0,
-            (key,),
+            (key_a, key_b),
             0,
             16,
-            (UCMGroupWindows(0, 2, True, (6, 2), (), ()),),
+            (UCMGroupWindows(0, np.array([6, 2])),),
         )
         load_meta = UCMConnectorMetadata(
             requests={"r": RequestDispatchMeta("r", load_plans=(load_plan,))}
         )
         load_batch = layout.build_load_batches(load_meta)
-        self.assertEqual(load_batch.sizes, (48, 48))
-        self.assertEqual(load_batch.offsets, (0, 48))
-        self.assertEqual(load_batch.ptrs, (0x1000 + 6 * 48, 0x1000 + 2 * 48))
+        self.assertEqual(load_batch.sizes.tolist(), [48, 48])
+        self.assertEqual(load_batch.offsets.tolist(), [0, 0])
+        self.assertEqual(load_batch.ptrs.tolist(), [0x1000 + 6 * 48, 0x1000 + 2 * 48])
 
         adapter.dump(
             dump_batch.block_ids,
@@ -2086,7 +2153,7 @@ class RaggedLayoutTest(unittest.TestCase):
             (key,),
             0,
             768,
-            (UCMGroupWindows(0, 1, True, (1,), (), ()),),
+            (UCMGroupWindows(0, np.array([1,])),),
         )
         metadata = UCMConnectorMetadata(
             requests={"r": RequestDispatchMeta("r", load_plans=(plan,))}
@@ -2094,9 +2161,9 @@ class RaggedLayoutTest(unittest.TestCase):
 
         batch = layout.build_load_batches(metadata)
 
-        self.assertEqual(batch.sizes, (786432, 98304))
-        self.assertEqual(batch.offsets, (0, 786432))
-        self.assertEqual(batch.ptrs, (0x1000 + 786432, 0x200000 + 98304))
+        self.assertEqual(batch.sizes.tolist(), [786432, 98304])
+        self.assertEqual(batch.offsets.tolist(), [0, 786432])
+        self.assertEqual(batch.ptrs.tolist(), [0x1000 + 786432, 0x200000 + 98304])
 
     def test_kimi_state_components_copy_payload_not_shared_page_stride(self):
         parsed = parse_kv_cache_config(
@@ -2151,7 +2218,7 @@ class RaggedLayoutTest(unittest.TestCase):
             (key,),
             1536,
             2304,
-            (UCMGroupWindows(1, 1, True, (1,), (), ()),),
+            (UCMGroupWindows(1, np.array([1,])),),
         )
         metadata = UCMConnectorMetadata(
             requests={"r": RequestDispatchMeta("r", load_plans=(plan,))}
@@ -2159,15 +2226,12 @@ class RaggedLayoutTest(unittest.TestCase):
 
         batch = layout.build_load_batches(metadata)
 
-        self.assertEqual(
-            batch.ptrs,
-            (
+        self.assertEqual(batch.ptrs.tolist(), [
                 0x5000 + conv_bytes,
                 0x5000 + num_blocks * conv_bytes + ssm_bytes,
-            ),
-        )
-        self.assertEqual(batch.sizes, (conv_bytes, ssm_bytes))
-        self.assertEqual(batch.offsets, (0, conv_bytes))
+            ])
+        self.assertEqual(batch.sizes.tolist(), [conv_bytes, ssm_bytes])
+        self.assertEqual(batch.offsets.tolist(), [0, conv_bytes])
 
     def test_component_major_layout_spans_multiple_physical_blocks(self):
         parsed = parse_kv_cache_config(
@@ -2210,23 +2274,20 @@ class RaggedLayoutTest(unittest.TestCase):
 
         batch = layout.build_load_batches(metadata)
 
-        # Records are layer-major per hash window: each view's window bytes
-        # are contiguous across the window's blocks (layer 0 K 512 + V 256,
-        # layer 1 K 384 -- three separate runs, since neither their strides
-        # nor their block-0 addresses chain), then the next view follows.
-        self.assertEqual(batch.offsets, (0, 512, 1024, 1280, 1536, 1920))
-        self.assertEqual(batch.sizes, (512, 512, 256, 256, 384, 384))
-        self.assertEqual(
-            batch.ptrs,
-            (0x1400, 0x1A00, 0x3200, 0x3500, 0x5300, 0x5780),
-        )
+        # Records are block-major: block 0's views, then block 1's -- each
+        # block's layer pages land at the per-block anchor (K/V of layer 0
+        # then layer 1), so one ucm block is the byte-concatenation of its
+        # two vllm blocks.
+        self.assertEqual(batch.offsets.tolist(), [0, 512, 768, 1152, 1664, 1920])
+        self.assertEqual(batch.sizes.tolist(), [512, 256, 384, 512, 256, 384])
+        self.assertEqual(batch.ptrs.tolist(), [0x1400, 0x3200, 0x5300, 0x1A00, 0x3500, 0x5780])
         # A layerwise (filtered) batch must address the very same record
         # coordinates: a layerwise load lands exactly where the full record
         # was dumped.
         layer_batch = layout.build_load_batches(metadata, "model.layers.1.attn")
-        self.assertEqual(layer_batch.offsets, (1536, 1920))
-        self.assertEqual(layer_batch.sizes, (384, 384))
-        self.assertEqual(layer_batch.ptrs, (0x5300, 0x5780))
+        self.assertEqual(layer_batch.offsets.tolist(), [768, 1920])
+        self.assertEqual(layer_batch.sizes.tolist(), [384, 384])
+        self.assertEqual(layer_batch.ptrs.tolist(), [0x5300, 0x5780])
         full_positions = {
             (ptr, size): offset
             for ptr, size, offset in zip(batch.ptrs, batch.sizes, batch.offsets)
@@ -2301,23 +2362,23 @@ class RaggedLayoutTest(unittest.TestCase):
             (key,),
             0,
             256,
-            (UCMGroupWindows(0, 1, True, (2,), (), ()),),
+            (UCMGroupWindows(0, np.array([2,])),),
         )
         metadata = UCMConnectorMetadata(
             requests={"r": RequestDispatchMeta("r", load_plans=(plan,))}
         )
         batch = layout.build_load_batches(metadata)
         # Whole batch: one span covering both layers' pages of block 2.
-        self.assertEqual(batch.ptrs, (0x1000 + 2 * block_stride,))
-        self.assertEqual(batch.sizes, (2 * layer_stride,))
-        self.assertEqual(batch.offsets, (0,))
+        self.assertEqual(batch.ptrs.tolist(), [0x1000 + 2 * block_stride,])
+        self.assertEqual(batch.sizes.tolist(), [2 * layer_stride,])
+        self.assertEqual(batch.offsets.tolist(), [0,])
 
         # Layered batch: layer 1's page only, at its in-slot record offset
         # (one page in) -- the same bytes the whole-batch span covered.
         layer_batch = layout.build_load_batches(metadata, "model.layers.1.attn")
-        self.assertEqual(layer_batch.ptrs, (0x1000 + page + 2 * block_stride,))
-        self.assertEqual(layer_batch.sizes, (page,))
-        self.assertEqual(layer_batch.offsets, (page,))
+        self.assertEqual(layer_batch.ptrs.tolist(), [0x1000 + page + 2 * block_stride,])
+        self.assertEqual(layer_batch.sizes.tolist(), [page,])
+        self.assertEqual(layer_batch.offsets.tolist(), [page,])
 
         # The public extract_segments API mirrors both shapes: the whole
         # unfiltered window is the group span, layered queries the view
@@ -2437,18 +2498,18 @@ class RaggedLayoutTest(unittest.TestCase):
             (key,),
             0,
             256,
-            (UCMGroupWindows(0, 1, True, (3,), (), ()),),
+            (UCMGroupWindows(0, np.array([3,])),),
         )
         metadata = UCMConnectorMetadata(
             requests={"r": RequestDispatchMeta("r", load_plans=(plan,))}
         )
         batch = layout.build_load_batches(metadata)
-        self.assertEqual(batch.ptrs, (0x1000 + 3 * slot,))
-        self.assertEqual(batch.sizes, (slot,))
+        self.assertEqual(batch.ptrs.tolist(), [0x1000 + 3 * slot,])
+        self.assertEqual(batch.sizes.tolist(), [slot,])
         layer_batch = layout.build_load_batches(metadata, "model.layers.1.attn")
-        self.assertEqual(layer_batch.ptrs, (0x1000 + 4096 + 3 * slot,))
-        self.assertEqual(layer_batch.sizes, (4096,))
-        self.assertEqual(layer_batch.offsets, (4096,))
+        self.assertEqual(layer_batch.ptrs.tolist(), [0x1000 + 4096 + 3 * slot,])
+        self.assertEqual(layer_batch.sizes.tolist(), [4096,])
+        self.assertEqual(layer_batch.offsets.tolist(), [4096,])
 
     def test_layer_contiguous_views_compile_to_one_entry_per_layer(self):
         # GLM-style placement: layer 1 sits after *all* of layer 0's
@@ -2467,6 +2528,7 @@ class RaggedLayoutTest(unittest.TestCase):
                 )
             ),
             scheduler_block_size=4,
+            ucm_cache_block_size=8,
         )
         layout = UCMKVCacheLayout(
             parsed,
@@ -2508,27 +2570,23 @@ class RaggedLayoutTest(unittest.TestCase):
             (key,),
             0,
             8,
-            (UCMGroupWindows(0, 2, True, (2, 5), (), ()),),
+            (UCMGroupWindows(0, np.array([2, 5])),),
         )
         metadata = UCMConnectorMetadata(
             requests={"r": RequestDispatchMeta("r", load_plans=(plan,))}
         )
         batch = layout.build_load_batches(metadata)
-        # Block-major records; adjacent physical blocks never merge into one
-        # entry: cross-block adjacency is an allocation accident, not a
-        # Records are layer-major per hash window: view 0's blocks, then
-        # view 1's blocks -- each view's window bytes contiguous.
-        self.assertEqual(batch.sizes, (12, 12, 12, 12))
-        self.assertEqual(batch.offsets, (0, 12, 24, 36))
-        self.assertEqual(
-            batch.ptrs,
-            (
+        # Block-major record: block 0's views, then block 1's -- adjacent
+        # physical blocks never merge into one entry; cross-block
+        # adjacency is an allocation accident, not a record fact.
+        self.assertEqual(batch.sizes.tolist(), [12, 12, 12, 12])
+        self.assertEqual(batch.offsets.tolist(), [0, 12, 24, 36])
+        self.assertEqual(batch.ptrs.tolist(), [
                 0x1000 + 2 * 12,
-                0x1000 + 5 * 12,
                 0x1000 + 8 * 12 + 2 * 12,
+                0x1000 + 5 * 12,
                 0x1000 + 8 * 12 + 5 * 12,
-            ),
-        )
+            ])
 
         # The extract_segments grid answers the same spans without
         # records: rows are blocks, columns views.
@@ -2565,6 +2623,7 @@ class RaggedLayoutTest(unittest.TestCase):
                 )
             ),
             scheduler_block_size=128,
+            ucm_cache_block_size=256,
         )
         caches = {
             "model.layers.0.attn": (
@@ -2586,7 +2645,7 @@ class RaggedLayoutTest(unittest.TestCase):
             (key,),
             0,
             256,
-            (UCMGroupWindows(0, 2, True, (2, 5), (), ()),),
+            (UCMGroupWindows(0, np.array([2, 5])),),
         )
         metadata = UCMConnectorMetadata(
             requests={"r": RequestDispatchMeta("r", load_plans=(plan,))}
@@ -2645,7 +2704,7 @@ class RaggedLayoutTest(unittest.TestCase):
             (key,),
             0,
             128,
-            (UCMGroupWindows(0, 1, True, (2,), (), ()),),
+            (UCMGroupWindows(0, np.array([2,])),),
         )
         metadata = UCMConnectorMetadata(
             requests={"r": RequestDispatchMeta("r", load_plans=(plan,))}
@@ -2653,9 +2712,9 @@ class RaggedLayoutTest(unittest.TestCase):
 
         batch = layout.build_load_batches(metadata)
 
-        self.assertEqual(batch.ptrs, (k_base + 2 * 16384, scale_base + 2 * 256))
-        self.assertEqual(batch.sizes, (16384, 256))
-        self.assertEqual(batch.offsets, (0, 16384))
+        self.assertEqual(batch.ptrs.tolist(), [k_base + 2 * 16384, scale_base + 2 * 256])
+        self.assertEqual(batch.sizes.tolist(), [16384, 256])
+        self.assertEqual(batch.offsets.tolist(), [0, 16384])
 
     def test_model_layer_selection_spans_cache_names_and_groups(self):
         from ucm.integration.vllm.v2.ucm_scheduler import (
@@ -2711,24 +2770,19 @@ class RaggedLayoutTest(unittest.TestCase):
             ),
         )
 
-        def metadata(block0, block1, start, end):
-            # One key whose window is [start, end): a whole block, or the
-            # sub-block span the old token range used to imply.
-            whole = start == 0 and end == 4
-            local_starts = () if whole else (start,)
-            local_ends = () if whole else (end,)
-
-            def group_window(group_id, block_id):
-                return UCMGroupWindows(
-                    group_id, 1, whole, (block_id,), local_starts, local_ends
-                )
-
+        def metadata(block0, block1):
+            # One whole-block key over both groups: the packed declared
+            # group answers at its slot anchors, the aux layer-first
+            # group at its payload slots.
             plan = UCMGroupDispatchPlan(
                 "FA",
                 (b"record",),
-                start,
-                end,
-                (group_window(0, block0), group_window(1, block1)),
+                0,
+                4,
+                (
+                    UCMGroupWindows(0, np.array([block0])),
+                    UCMGroupWindows(1, np.array([block1])),
+                ),
             )
             return UCMConnectorMetadata(
                 requests={
@@ -2738,65 +2792,66 @@ class RaggedLayoutTest(unittest.TestCase):
                 }
             )
 
-        # Whole Block First IO includes padding; partial IO compacts its
-        # windows. Model-layer selection must preserve both record formats.
-        for start, end, offsets in ((0, 4, (8, 16, 36)), (1, 3, (2, 4, 10))):
-            with (
-                self.subTest(window=(start, end)),
-                tempfile.TemporaryDirectory() as path,
-            ):
-                source_meta = metadata(1, 2, start, end)
-                target_meta = metadata(3, 4, start, end)
-                source = layout.build_dump_batches(source_meta)
-                target = layout.build_load_batches(target_meta)
-                source_layer = layout.build_dump_batches(source_meta, layer_id=layer_id)
-                target_layer = layout.build_load_batches(target_meta, layer_id=layer_id)
-                self.assertEqual(source_layer.offsets, offsets)
-                self.assertEqual(target_layer.offsets, offsets)
-                exact = layout.build_load_batches(target_meta, "model.layers.2.attn")
-                self.assertEqual(exact.offsets, offsets[:1])
-                window = layout.group_layouts[0].extract_segments(
-                    [3], [start], [end], layer_ids=[2]
+        # Whole Block First IO includes padding; sub-span IO (FA sharing a
+        # block, WA tails) is covered by its own tests.  Model-layer
+        # selection must preserve the record coordinates either way.
+        offsets = (8, 16, 36)
+        with (
+            self.subTest(window=(0, 4)),
+            tempfile.TemporaryDirectory() as path,
+        ):
+            source_meta = metadata(1, 2)
+            target_meta = metadata(3, 4)
+            source = layout.build_dump_batches(source_meta)
+            target = layout.build_load_batches(target_meta)
+            source_layer = layout.build_dump_batches(source_meta, layer_id=layer_id)
+            target_layer = layout.build_load_batches(target_meta, layer_id=layer_id)
+            self.assertEqual(source_layer.offsets.tolist(), list(offsets))
+            self.assertEqual(target_layer.offsets.tolist(), list(offsets))
+            exact = layout.build_load_batches(target_meta, "model.layers.2.attn")
+            self.assertEqual(exact.offsets.tolist(), [offsets[0]])
+            window = layout.group_layouts[0].extract_segments(
+                [3], [0], [4], layer_ids=[2]
+            )
+            self.assertEqual(
+                tuple(zip(window[0].reshape(-1).tolist(),
+                          window[1].reshape(-1).tolist())),
+                tuple(zip(target_layer.ptrs[:2], target_layer.sizes[:2])),
+            )
+            with self.assertRaisesRegex(ValueError, "either"):
+                layout.build_load_batches(
+                    target_meta, "model.layers.2.attn", layer_id=2
                 )
-                self.assertEqual(
-                    tuple(zip(window[0].reshape(-1).tolist(),
-                              window[1].reshape(-1).tolist())),
-                    tuple(zip(target_layer.ptrs[:2], target_layer.sizes[:2])),
-                )
-                with self.assertRaisesRegex(ValueError, "either"):
-                    layout.build_load_batches(
-                        target_meta, "model.layers.2.attn", layer_id=2
-                    )
-                with self.assertRaises(KeyError):
-                    layout.build_load_batches(target_meta, layer_id=99)
+            with self.assertRaises(KeyError):
+                layout.build_load_batches(target_meta, layer_id=99)
 
-                memory = ByteMemory()
-                for ptr, size in zip(target.ptrs, target.sizes):
-                    memory.write(ptr, b"\xef" * size)
-                for offset, ptr, size in zip(source.offsets, source.ptrs, source.sizes):
-                    memory.write(ptr, bytes((offset + i) % 251 for i in range(size)))
-                proxy = SimpleFileUCMProxy(
-                    Path(path), byte_access=MemoryByteAccess(memory)
-                )
-                proxy.dump(source.block_ids, source.offsets, source.ptrs, source.sizes)
-                proxy.load(
-                    target_layer.block_ids,
-                    target_layer.offsets,
-                    target_layer.ptrs,
-                    target_layer.sizes,
-                )
-                for offset, ptr, size in zip(target.offsets, target.ptrs, target.sizes):
-                    expected = bytearray(b"\xef" * size)
-                    for selected_offset, selected_size in zip(
-                        target_layer.offsets, target_layer.sizes
-                    ):
-                        if offset <= selected_offset < offset + size:
-                            begin = selected_offset - offset
-                            expected[begin : begin + selected_size] = bytes(
-                                (selected_offset + i) % 251
-                                for i in range(selected_size)
-                            )
-                    self.assertEqual(memory.read(ptr, size), bytes(expected))
+            memory = ByteMemory()
+            for ptr, size in zip(target.ptrs, target.sizes):
+                memory.write(ptr, b"\xef" * size)
+            for offset, ptr, size in zip(source.offsets, source.ptrs, source.sizes):
+                memory.write(ptr, bytes((offset + i) % 251 for i in range(size)))
+            proxy = SimpleFileUCMProxy(
+                Path(path), byte_access=MemoryByteAccess(memory)
+            )
+            proxy.dump(source.block_ids, source.offsets, source.ptrs, source.sizes)
+            proxy.load(
+                target_layer.block_ids,
+                target_layer.offsets,
+                target_layer.ptrs,
+                target_layer.sizes,
+            )
+            for offset, ptr, size in zip(target.offsets, target.ptrs, target.sizes):
+                expected = bytearray(b"\xef" * size)
+                for selected_offset, selected_size in zip(
+                    target_layer.offsets, target_layer.sizes
+                ):
+                    if offset <= selected_offset < offset + size:
+                        begin = selected_offset - offset
+                        expected[begin : begin + selected_size] = bytes(
+                            (selected_offset + i) % 251
+                            for i in range(selected_size)
+                        )
+                self.assertEqual(memory.read(ptr, size), bytes(expected))
 
     def test_dsv4_canonical_subrange_selects_intersecting_large_page(self):
         parsed = parse_kv_cache_config(
@@ -2848,7 +2903,7 @@ class RaggedLayoutTest(unittest.TestCase):
             1024,
             # N:1: the key is one 512-token sub-span inside a 16384-token
             # page, spelled out instead of re-derived from the token range.
-            (UCMGroupWindows(1, 1, False, (2,), (512,), (1024,)),),
+            (UCMGroupWindows(1, np.array([2,])),),
         )
         metadata = UCMConnectorMetadata(
             requests={"r": RequestDispatchMeta("r", load_plans=(plan,))}
@@ -2856,7 +2911,7 @@ class RaggedLayoutTest(unittest.TestCase):
 
         batch = layout.build_load_batches(metadata)
 
-        self.assertEqual(batch.sizes, (4096,))
+        self.assertEqual(batch.sizes.tolist(), [4096,])
         self.assertEqual(batch.ptrs[-1], 0x5000 + 2 * 131072 + 4 * 1024)
 
     def test_hybrid_state_uses_one_complete_checkpoint_block(self):
@@ -2912,10 +2967,10 @@ class RaggedLayoutTest(unittest.TestCase):
         )
 
         dump_plan = UCMGroupDispatchPlan(
-            0, (key,), 0, 4, (UCMGroupWindows(0, 1, True, (1,), (), ()),)
+            0, (key,), 0, 4, (UCMGroupWindows(0, np.array([1,])),)
         )
         load_plan = UCMGroupDispatchPlan(
-            0, (key,), 0, 4, (UCMGroupWindows(0, 1, True, (6,), (), ()),)
+            0, (key,), 0, 4, (UCMGroupWindows(0, np.array([6,])),)
         )
         dump_meta = UCMConnectorMetadata(
             requests={"r": RequestDispatchMeta("r", dump_plans=(dump_plan,))}
@@ -2973,7 +3028,7 @@ class RaggedLayoutTest(unittest.TestCase):
             dump_batch.sizes,
         )
         deferred_load_plan = UCMGroupDispatchPlan(
-            0, (key,), 0, 4, (UCMGroupWindows(0, 1, True, (7,), (), ()),)
+            0, (key,), 0, 4, (UCMGroupWindows(0, np.array([7,])),)
         )
         deferred_load_meta = UCMConnectorMetadata(
             requests={"r": RequestDispatchMeta("r", load_plans=(deferred_load_plan,))}

@@ -10,6 +10,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Protocol, TypeAlias, runtime_checkable
 from uuid import uuid4
 
+import numpy as np
+
 if TYPE_CHECKING:
     import torch
 
@@ -34,17 +36,17 @@ class UCMProxy(Protocol):
     def load(
         self,
         block_ids: Sequence[bytes],
-        offsets: Sequence[int],
-        ptrs: Sequence[int],
-        sizes: Sequence[int],
+        offsets: np.ndarray,
+        ptrs: np.ndarray,
+        sizes: np.ndarray,
     ) -> object | None: ...
 
     def dump(
         self,
         block_ids: Sequence[bytes],
-        offsets: Sequence[int],
-        ptrs: Sequence[int],
-        sizes: Sequence[int],
+        offsets: np.ndarray,
+        ptrs: np.ndarray,
+        sizes: np.ndarray,
     ) -> object | None: ...
 
 
@@ -190,9 +192,9 @@ class SimpleFileUCMProxy:
     @staticmethod
     def _records(
         block_ids: Sequence[bytes],
-        offsets: Sequence[int],
-        ptrs: Sequence[int],
-        sizes: Sequence[int],
+        offsets: np.ndarray,
+        ptrs: np.ndarray,
+        sizes: np.ndarray,
     ) -> dict[bytes, list[tuple[int, int, int]]]:
         records: dict[bytes, list[tuple[int, int, int]]] = {}
         for key, offset, ptr, size in zip(block_ids, offsets, ptrs, sizes, strict=True):
@@ -219,9 +221,9 @@ class SimpleFileUCMProxy:
     def dump(
         self,
         block_ids: Sequence[bytes],
-        offsets: Sequence[int],
-        ptrs: Sequence[int],
-        sizes: Sequence[int],
+        offsets: np.ndarray,
+        ptrs: np.ndarray,
+        sizes: np.ndarray,
     ) -> None:
         records = self._records(block_ids, offsets, ptrs, sizes)
         self.byte_access.synchronize()
@@ -246,9 +248,9 @@ class SimpleFileUCMProxy:
     def load(
         self,
         block_ids: Sequence[bytes],
-        offsets: Sequence[int],
-        ptrs: Sequence[int],
-        sizes: Sequence[int],
+        offsets: np.ndarray,
+        ptrs: np.ndarray,
+        sizes: np.ndarray,
     ) -> None:
         records = self._records(block_ids, offsets, ptrs, sizes)
         for key, segments in records.items():
@@ -275,13 +277,13 @@ class SimpleFileUCMProxy:
 @dataclass(frozen=True)
 class UCMProxyBatch:
     block_ids: tuple[bytes, ...]
-    offsets: tuple[int, ...]
-    ptrs: tuple[int, ...]
-    sizes: tuple[int, ...]
+    offsets: np.ndarray
+    ptrs: np.ndarray
+    sizes: np.ndarray
 
     @property
     def total_bytes(self) -> int:
-        return sum(self.sizes)
+        return int(self.sizes.sum())
 
 
 class UCMProxyAdapter:
@@ -354,36 +356,43 @@ class UCMProxyAdapter:
     def _batch(
         self,
         block_ids: Sequence[bytes],
-        offsets: Sequence[int],
-        ptrs: Sequence[int],
-        sizes: Sequence[int],
+        offsets: Sequence[int] | np.ndarray,
+        ptrs: Sequence[int] | np.ndarray,
+        sizes: Sequence[int] | np.ndarray,
     ) -> UCMProxyBatch:
         keys = self._keys(block_ids)
-        normalized = (
-            tuple(int(value) for value in offsets),
-            tuple(int(value) for value in ptrs),
-            tuple(int(value) for value in sizes),
+        arrays = tuple(
+            np.asarray(values, dtype=np.int64)
+            for values in (offsets, ptrs, sizes)
         )
-        lengths = {len(keys), *(len(values) for values in normalized)}
+        lengths = {len(keys), *(len(values) for values in arrays)}
         if len(lengths) != 1:
             raise ValueError(
                 "block_ids, offsets, ptrs and sizes must have identical lengths"
             )
-        normalized_offsets, normalized_ptrs, normalized_sizes = normalized
-        for index, (key, offset, ptr, size) in enumerate(
-            zip(keys, normalized_offsets, normalized_ptrs, normalized_sizes)
+        normalized_offsets, normalized_ptrs, normalized_sizes = arrays
+        for name, values, invalid in (
+            ("offset", normalized_offsets, normalized_offsets < 0),
+            ("ptr", normalized_ptrs, normalized_ptrs <= 0),
+            ("size", normalized_sizes, normalized_sizes <= 0),
         ):
-            if offset < 0 or ptr <= 0 or size <= 0:
+            if invalid.any():
+                index = int(np.argmax(invalid))
                 raise ValueError(
                     f"Invalid Proxy segment at index {index}: "
-                    f"offset={offset}, ptr={ptr}, size={size}"
+                    f"{name}={int(values[index])}"
                 )
-            record_size = self._record_sizes.get(key)
-            if record_size is not None and offset + size > record_size:
-                raise ValueError(
-                    f"Proxy segment {index} exceeds record: "
-                    f"offset={offset}, size={size}, record_size={record_size}"
-                )
+        if self._record_sizes:
+            for index, (key, offset, size) in enumerate(
+                zip(keys, normalized_offsets, normalized_sizes)
+            ):
+                record_size = self._record_sizes.get(key)
+                if record_size is not None and offset + size > record_size:
+                    raise ValueError(
+                        f"Proxy segment {index} exceeds record: "
+                        f"offset={int(offset)}, size={int(size)}, "
+                        f"record_size={record_size}"
+                    )
         return UCMProxyBatch(
             keys, normalized_offsets, normalized_ptrs, normalized_sizes
         )
@@ -391,9 +400,9 @@ class UCMProxyAdapter:
     def load(
         self,
         block_ids: Sequence[bytes],
-        offsets: Sequence[int],
-        ptrs: Sequence[int],
-        sizes: Sequence[int],
+        offsets: np.ndarray,
+        ptrs: np.ndarray,
+        sizes: np.ndarray,
     ) -> None:
         batch = self._batch(block_ids, offsets, ptrs, sizes)
         if not batch.block_ids:
@@ -411,9 +420,9 @@ class UCMProxyAdapter:
     def dump(
         self,
         block_ids: Sequence[bytes],
-        offsets: Sequence[int],
-        ptrs: Sequence[int],
-        sizes: Sequence[int],
+        offsets: np.ndarray,
+        ptrs: np.ndarray,
+        sizes: np.ndarray,
     ) -> None:
         batch = self._batch(block_ids, offsets, ptrs, sizes)
         if not batch.block_ids:

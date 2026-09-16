@@ -499,6 +499,19 @@ def parse_kv_cache_config(
                 f"multiple of ucm_cache_block_size {selected_block}"
             )
 
+    # Sliding tails keep a static window shape: the boundary must land
+    # on the group's block grid, so its token block must divide the
+    # cache block.
+    for group in groups:
+        if not group.is_sliding_window or not (group.tail_tokens or 0):
+            continue
+        if selected_block % group.token_block_size:
+            raise ValueError(
+                f"Sliding-window group {group.group_id} token_block_size "
+                f"{group.token_block_size} must divide "
+                f"ucm_cache_block_size {selected_block}"
+            )
+
     if LAYOUT_DEBUG:
         for group in groups:
             kind_names = ",".join(sorted(kind.value for kind in group.kinds))
@@ -601,155 +614,140 @@ class UCMKVCacheLayout:
         layer_names: frozenset[str] | None,
     ) -> UCMProxyBatch:
         keys: list[bytes] = []
-        offsets: list[int] = []
-        ptrs: list[int] = []
-        sizes: list[int] = []
+        offsets: list[np.ndarray] = []
+        ptrs: list[np.ndarray] = []
+        sizes: list[np.ndarray] = []
         for plan in plans:
-            for key, group_ptrs, group_sizes, group_offsets in self._iter_plan_segments(
-                plan, layer_names
+            for group_keys, group_offsets, group_ptrs, group_sizes in (
+                self._iter_plan_segments(plan, layer_names)
             ):
-                keys.extend((key,) * len(group_ptrs))
-                ptrs.extend(group_ptrs)
-                sizes.extend(group_sizes)
-                offsets.extend(group_offsets)
-        return UCMProxyBatch(tuple(keys), tuple(offsets), tuple(ptrs), tuple(sizes))
+                keys.extend(group_keys)
+                offsets.append(group_offsets)
+                ptrs.append(group_ptrs)
+                sizes.append(group_sizes)
+        if not keys:
+            empty = np.empty(0, dtype=np.int64)
+            return UCMProxyBatch((), empty, empty, empty)
+        return UCMProxyBatch(
+            tuple(keys),
+            np.concatenate(offsets),
+            np.concatenate(ptrs),
+            np.concatenate(sizes),
+        )
 
     def _iter_plan_segments(
         self,
         plan: "UCMGroupDispatchPlan",
         layer_names: frozenset[str] | None,
-    ) -> Iterator[tuple[bytes, list[int], list[int], list[int]]]:
-        """Turn a plan's self-describing windows into proxy segments.
+    ) -> Iterator[tuple[list[bytes], np.ndarray, np.ndarray, np.ndarray]]:
+        """One plan's records as per-group arrays, straight off templates.
 
-        The scheduler already resolved every key's blocks and token
-        windows; this shell only places each group's contribution inside
-        one key's record: a group's segments start at the running
-        block_offset and the next group continues after its record bytes.
-        Layouts answer (ptr, size) grids; nothing here re-derives
-        scheduling facts.
+        The scheduler sends keys and window block ids; each group's
+        static template (compiled at layout init -- the offsets/sizes
+        grids of one key's window, block-major: block 0's views, block
+        1's views, ...) places them inside the key's record, and group
+        g's contribution starts at the running group_base.  All keys of
+        a plan resolve in one vectorized pass per group; only the block
+        ids (and full-attention sub-span heads) vary per call.  Block
+        First groups with whole unfiltered windows take the
+        one-span-per-block fast path, paddings riding inside.
         """
 
+        if not plan.keys:
+            return
         if LAYOUT_DEBUG:
             layout_debug(
                 f"plan hash_group={plan.hash_group} "
                 f"tokens=[{plan.token_start},{plan.token_end}) "
                 f"keys={len(plan.keys)} "
-                f"groups={[group.group_id for group in plan.windows]}"
+                f"groups={[window.group_id for window in plan.windows]}"
             )
-        for key_index, key in enumerate(plan.keys):
-            block_offset = 0
-            for group in plan.windows:
-                group_layout = self.group_layouts[group.group_id]
-                mask = (
-                    None
-                    if layer_names is None
-                    else group_layout.view_mask(layer_names=layer_names)
+        key_count = len(plan.keys)
+        group_base = 0
+        for window in plan.windows:
+            group_layout = self.group_layouts[window.group_id]
+            per_key = group_layout.window_blocks
+            total = key_count * per_key
+            if len(window.blocks) != total:
+                raise ValueError(
+                    f"Plan window for group {window.group_id} carries "
+                    f"{len(window.blocks)} blocks for {key_count} keys x "
+                    f"{per_key} blocks each"
                 )
-                lo = key_index * group.per_key
-                hi = lo + group.per_key
-                ptrs, sizes, offsets, record_bytes = self._group_record(
-                    group_layout,
-                    group.blocks[lo:hi],
-                    None if group.whole else group.local_starts[lo:hi],
-                    None if group.whole else group.local_ends[lo:hi],
-                    mask,
+            blocks = window.blocks
+            if len(blocks) and (
+                blocks.min() < 0 or blocks.max() >= group_layout.num_blocks
+            ):
+                raise ValueError(
+                    f"Plan window for group {window.group_id} carries "
+                    f"vLLM block IDs outside [0, {group_layout.num_blocks})"
                 )
-                if ptrs:
-                    yield (
-                        key,
-                        ptrs,
-                        sizes,
-                        [offset + block_offset for offset in offsets],
+            mask = (
+                None
+                if layer_names is None
+                else group_layout.view_mask(layer_names=layer_names)
+            )
+            span = group_layout.block_first
+            if (
+                span is not None
+                and mask is None
+                and not group_layout.subspan_keys
+                and group_layout.window_shape.span == 0
+            ):
+                # Fast path: whole blocks on a Block First layout are one
+                # IO span each.
+                ptrs = span.base_ptr + blocks * span.block_stride
+                sizes = np.full(total, span.block_size_bytes, dtype=np.int64)
+                offsets = (
+                    np.arange(total, dtype=np.int64) % per_key
+                ) * span.block_size_bytes + group_base
+                entries_per_key = per_key
+            else:
+                offsets = (
+                    np.tile(group_layout.template_offsets, (key_count, 1))
+                    + group_base
+                )
+                sizes = np.tile(group_layout.template_sizes, (key_count, 1))
+                ptrs = (
+                    group_layout.base_ptrs[None, :]
+                    + blocks[:, None] * group_layout.block_strides[None, :]
+                )
+                if group_layout.subspan_keys:
+                    # FA sub-span: every key sits at an arithmetic offset
+                    # inside its shared block.
+                    first_key = (
+                        plan.token_start // self.spec.ucm_cache_block_size
                     )
-                block_offset += record_bytes
+                    heads = (
+                        np.arange(
+                            first_key, first_key + key_count, dtype=np.int64
+                        )
+                        * self.spec.ucm_cache_block_size
+                        % group_layout.token_block_size
+                    )
+                    ptrs = ptrs + group_layout.span_head_offsets(heads)
+                else:
+                    ptrs = ptrs + np.tile(
+                        group_layout.template_ptr_extras, (key_count, 1)
+                    )
+                if mask is not None:
+                    offsets = offsets[:, mask]
+                    sizes = sizes[:, mask]
+                    ptrs = ptrs[:, mask]
+                offsets = offsets.reshape(-1)
+                sizes = sizes.reshape(-1)
+                ptrs = ptrs.reshape(-1)
+                entries_per_key = per_key * group_layout.view_count(mask)
             if LAYOUT_DEBUG:
                 layout_debug(
-                    f"record key={key.hex()[:16]}... "
-                    f"record_size={block_offset}"
+                    f"record group={window.group_id} keys={key_count} "
+                    f"blocks={total} entries={len(ptrs)} "
+                    f"record_size={group_base + group_layout.window_record_bytes}"
                 )
-
-    def _group_record(
-        self,
-        group_layout: "KVCacheGroupLayout",
-        block_ids: Sequence[int],
-        local_starts: Sequence[int] | None,
-        local_ends: Sequence[int] | None,
-        mask: "np.ndarray | None",
-    ) -> tuple[list[int], list[int], list[int], int]:
-        """Place one group's key window in the key's record.
-
-        ``local_starts``/``local_ends`` None means whole blocks.  Three
-        ledgers, one per group shape:
-
-        - Block First, whole and unfiltered: the block slot is one IO
-          span, paddings riding inside (``block_first_segments``).
-        - Block First, layered or sub-block: the slot-image ledger --
-          offsets are the descriptor anchors, so a layered load lands
-          exactly where the span's bytes were dumped.
-        - Everything else: layer-major per hash window.  View L's slot
-          starts after every earlier view's window bytes: with four
-          vLLM blocks per hash and per-block layer size ``s_l``, layer
-          0 lands at 0, layer 1 at ``4 * s_0``, layer 2 at
-          ``4 * (s_0 + s_1)``, ...  Unselected views still occupy their
-          bytes, so a layerwise batch addresses the very same slots.
-
-        Returns flattened (ptrs, sizes, offsets) and the group's record
-        size -- the block_offset the next group continues from.
-        """
-
-        whole = local_starts is None
-        span = group_layout.block_first if whole else None
-        if span is not None and mask is None:
-            ptrs, sizes = group_layout.block_first_segments(block_ids)
-            offsets = (
-                np.arange(len(block_ids), dtype=np.int64)
-                * group_layout.block_size_bytes
+            yield (
+                [key for key in plan.keys for _ in range(entries_per_key)],
+                offsets,
+                ptrs,
+                sizes,
             )
-            return (
-                ptrs.tolist(),
-                sizes.tolist(),
-                offsets.tolist(),
-                len(block_ids) * group_layout.block_size_bytes,
-            )
-        if local_starts is None or local_ends is None:
-            starts = [0] * len(block_ids)
-            ends = [group_layout.token_block_size] * len(block_ids)
-        else:
-            starts = list(local_starts)
-            ends = list(local_ends)
-        ptrs, sizes = group_layout.extract_segments(block_ids, starts, ends)
-        if span is not None:
-            # Slot-image ledger: block-major rows at their anchors.
-            offsets = (
-                np.arange(len(block_ids), dtype=np.int64)[:, None]
-                * group_layout.block_size_bytes
-                + group_layout.block_slots
-            )
-            record_bytes = len(block_ids) * group_layout.block_size_bytes
-        else:
-            # Layer-major ledger: view slots by window bytes, blocks
-            # packed inside each view's slot.
-            view_bytes = sizes.sum(axis=0)
-            view_slots = np.cumsum(view_bytes) - view_bytes
-            within_view = np.cumsum(sizes, axis=0) - sizes
-            offsets = view_slots + within_view
-            record_bytes = int(view_bytes.sum())
-        if mask is not None:
-            ptrs = ptrs[:, mask]
-            sizes = sizes[:, mask]
-            offsets = offsets[:, mask]
-        # Slot-image records read block-major; layer-major records read
-        # view-major (each view's blocks back to back).
-        if span is not None:
-            return (
-                ptrs.reshape(-1).tolist(),
-                sizes.reshape(-1).tolist(),
-                offsets.reshape(-1).tolist(),
-                record_bytes,
-            )
-        return (
-            ptrs.T.reshape(-1).tolist(),
-            sizes.T.reshape(-1).tolist(),
-            offsets.T.reshape(-1).tolist(),
-            record_bytes,
-        )
+            group_base += group_layout.window_record_bytes

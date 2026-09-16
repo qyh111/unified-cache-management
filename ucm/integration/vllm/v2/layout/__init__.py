@@ -27,7 +27,9 @@ def build_group_layouts(
     """One :class:`KVCacheGroupLayout` per KV group of the parsed spec."""
 
     return {
-        group.group_id: KVCacheGroupLayout(group, kv_caches)
+        group.group_id: KVCacheGroupLayout(
+            group, kv_caches, spec.ucm_cache_block_size
+        )
         for group in spec.groups
     }
 
