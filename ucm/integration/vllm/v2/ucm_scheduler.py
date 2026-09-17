@@ -12,7 +12,6 @@ import numpy as np
 
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
 
-from .layout.group import group_tail_blocks
 from .ucm_kv_cache import UCMKVCacheGroupInfo, UCMKVCacheSpec
 from .ucm_proxy import UCMProxyAdapter
 
@@ -80,7 +79,7 @@ class UCMGroupDispatchPlan:
     token_end: int
     # Window block ids per participating group, in dispatch_routes()
     # order, block-major (tail_blocks blocks per key) -- the static
-    # window shape lives in the spec (see ``group_tail_blocks``), so
+    # window shape lives on the spec's groups (``tail_blocks``), so
     # only the ids travel.
     windows: tuple[np.ndarray, ...]
 
@@ -344,6 +343,11 @@ class UCMDispatcher:
         if token_end <= token_start:
             return ()
         ucm_block_size = self.spec.ucm_cache_block_size
+        # Route-invariant key bounds: the first key the range touches and
+        # the boundary it ends on.  FA's guard and the WA/State dump
+        # guard are the same "no complete key in range" test.
+        first_key = token_start // ucm_block_size
+        last_key = token_end // ucm_block_size
         for route_index, (hash_group, physical_groups) in enumerate(self._routes):
             keys_available = state.group_ucm_block_ids[route_index]
             if hash_group in ("WA", "State"):
@@ -356,16 +360,18 @@ class UCMDispatcher:
                 # stores nothing.  A load restores the boundary load_end
                 # ends on (always cache-aligned).
                 if is_dump:
-                    if token_end // ucm_block_size <= token_start // ucm_block_size:
+                    if last_key <= first_key:
                         continue
                 elif token_end % ucm_block_size:
                     continue
-                boundary = token_end // ucm_block_size
-                start = max(boundary - 1, 0)
-                end = boundary
+                start = max(last_key - 1, 0)
+                end = last_key
             else:
-                start = token_start // ucm_block_size
-                end = token_end // ucm_block_size
+                # FA keys are stored once and never re-stored, so a plan
+                # covers every complete key the range touches -- not just
+                # the newest boundary.
+                start = first_key
+                end = last_key
                 if end <= start:
                     continue
             if hash_group == "WA":
@@ -415,7 +421,7 @@ class UCMDispatcher:
 
         ucm_block_size = self.spec.ucm_cache_block_size
         table = state.group_vllm_block_ids[group.group_id]
-        tail_blocks = group_tail_blocks(group, ucm_block_size)
+        tail_blocks = group.tail_blocks
         if hash_group == "FA":
             boundary_tokens = (
                 np.arange(start + 1, end + 1, dtype=np.uint64)
@@ -440,5 +446,5 @@ class UCMDispatcher:
         within = boundary_block_idx - first_idx
         if tail_blocks == 1:
             return table_ids[within]
-        offsets = np.arange(tail_blocks, dtype=np.uint64)[::-1]
-        return table_ids[(within[:, None] - offsets[None, :]).reshape(-1)]
+        steps_back = np.arange(tail_blocks, dtype=np.uint64)[::-1]
+        return table_ids[(within[:, None] - steps_back[None, :]).reshape(-1)]

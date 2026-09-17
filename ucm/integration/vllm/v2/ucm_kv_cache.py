@@ -9,7 +9,7 @@ proxy batches with deterministic record offsets.
 from __future__ import annotations
 
 from collections.abc import Iterable, Iterator, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Literal
 
 import numpy as np
@@ -65,6 +65,9 @@ class UCMKVCacheGroupInfo:
     token_block_size: int
     kinds: frozenset[KVCacheSpecKind]
     tail_tokens: int | None = None
+    # vLLM blocks one ucm key's window spans (0 = the group stores
+    # nothing); the parser stamps it once the cache block size is known.
+    tail_blocks: int = 0
     is_eagle_group: bool = False
 
     @property
@@ -172,6 +175,28 @@ class UCMKVCacheSpec:
             for group in self.groups
             for layer in group.layers
         }
+
+
+def _group_tail_blocks(
+    group: UCMKVCacheGroupInfo, ucm_block_size: int
+) -> int:
+    """vLLM blocks one ucm key's window spans (0 = the group stores nothing).
+
+    HMA's ``tail_blocks`` with the one generalization v2 needs: a tail
+    that does not divide the block still keeps its partial head block
+    (ceil, not HMA's floor).  A state snapshot is one indivisible
+    checkpoint page; a full-attention key spans the whole ucm block
+    (several blocks when the unit is the larger side, the containing
+    block otherwise).
+    """
+
+    token_block = group.token_block_size
+    if group.is_state_snapshot:
+        return 1
+    if group.is_sliding_window:
+        tail = group.tail_tokens or 0
+        return (tail + token_block - 1) // token_block if tail > 0 else 0
+    return (ucm_block_size + token_block - 1) // token_block
 
 
 def _concrete_specs(
@@ -512,13 +537,18 @@ def parse_kv_cache_config(
                 f"ucm_cache_block_size {selected_block}"
             )
 
+    groups = [
+        replace(group, tail_blocks=_group_tail_blocks(group, selected_block))
+        for group in groups
+    ]
+
     if LAYOUT_DEBUG:
         for group in groups:
             kind_names = ",".join(sorted(kind.value for kind in group.kinds))
             layout_debug(
                 f"spec group={group.group_id} layers={group.num_layers} "
                 f"kinds={{{kind_names}}} token_block={group.token_block_size} "
-                f"tail={group.tail_tokens}"
+                f"tail={group.tail_tokens} tail_blocks={group.tail_blocks}"
             )
         layout_debug(
             f"spec scheduler_block={scheduler_block_size} "

@@ -66,28 +66,6 @@ class TensorDescriptor:
     block_stride: int
 
 
-def group_tail_blocks(
-    group: "UCMKVCacheGroupInfo", ucm_block_size: int
-) -> int:
-    """vLLM blocks one ucm key's window spans (0 = the group stores nothing).
-
-    The count both sides agree on -- HMA's ``tail_blocks`` with the one
-    generalization v2 needs: a tail that does not divide the block still
-    keeps its partial head block (ceil, not HMA's floor).  A state
-    snapshot is one indivisible checkpoint page; a full-attention key
-    spans the whole ucm block (several blocks when the unit is the
-    larger side, the containing block otherwise).
-    """
-
-    token_block = group.token_block_size
-    if group.is_state_snapshot:
-        return 1
-    if group.is_sliding_window:
-        tail = group.tail_tokens or 0
-        return -(-tail // token_block) if tail > 0 else 0
-    return -(-ucm_block_size // token_block)
-
-
 @dataclass(frozen=True)
 class BlockFirstView:
     """One group's contiguous per-block span on a Block First layout.
@@ -216,7 +194,7 @@ class KVCacheGroupLayout:
         # views, block 1's views, ...).  ``window_span`` is the head
         # block's live tokens -- 0 means every block in the window is
         # whole.
-        self.tail_blocks = group_tail_blocks(group, ucm_block_size)
+        self.tail_blocks = group.tail_blocks
         if group.is_sliding_window:
             span = (group.tail_tokens or 0) % self.token_block_size
         elif not group.is_state_snapshot:
