@@ -722,11 +722,6 @@ class UCMKVCacheLayout:
                     f"{len(blocks)} blocks for {key_count} keys x "
                     f"{per_key} blocks each"
                 )
-            if len(blocks) and blocks.max() >= group_layout.num_blocks:
-                raise ValueError(
-                    f"Plan window for group {group.group_id} carries "
-                    f"vLLM block IDs outside [0, {group_layout.num_blocks})"
-                )
             mask = (
                 None
                 if layer_names is None
