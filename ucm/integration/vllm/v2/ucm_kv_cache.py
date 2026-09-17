@@ -771,7 +771,7 @@ class UCMKVCacheLayout:
                         * self.spec.ucm_cache_block_size
                         % group_layout.token_block_size
                     )
-                    ptrs = ptrs + group_layout.span_head_offsets(heads)
+                    ptrs = ptrs + group_layout.tokens_to_view_bytes(heads)
                 else:
                     ptrs = ptrs + np.tile(
                         group_layout.template_ptr_extras, (key_count, 1)

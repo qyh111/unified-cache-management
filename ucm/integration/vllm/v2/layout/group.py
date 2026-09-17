@@ -210,7 +210,7 @@ class KVCacheGroupLayout:
         template_sizes = np.zeros((rows, views), dtype=np.uint64)
         template_extras = np.zeros((rows, views), dtype=np.uint64)
         if span:
-            template_sizes[0] = self._span_view_sizes(span)
+            template_sizes[0] = self.tokens_to_view_bytes(span)
             template_offsets[0] = (
                 np.cumsum(template_sizes[0]) - template_sizes[0]
             )
@@ -219,7 +219,7 @@ class KVCacheGroupLayout:
                 # number of tokens back from the boundary); a
                 # full-attention sub-span's head varies per key instead,
                 # derived at dispatch from the token range.
-                template_extras[0] = self._head_view_offsets(
+                template_extras[0] = self.tokens_to_view_bytes(
                     (self.token_block_size - span) % self.token_block_size
                 )
                 for row in range(1, rows):
@@ -309,42 +309,32 @@ class KVCacheGroupLayout:
     # Queries
     # ------------------------------------------------------------------
 
-    def _span_view_sizes(self, span_tokens: int) -> np.ndarray:
-        """Per-view bytes of a sub-block token span; exact or error."""
+    def tokens_to_view_bytes(self, tokens: int | np.ndarray) -> np.ndarray:
+        """Per-view bytes whole tokens occupy -- one conversion, two roles.
 
-        states = span_tokens * self.states_per_block
-        if (states % self.token_block_size).any():
-            bad = np.nonzero(states % self.token_block_size)[0][:4]
+        States are evenly spaced inside a block (states_per_block states
+        per token_block tokens), so "the bytes t tokens occupy" and "the
+        bytes the first t tokens of a block span" are the same number: a
+        partial block's live size (template row 0) and a window head's
+        pointer skip (a mid-block start) both read here.  FA sub-span
+        heads pass a per-key array and get a (key, view) grid back.
+        Windows that are not a whole number of states raise.
+        """
+
+        # outer product == the (K, 1) x (1, V) broadcast: one scalar (or
+        # one row) of token counts against every view's state column.
+        states = np.multiply.outer(tokens, self.states_per_block)
+        leftover = states % self.token_block_size
+        if leftover.any():
+            bad = np.nonzero(
+                leftover.reshape(-1, leftover.shape[-1]).any(axis=0)
+            )[0][:4]
             names = ", ".join(self.layer_names[index] for index in bad)
             raise ValueError(
-                f"A {span_tokens}-token span is not representable by "
-                f"tensor layout (views starting at {names})"
+                "Token windows are not representable exactly by tensor "
+                f"layout (views starting at {names})"
             )
         return (states // self.token_block_size) * self.state_strides
-
-    def _head_view_offsets(self, head_tokens: int) -> np.ndarray:
-        """Per-view byte offsets of a window starting mid-block."""
-
-        states = head_tokens * self.states_per_block
-        if (states % self.token_block_size).any():
-            raise ValueError(
-                f"A window head at token {head_tokens} is not "
-                "representable by tensor layout"
-            )
-        offsets = (states // self.token_block_size) * self.state_strides
-        return offsets.astype(np.uint64, copy=False)
-
-    def span_head_offsets(self, head_tokens: np.ndarray) -> np.ndarray:
-        """Per-(key, view) byte offsets of FA sub-span heads."""
-
-        states = head_tokens[:, None] * self.states_per_block[None, :]
-        if (states % self.token_block_size).any():
-            raise ValueError(
-                "Full-attention sub-span heads are not representable "
-                "by tensor layout"
-            )
-        offsets = (states // self.token_block_size) * self.state_strides[None, :]
-        return offsets.astype(np.uint64, copy=False)
 
     def view_count(self, mask: "np.ndarray | None") -> int:
         return len(self.layer_names) if mask is None else int(mask.sum())
