@@ -684,7 +684,7 @@ class UCMKVCacheLayout:
             # Normalize at the pickle boundary: int64 ids mixed into the
             # uint64 stride arithmetic below would silently promote.
             blocks = np.asarray(blocks, dtype=np.uint64)
-            per_key = group_layout.window_blocks
+            per_key = group_layout.tail_blocks
             total = key_count * per_key
             if len(blocks) != total:
                 raise ValueError(
@@ -702,20 +702,23 @@ class UCMKVCacheLayout:
                 if layer_names is None
                 else group_layout.view_mask(layer_names=layer_names)
             )
-            span = group_layout.block_first
+            block_first = group_layout.block_first
             if (
-                span is not None
+                block_first is not None
                 and mask is None
-                and not group_layout.subspan_keys
-                and group_layout.window_shape.span == 0
+                and group_layout.window_span == 0
             ):
                 # Fast path: whole blocks on a Block First layout are one
-                # IO span each.
-                ptrs = span.base_ptr + blocks * span.block_stride
-                sizes = np.full(total, span.block_size_bytes, dtype=np.uint64)
+                # IO span each (a zero span also means zero head offsets).
+                ptrs = (
+                    block_first.base_ptr + blocks * block_first.block_stride
+                )
+                sizes = np.full(
+                    total, block_first.block_size_bytes, dtype=np.uint64
+                )
                 offsets = (
                     np.arange(total, dtype=np.uint64) % per_key
-                ) * span.block_size_bytes + group_base
+                ) * block_first.block_size_bytes + group_base
                 entries_per_key = per_key
             else:
                 offsets = (
@@ -727,7 +730,10 @@ class UCMKVCacheLayout:
                     group_layout.base_ptrs[None, :]
                     + blocks[:, None] * group_layout.block_strides[None, :]
                 )
-                if group_layout.subspan_keys:
+                if (
+                    not group_layout.is_sliding_window
+                    and group_layout.window_span
+                ):
                     # FA sub-span: every key sits at an arithmetic offset
                     # inside its shared block.
                     first_key = (

@@ -1677,6 +1677,66 @@ class DispatcherLifecycleTest(unittest.TestCase):
         self.assertEqual(wa_plan.keys, (wa_keys[4],))
         self.assertEqual(wa_plan.windows[0].tolist(), [1, 2, 3, 4])
 
+    def test_wa_window_not_dividing_block_keeps_partial_head(self):
+        # ceil, not HMA's floor: a 96-token window over 64-token blocks
+        # spans two blocks -- the head block keeps its trailing 32 tokens
+        # at a 32-token in-block offset, the newest block stays whole,
+        # and the two IO spans are memory-adjacent.
+        parsed = parse_kv_cache_config(
+            config(
+                group(["model.layers.0.attn"], FullAttentionSpec(128)),
+                group(
+                    ["model.layers.1.swa_cache"],
+                    AscendSlidingWindowMLASpec(64, 1, 96),
+                ),
+            ),
+            scheduler_block_size=128,
+        )
+        dispatcher = make_dispatcher(parsed)
+        request = FakeRequest("r", 512)
+        fa_keys = tuple(bytes([index]) * 16 for index in range(4))
+        wa_keys = tuple(bytes([index + 32]) * 16 for index in range(4))
+        seed_request_state(
+            dispatcher, request, group_ucm_block_ids=(fa_keys, wa_keys)
+        )
+        dispatcher.requests["r"].group_vllm_block_ids = (
+            list(range(4)),
+            list(range(8)),
+        )
+
+        metadata = dispatcher.build_metadata({"r": 384})
+        wa_plan = next(
+            plan
+            for plan in metadata.requests["r"].dump_plans
+            if plan.hash_group == "WA"
+        )
+        # Window [288, 384): the head half of block 4 plus all of block 5.
+        self.assertEqual(wa_plan.keys, (wa_keys[2],))
+        self.assertEqual(wa_plan.windows[0].tolist(), [4, 5])
+
+        layout = UCMKVCacheLayout(
+            parsed,
+            {
+                "model.layers.0.attn": FakeTensor(
+                    0x1000, (8, 128, 1, 512), (65536, 512, 512, 1),
+                    element_size=2,
+                ),
+                "model.layers.1.swa_cache": FakeTensor(
+                    0x3000, (8, 64, 1, 512), (32768, 512, 512, 1),
+                    element_size=2,
+                ),
+            },
+        )
+        batch = layout.build_dump_batches(
+            metadata, "model.layers.1.swa_cache"
+        )
+        self.assertEqual(batch.sizes.tolist(), [32768, 65536])
+        self.assertEqual(batch.offsets.tolist(), [0, 32768])
+        self.assertEqual(
+            batch.ptrs.tolist(),
+            [0x3000 + 4 * 65536 + 32768, 0x3000 + 5 * 65536],
+        )
+
     def test_dsv4_fa_windows_encode_n_to_one_keys_flat(self):
         parsed = parse_kv_cache_config(
             config(

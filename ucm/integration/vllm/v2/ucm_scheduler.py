@@ -12,6 +12,7 @@ import numpy as np
 
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
 
+from .layout.group import group_tail_blocks
 from .ucm_kv_cache import UCMKVCacheGroupInfo, UCMKVCacheSpec
 from .ucm_proxy import UCMProxyAdapter
 
@@ -78,8 +79,9 @@ class UCMGroupDispatchPlan:
     token_start: int
     token_end: int
     # Window block ids per participating group, in dispatch_routes()
-    # order -- the static window shape lives in the spec (see
-    # ``group_window_shape``), so only the ids travel.
+    # order, block-major (tail_blocks blocks per key) -- the static
+    # window shape lives in the spec (see ``group_tail_blocks``), so
+    # only the ids travel.
     windows: tuple[np.ndarray, ...]
 
 
@@ -402,41 +404,41 @@ class UCMDispatcher:
     ) -> np.ndarray:
         """One group's window block ids for the plan's keys, vectorized.
 
-        The static half of the window (block count, sub-span shape) lives
-        in ``group_window_shape``; only these ids travel in the plan.
-        FA keys each span one whole unit: whole blocks when the unit is
-        the larger side, the containing block per key otherwise.  A WA
-        plan's single boundary key keeps the tail window's blocks (the
-        _plans gate guarantees the window is complete and the parse-time
-        alignment check guarantees the boundary is block-aligned).  A
-        State plan's key keeps the boundary's last block.
+        Every window is ``tail_blocks`` vllm blocks ending at the block
+        containing the window's last token -- HMA's boundary indices: a
+        FA key's last token is (k + 1) * unit - 1, a WA/State plan's
+        single boundary key anchors at the boundary the plan completed.
+        The _plans clamp gate keeps the WA gather non-negative and the
+        parse-time divisibility checks keep an FA key inside one shared
+        block.  Block-major per key.
         """
 
         ucm_block_size = self.spec.ucm_cache_block_size
         table = state.group_vllm_block_ids[group.group_id]
-        token_block = group.token_block_size
-        if hash_group == "State":
-            last = (end * ucm_block_size - 1) // token_block
-            return np.asarray(table[last : last + 1], dtype=np.uint64)
-        if hash_group == "WA":
-            assert group.tail_tokens  # WA chains only carry tail-storing groups
-            boundary = end * ucm_block_size
-            first = (boundary - group.tail_tokens) // token_block
-            return np.asarray(
-                table[first : boundary // token_block], dtype=np.uint64
+        tail_blocks = group_tail_blocks(group, ucm_block_size)
+        if hash_group == "FA":
+            boundary_tokens = (
+                np.arange(start + 1, end + 1, dtype=np.uint64)
+                * ucm_block_size
+                - 1
             )
-        if ucm_block_size % token_block == 0:
-            # Whole blocks: one table slice carries every key's span.
-            return np.asarray(
-                table[
-                    start * ucm_block_size // token_block : end
-                    * ucm_block_size
-                    // token_block
-                ],
-                dtype=np.uint64,
+        else:
+            # WA / State: one boundary key at the plan's newest boundary.
+            boundary_tokens = np.asarray(
+                [end * ucm_block_size - 1], dtype=np.uint64
             )
-        # Several keys share one block: the containing block per key (the
-        # table is short here -- token_block spans at least two units).
-        table_ids = np.asarray(table, dtype=np.uint64)
-        ordinals = np.arange(start, end, dtype=np.uint64) * ucm_block_size
-        return table_ids[ordinals // token_block]
+        boundary_block_idx = boundary_tokens // group.token_block_size
+        # Convert only the table range the windows touch -- a WA group's
+        # table spans the whole request while its window holds a couple
+        # of blocks.  The clamp gate and the FA divisibility checks keep
+        # first_idx non-negative.
+        first_idx = int(boundary_block_idx.min()) - (tail_blocks - 1)
+        last_idx = int(boundary_block_idx.max())
+        table_ids = np.asarray(
+            table[first_idx : last_idx + 1], dtype=np.uint64
+        )
+        within = boundary_block_idx - first_idx
+        if tail_blocks == 1:
+            return table_ids[within]
+        offsets = np.arange(tail_blocks, dtype=np.uint64)[::-1]
+        return table_ids[(within[:, None] - offsets[None, :]).reshape(-1)]

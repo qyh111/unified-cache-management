@@ -66,45 +66,26 @@ class TensorDescriptor:
     block_stride: int
 
 
-@dataclass(frozen=True)
-class UCMGroupShape:
-    """One group's static window shape over one ucm block.
-
-    ``blocks`` is how many vllm blocks one ucm block's window spans.
-    ``span`` > 0 marks sub-block windows: a full-attention group whose
-    token block is larger than the ucm block places each key at an
-    arithmetic offset inside its block (derived per plan from the token
-    range); a sliding tail shorter than one block stores the block's
-    trailing ``span`` tokens.  ``head`` is the first block's static
-    local start (sliding tails; full-attention sub-spans derive it per
-    key).
-    """
-
-    blocks: int
-    span: int = 0
-    head: int = 0
-
-
-def group_window_shape(
+def group_tail_blocks(
     group: "UCMKVCacheGroupInfo", ucm_block_size: int
-) -> UCMGroupShape:
-    """The static per-group window shape; both sides derive it alike."""
+) -> int:
+    """vLLM blocks one ucm key's window spans (0 = the group stores nothing).
+
+    The count both sides agree on -- HMA's ``tail_blocks`` with the one
+    generalization v2 needs: a tail that does not divide the block still
+    keeps its partial head block (ceil, not HMA's floor).  A state
+    snapshot is one indivisible checkpoint page; a full-attention key
+    spans the whole ucm block (several blocks when the unit is the
+    larger side, the containing block otherwise).
+    """
 
     token_block = group.token_block_size
     if group.is_state_snapshot:
-        return UCMGroupShape(blocks=1)
+        return 1
     if group.is_sliding_window:
         tail = group.tail_tokens or 0
-        if tail <= 0:
-            return UCMGroupShape(blocks=0)
-        return UCMGroupShape(
-            blocks=-(-tail // token_block),
-            span=tail % token_block,
-            head=(token_block - tail % token_block) % token_block,
-        )
-    if ucm_block_size % token_block == 0:
-        return UCMGroupShape(blocks=ucm_block_size // token_block)
-    return UCMGroupShape(blocks=1, span=ucm_block_size)
+        return -(-tail // token_block) if tail > 0 else 0
+    return -(-ucm_block_size // token_block)
 
 
 @dataclass(frozen=True)
@@ -139,6 +120,7 @@ class KVCacheGroupLayout:
         self.group_id = group.group_id
         self.token_block_size = group.token_block_size
         self.is_state_snapshot = group.is_state_snapshot
+        self.is_sliding_window = group.is_sliding_window
         self.num_blocks = group.layers[0].num_blocks
         if self.num_blocks <= 0:
             raise ValueError("num_blocks must be positive")
@@ -229,19 +211,23 @@ class KVCacheGroupLayout:
             self.block_size_bytes = int(self.payload_bytes.sum())
         # Window template: the static half of every dispatch over this
         # group (the plan's block ids are the dynamic half).  One ucm
-        # block's window is ``window_blocks`` vllm blocks; the template
+        # key's window is ``tail_blocks`` vllm blocks; the template
         # places their views in one key's record, block-major (block 0's
-        # views, block 1's views, ...).
-        self.window_shape = group_window_shape(group, ucm_block_size)
-        self.window_blocks = self.window_shape.blocks
-        span = self.window_shape.span
-        self.subspan_keys = (
-            not group.is_state_snapshot
-            and not group.is_sliding_window
-            and span > 0
-        )
+        # views, block 1's views, ...).  ``window_span`` is the head
+        # block's live tokens -- 0 means every block in the window is
+        # whole.
+        self.tail_blocks = group_tail_blocks(group, ucm_block_size)
+        if group.is_sliding_window:
+            span = (group.tail_tokens or 0) % self.token_block_size
+        elif not group.is_state_snapshot:
+            # A full-attention key smaller than one token block shares
+            # that block with its neighbours; the window is the unit.
+            span = ucm_block_size % self.token_block_size
+        else:
+            span = 0
+        self.window_span = span
         views = len(self.layer_names)
-        rows = max(self.window_blocks, 1)
+        rows = max(self.tail_blocks, 1)
         template_offsets = np.zeros((rows, views), dtype=np.uint64)
         template_sizes = np.zeros((rows, views), dtype=np.uint64)
         template_extras = np.zeros((rows, views), dtype=np.uint64)
@@ -250,10 +236,13 @@ class KVCacheGroupLayout:
             template_offsets[0] = (
                 np.cumsum(template_sizes[0]) - template_sizes[0]
             )
-            if not self.subspan_keys:
-                # A sliding tail's head block starts mid-block.
+            if self.is_sliding_window:
+                # A sliding tail's head block starts mid-block (a fixed
+                # number of tokens back from the boundary); a
+                # full-attention sub-span's head varies per key instead,
+                # derived at dispatch from the token range.
                 template_extras[0] = self._head_view_offsets(
-                    self.window_shape.head
+                    (self.token_block_size - span) % self.token_block_size
                 )
                 for row in range(1, rows):
                     template_sizes[row] = self.payload_bytes
@@ -283,7 +272,7 @@ class KVCacheGroupLayout:
                 f"state={int(self.is_state_snapshot)} "
                 f"block-first={int(self.block_first is not None)} "
                 f"block_size_bytes={self.block_size_bytes} token_block={self.token_block_size} "
-                f"window_blocks={self.window_blocks} span={span} "
+                f"tail_blocks={self.tail_blocks} span={span} "
                 f"record_bytes={self.window_record_bytes}"
             )
 
