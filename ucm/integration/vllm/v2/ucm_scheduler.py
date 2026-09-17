@@ -329,42 +329,45 @@ class UCMDispatcher:
         load_start = state.hbm_hit_tokens if should_load else load_end
         dump_start = state.token_processed
         dump_end = step_end
-        load = self._plans(state, load_start, load_end, is_dump=False)
+        load = self._plans(state, load_start, load_end)
         if should_load:
             state.load_pending = False
-        dump = self._plans(state, dump_start, dump_end, is_dump=True)
+        dump = self._plans(state, dump_start, dump_end)
         state.token_processed = step_end
         return RequestDispatchMeta(request_id, load, dump)
 
     def _plans(
-        self, state: RequestState, token_start: int, token_end: int, *, is_dump: bool
+        self, state: RequestState, token_start: int, token_end: int
     ) -> tuple[UCMGroupDispatchPlan, ...]:
+        """Plans over [token_start, token_end); dump and load share one rule.
+
+        FA gets every complete key the range touches; WA/State get the
+        newest boundary it ends on.  A pending load always ends on a
+        whole key (_lookup restores only key-aligned boundaries), so its
+        newest boundary is exactly the restore boundary.
+        """
         plans: list[UCMGroupDispatchPlan] = []
         if token_end <= token_start:
             return ()
         ucm_block_size = self.spec.ucm_cache_block_size
         # Route-invariant key bounds: the first key the range touches and
-        # the boundary it ends on.  FA's guard and the WA/State dump
-        # guard are the same "no complete key in range" test.
+        # the boundary it ends on.  No complete key in range means no
+        # plan for any kind: FA has nothing to store or load, and the
+        # WA/State boundary was not reached.
         first_key = token_start // ucm_block_size
         last_key = token_end // ucm_block_size
+        if last_key <= first_key:
+            return ()
         for route_index, (hash_group, physical_groups) in enumerate(self._routes):
             keys_available = state.group_ucm_block_ids[route_index]
             if hash_group in ("WA", "State"):
                 # One boundary record per plan.  A dump keeps the newest
                 # boundary the step completed -- a step may straddle
-                # boundaries without ending on one, so completion is
-                # "token_end passed it" (the step range, which starts
+                # boundaries without ending on one, so the anchor is the
+                # boundary token_end passed (the step range, which starts
                 # where the previous step ended, keeps each boundary from
-                # being recorded twice); a step completing no new boundary
-                # stores nothing.  A load restores the boundary load_end
-                # ends on (always cache-aligned).
-                if is_dump:
-                    if last_key <= first_key:
-                        continue
-                elif token_end % ucm_block_size:
-                    continue
-                start = max(last_key - 1, 0)
+                # being recorded twice).
+                start = last_key - 1
                 end = last_key
             else:
                 # FA keys are stored once and never re-stored, so a plan
@@ -372,8 +375,6 @@ class UCMDispatcher:
                 # the newest boundary.
                 start = first_key
                 end = last_key
-                if end <= start:
-                    continue
             if hash_group == "WA":
                 # A tail window is only worth storing once it is
                 # complete: an early boundary shorter than the chain's
