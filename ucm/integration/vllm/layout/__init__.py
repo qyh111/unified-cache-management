@@ -31,6 +31,7 @@ from typing import TYPE_CHECKING
 
 from .group import BlockAccess, BlockFirstView, KVCacheGroupLayout, TensorDescriptor
 from .record import GroupRecordLayout
+from .schema import LayerShardSchema, Slot, StoreSchema
 from .spec import (
     UCMKVCacheGroupInfo,
     UCMKVCacheSpec,
@@ -64,7 +65,10 @@ __all__ = [
     "GroupRecordLayout",
     "KVCacheGroupLayout",
     "LAYOUT_DEBUG",
+    "LayerShardSchema",
     "MemorySegment",
+    "Slot",
+    "StoreSchema",
     "TensorDescriptor",
     "UCMKVCacheGroupInfo",
     "UCMKVCacheSpec",
