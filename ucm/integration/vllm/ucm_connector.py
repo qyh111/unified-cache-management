@@ -41,6 +41,13 @@ from ucm.integration.vllm.metrics import (
     UCMConnectorStats,
     UCMPromMetrics,
 )
+from ucm.integration.vllm.layout import (
+    GroupRecordLayout,
+    LayerShardSchema,
+    StoreSchema,
+    build_group_layouts,
+    parse_kv_cache_config,
+)
 from ucm.integration.vllm.rank_consistency import RankConsistencyManager
 from ucm.integration.vllm.request_hasher import RequestHasher
 from ucm.logger import init_logger
@@ -1304,6 +1311,144 @@ class MiniMaxM3KVCacheLayout(KVCacheLayout):
 
 
 @dataclass
+class GroupSchemaLayout(KVCacheLayout):
+    """KV-cache layout compiled through the ported connector-v2 pipeline.
+
+    Opt-in via launch_config ``use_group_schema_layout``; the default
+    selection chain is untouched. The pipeline is
+    ``parse_kv_cache_config`` -> ``build_group_layouts`` ->
+    ``GroupRecordLayout`` -> ``StoreSchema``/``LayerShardSchema``: the
+    slot table (and its ghost columns) is compiled from the parsed spec
+    and validated against the live tensors, replacing the
+    collect-and-guess path of the base layouts.
+
+    Increment scope: one non-sliding full-attention KV group (plain
+    models), which the base connector's single-chain dispatch serves
+    unchanged -- ``extract_block_addrs`` and the size properties are
+    inherited. Multi-group hybrids and sliding windows need the per-group
+    dispatch integration and raise until that lands.
+    """
+
+    def __init__(
+        self,
+        kvcaches,
+        ucm_config: dict,
+        vllm_config: "VllmConfig",
+        kv_cache_config: "KVCacheConfig",
+    ) -> None:
+        self.use_layerwise = ucm_config.get("use_layerwise", True)
+        self.kv_cache_config = kv_cache_config
+        self.vllm_config = vllm_config
+        self.pp_size = self.vllm_config.parallel_config.pipeline_parallel_size
+        self.num_hidden_layers = getattr(
+            self.vllm_config.model_config.hf_text_config, "num_hidden_layers", 0
+        )
+        if self.pp_size > 1 and self.num_hidden_layers <= 0:
+            raise ValueError("num_hidden_layers must be > 0 when pp_size > 1")
+        self.layer_name_to_id = {
+            name: extract_layer_index(name) for name in kvcaches.keys()
+        }
+        self.first_layer_id = next(iter(self.layer_name_to_id.values()))
+        self.num_blocks = self.kv_cache_config.num_blocks
+        self._build_group_schema(kvcaches)
+
+    def _build_group_schema(self, kvcaches) -> None:
+        device_type = getattr(current_platform, "device_type", None) or "npu"
+        spec = parse_kv_cache_config(
+            self.kv_cache_config,
+            scheduler_block_size=self.vllm_config.cache_config.block_size,
+            device_type=device_type,
+            num_hidden_layers=self.num_hidden_layers or None,
+        )
+        if len(spec.groups) != 1:
+            raise NotImplementedError(
+                "GroupSchemaLayout currently supports exactly one KV group; "
+                f"got {len(spec.groups)} (multi-group hybrids need the "
+                "per-group dispatch integration)"
+            )
+        group = spec.groups[0]
+        if group.is_sliding_window or group.is_state_snapshot:
+            raise NotImplementedError(
+                "GroupSchemaLayout currently supports full-attention groups "
+                "only; sliding windows need the window-row dispatch"
+            )
+        group_layouts = build_group_layouts(spec, kvcaches)
+        layout = group_layouts[group.group_id]
+        record = GroupRecordLayout.build(group, layout, spec.ucm_cache_block_size)
+        if record.blocks_per_key != 1:
+            raise NotImplementedError(
+                "GroupSchemaLayout currently supports one window row per key "
+                f"(tail_blocks={record.blocks_per_key})"
+            )
+        self._spec = spec
+        self._group = group
+        self._group_layout = layout
+        self._record = record
+        routes = (("FA", (group.group_id,)),)
+        self._store_schema = StoreSchema.build(routes, {group.group_id: record})
+        self._layer_shards = LayerShardSchema.build(routes, {group.group_id: record})
+        self._materialize()
+
+    def _materialize(self) -> None:
+        """Emit the base-layout arrays from the compiled slot table.
+
+        Bulk: one row of real columns. Layerwise: one row per model layer;
+        every row presents the same slot list, and slots the layer does not
+        own follow the ghost convention (``base_ptr=0, block_stride=0``,
+        declared width kept) so the store registration filters them.
+        """
+        layout = self._group_layout
+        record = self._record
+        if not self.use_layerwise:
+            self.base_ptrs = layout.base_ptrs.copy()
+            self.block_stride_lists = layout.block_strides.copy()
+            self.tensor_size_lists = record.access.segment_bytes[0].copy()
+            self.buffer_sizes = layout.payload_bytes.copy()
+            logger.info(
+                "GroupSchemaLayout bulk: slots=%d, record_bytes=%d",
+                len(self.tensor_size_lists),
+                int(self.tensor_size_lists.sum()),
+            )
+            return
+
+        sizes = list(self._layer_shards.tensor_size_list)
+        n_slots = len(sizes)
+        ptr_rows, stride_rows, size_rows, buffer_rows = [], [], [], []
+        for layer_id in sorted(layout.layer_slices):
+            sl = layout.layer_slices[layer_id]
+            real_ptrs = layout.base_ptrs[sl]
+            real_strides = layout.block_strides[sl]
+            real_buffers = layout.payload_bytes[sl]
+            count = len(real_ptrs)
+            if count > n_slots:
+                raise ValueError(
+                    f"layer {layer_id} has {count} columns but the group "
+                    f"schema has {n_slots} positions"
+                )
+            pad = n_slots - count
+            ptr_rows.append(
+                np.concatenate([real_ptrs, np.zeros(pad, dtype=np.uint64)])
+            )
+            stride_rows.append(
+                np.concatenate([real_strides, np.zeros(pad, dtype=np.uint64)])
+            )
+            size_rows.append(np.asarray(sizes, dtype=np.uint64))
+            buffer_rows.append(
+                np.concatenate([real_buffers, np.zeros(pad, dtype=np.uint64)])
+            )
+        self.base_ptrs = np.asarray(ptr_rows, dtype=np.uint64)
+        self.block_stride_lists = np.asarray(stride_rows, dtype=np.uint64)
+        self.tensor_size_lists = np.asarray(size_rows, dtype=np.uint64)
+        self.buffer_sizes = np.asarray(buffer_rows, dtype=np.uint64)
+        logger.info(
+            "GroupSchemaLayout layerwise: layers=%d, slots=%d, "
+            "shard_bytes=%d",
+            len(ptr_rows),
+            n_slots,
+            int(self.tensor_size_lists[0].sum()),
+        )
+
+
 class UCMConnectorMetadata(KVConnectorMetadata):
     request_meta: dict[str, RequestDispatchMeta] = field(default_factory=dict)
     preempted_req_ids: set[str] = field(default_factory=set)
@@ -1705,7 +1850,9 @@ class UCMDirectConnector(KVConnectorBase_V1):
             # vllm_ascend >= 0.10.0 uses Tuple for kvcaches
             for i, tensor in enumerate(sample_kv_layer):
                 logger.info(f"kv cache shape {i}: {tensor.shape}")
-        if MiniMaxM3KVCacheLayout.supports(self._vllm_config):
+        if self.launch_config.get("use_group_schema_layout"):
+            layout_cls = GroupSchemaLayout
+        elif MiniMaxM3KVCacheLayout.supports(self._vllm_config):
             layout_cls = MiniMaxM3KVCacheLayout
         elif SharedIndexerKVCacheLayout.supports(self._vllm_config, self.launch_config):
             layout_cls = SharedIndexerKVCacheLayout
