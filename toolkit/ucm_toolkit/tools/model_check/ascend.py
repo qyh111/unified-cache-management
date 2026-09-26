@@ -79,8 +79,11 @@ storage_backends = config.storage_backends
 visible_devices = config.visible_devices
 dtype = config.dtype
 kv_cache_dtype = config.kv_cache_dtype
+connector_module_path = config.connector_module_path
 trust_remote_code = True
-request_token_salt = time.time_ns() ^ os.getpid()
+request_token_salt = int(
+    os.getenv("UCM_MODEL_CHECK_TOKEN_SALT", str(time.time_ns() ^ os.getpid()))
+)
 
 
 def _factory_kwargs_redirect_to_meta(kwargs: dict[str, Any]) -> dict[str, Any]:
@@ -117,6 +120,7 @@ def make_config() -> Any:
         storage_backends,
         use_layerwise,
         "npu",
+        connector_module_path,
     )
 
 
@@ -310,7 +314,7 @@ def check_config() -> None:
 def main() -> int:
     check_config()
     os.environ["ASCEND_RT_VISIBLE_DEVICES"] = visible_devices
-    active_device = torch.device("npu:0")
+    active_device = torch.device(f"npu:{os.getenv('LOCAL_RANK', '0')}")
     importlib.import_module("torch_npu")
     torch.npu.set_device(active_device)
     log(f"ASCEND_RT_VISIBLE_DEVICES={visible_devices}, device={active_device}")
@@ -325,7 +329,7 @@ def main() -> int:
         # the worker-published id, so initialize the worker before Scheduler.
         worker = make_worker(fixture)
         torch.npu.set_device(active_device)
-        dispatch = schedule(fixture, tokens, request_token_salt, patch_groups)
+        dispatch = schedule(fixture, tokens, request_token_salt, patch_groups, worker)
         verify(fixture, dispatch, worker, torch.npu.synchronize)
         return 0
     finally:

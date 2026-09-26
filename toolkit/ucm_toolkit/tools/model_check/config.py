@@ -17,6 +17,8 @@ STORAGE_BACKENDS_ENV = "UCM_MODEL_CHECK_STORAGE_BACKENDS"
 DEVICE_ENV = "UCM_MODEL_CHECK_DEVICE_ID"
 DTYPE_ENV = "UCM_MODEL_CHECK_DTYPE"
 KV_CACHE_DTYPE_ENV = "UCM_MODEL_CHECK_KV_CACHE_DTYPE"
+CONNECTOR_MODULE_PATH_ENV = "UCM_MODEL_CHECK_CONNECTOR_MODULE_PATH"
+LEGACY_CONNECTOR_MODULE = "ucm.integration.vllm.ucm_connector"
 
 
 def _bool_env(name: str, default: bool) -> bool:
@@ -68,11 +70,20 @@ class ModelCheckConfig:
     visible_devices: str
     dtype: str
     kv_cache_dtype: str
+    connector_module_path: str
+    tp: int = 1
+    pp: int = 1
+    pcp: int = 1
+    dcp: int = 1
 
 
 def load_config() -> ModelCheckConfig:
     """Load model-check configuration from the child-process environment."""
     return ModelCheckConfig(
+        tp=_int_env("UCM_MODEL_CHECK_TP", 1),
+        pp=_int_env("UCM_MODEL_CHECK_PP", 1),
+        pcp=_int_env("UCM_MODEL_CHECK_PCP", 1),
+        dcp=_int_env("UCM_MODEL_CHECK_DCP", 1),
         model=os.environ.get(MODEL_ENV, "/models/Qwen2.5-14B-Instruct"),
         tokens=_int_env(TOKENS_ENV, 4096),
         block_size=_int_env(BLOCK_SIZE_ENV, 64),
@@ -83,4 +94,7 @@ def load_config() -> ModelCheckConfig:
         visible_devices=os.environ.get(DEVICE_ENV, "0"),
         dtype=os.environ.get(DTYPE_ENV, "auto"),
         kv_cache_dtype=os.environ.get(KV_CACHE_DTYPE_ENV, "auto"),
+        connector_module_path=os.environ.get(
+            CONNECTOR_MODULE_PATH_ENV, LEGACY_CONNECTOR_MODULE
+        ),
     )

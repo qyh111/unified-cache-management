@@ -6,6 +6,7 @@ import copy
 import hashlib
 import inspect
 import math
+import os
 import time
 import traceback
 from contextlib import contextmanager, nullcontext
@@ -125,8 +126,9 @@ def make_config(
     storage_backends: str,
     use_layerwise: bool,
     device: str,
+    connector_module_path: str = "ucm.integration.vllm.ucm_connector",
 ) -> Any:
-    """Create a one-rank vLLM configuration for the synthetic request."""
+    """Create the requested vLLM parallel configuration for the synthetic request."""
 
     from vllm.config import KVTransferConfig
     from vllm.engine.arg_utils import EngineArgs
@@ -135,7 +137,7 @@ def make_config(
         KVTransferConfig,
         {
             "kv_connector": "UCMConnector",
-            "kv_connector_module_path": "ucm.integration.vllm.ucm_connector",
+            "kv_connector_module_path": connector_module_path,
             "kv_role": "kv_both",
             "kv_connector_extra_config": make_ucm_config(
                 store_pipeline,
@@ -155,8 +157,19 @@ def make_config(
             "dtype": dtype,
             "kv_cache_dtype": kv_cache_dtype,
             "block_size": block_size,
-            "tensor_parallel_size": 1,
-            "pipeline_parallel_size": 1,
+            "tensor_parallel_size": int(os.getenv("UCM_MODEL_CHECK_TP", "1")),
+            "pipeline_parallel_size": int(os.getenv("UCM_MODEL_CHECK_PP", "1")),
+            "prefill_context_parallel_size": int(os.getenv("UCM_MODEL_CHECK_PCP", "1")),
+            "decode_context_parallel_size": int(os.getenv("UCM_MODEL_CHECK_DCP", "1")),
+            "cp_kv_cache_interleave_size": (
+                block_size
+                if device == "npu"
+                and (
+                    int(os.getenv("UCM_MODEL_CHECK_PCP", "1")) > 1
+                    or int(os.getenv("UCM_MODEL_CHECK_DCP", "1")) > 1
+                )
+                else 1
+            ),
             "max_model_len": max_model_len,
             "max_num_batched_tokens": max_model_len,
             "max_num_seqs": 2,
@@ -172,6 +185,16 @@ def make_config(
         },
     )
     vllm_config = engine_args.create_engine_config()
+    for env, name in (
+        ("TP", "tensor_parallel_size"),
+        ("PP", "pipeline_parallel_size"),
+        ("PCP", "prefill_context_parallel_size"),
+        ("DCP", "decode_context_parallel_size"),
+    ):
+        if int(getattr(vllm_config.parallel_config, name, 1)) != int(
+            os.getenv(f"UCM_MODEL_CHECK_{env}", "1")
+        ):
+            raise UnsupportedEnvironment(f"Engine did not accept requested {env}")
     model_config = vllm_config.model_config
     if bool(
         getattr(model_config, "is_multimodal_model", False)
@@ -400,15 +423,12 @@ def make_layout(
     if hasattr(vllm_config.cache_config, "num_gpu_blocks"):
         vllm_config.cache_config.num_gpu_blocks = num_blocks
     if hasattr(kv_utils, "get_kv_cache_configs"):
+        specs = gather_objects(kv_cache_specs)
         with current_vllm_config_context(vllm_config):
             configs = kv_utils.get_kv_cache_configs(
-                vllm_config, [kv_cache_specs], [1 << 50]
+                vllm_config, specs, [1 << 50] * len(specs)
             )
-        if len(configs) != 1:
-            raise UnsupportedEnvironment(
-                f"Expected one worker KV config, got {len(configs)}"
-            )
-        return configs[0]
+        return configs[int(os.getenv("RANK", "0"))]
 
     if not hasattr(kv_utils, "get_kv_cache_groups"):
         raise UnsupportedEnvironment(
@@ -571,8 +591,48 @@ def init_kv(
     return kv_caches
 
 
+def gather_objects(value):
+    """Use real CPU process groups for metadata; no model tensors are gathered."""
+    if int(os.getenv("WORLD_SIZE", "1")) == 1:
+        return [value]
+    from vllm.distributed import get_world_group
+
+    values = [None] * torch.distributed.get_world_size()
+    torch.distributed.all_gather_object(
+        values, value, group=get_world_group().cpu_group
+    )
+    return values
+
+
+def assert_shared_dispatch(metadata):
+    """Independent native Schedulers must emit the same global transfer plan."""
+    if not hasattr(metadata, "requests"):
+        return
+    signature = [
+        (
+            request_id,
+            phase,
+            plan.hash_group,
+            plan.keys,
+            plan.token_start,
+            plan.token_end,
+            tuple(tuple(int(x) for x in window) for window in plan.windows),
+        )
+        for request_id, request in metadata.requests.items()
+        for phase in ("load", "dump")
+        for plan in getattr(request, phase + "_plans")
+    ]
+    signatures = gather_objects(signature)
+    if any(value != signatures[0] for value in signatures):
+        raise AssertionError("Ranks received different logical Scheduler/UCM plans")
+
+
+def sync_workers():
+    gather_objects(None)
+
+
 def init_dist(vllm_config: Any, backend: str) -> None:
-    """Create vLLM's mandatory one-rank model-parallel group once."""
+    """Create real model-parallel groups using torchrun rank/device coordinates."""
 
     from vllm.distributed import (
         init_distributed_environment,
@@ -583,15 +643,31 @@ def init_dist(vllm_config: Any, backend: str) -> None:
     if not torch.distributed.is_initialized():
         with current_vllm_config_context(vllm_config):
             init_distributed_environment(
-                world_size=1,
-                rank=0,
-                distributed_init_method="tcp://127.0.0.1:29500",
-                local_rank=0,
+                world_size=int(os.getenv("WORLD_SIZE", "1")),
+                rank=int(os.getenv("RANK", "0")),
+                distributed_init_method=(
+                    "env://" if "RANK" in os.environ else "tcp://127.0.0.1:29500"
+                ),
+                local_rank=int(os.getenv("LOCAL_RANK", "0")),
                 backend=backend,
             )
     if not model_parallel_is_initialized():
         with current_vllm_config_context(vllm_config):
-            initialize_model_parallel(1, 1, 1, 1, backend=backend)
+            p = vllm_config.parallel_config
+            call_with_supported_kwargs(
+                initialize_model_parallel,
+                {
+                    "tensor_model_parallel_size": p.tensor_parallel_size,
+                    "pipeline_model_parallel_size": p.pipeline_parallel_size,
+                    "prefill_context_model_parallel_size": getattr(
+                        p, "prefill_context_parallel_size", 1
+                    ),
+                    "decode_context_model_parallel_size": getattr(
+                        p, "decode_context_parallel_size", 1
+                    ),
+                    "backend": backend,
+                },
+            )
 
 
 def make_cache(
@@ -687,17 +763,74 @@ def make_cache(
 def make_worker(fixture: CacheFixture) -> Any:
     """Create the worker-side UCM connector and bind the real KV tensors."""
 
+    log_cache_layout(fixture)
+    from vllm.distributed.kv_transfer.kv_connector.factory import KVConnectorFactory
     from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorRole
 
-    from ucm.integration.vllm.ucm_connector import UCMConnector
-
-    connector = UCMConnector(
-        fixture.vllm_config,
-        KVConnectorRole.WORKER,
-        fixture.kv_cache_config,
+    connector = KVConnectorFactory.create_connector(
+        fixture.vllm_config, KVConnectorRole.WORKER, fixture.kv_cache_config
     )
     connector.register_kv_caches(fixture.kv_caches)
     return connector
+
+
+def _runtime_tensor_signature(value: Any) -> tuple[Any, ...]:
+    if isinstance(value, (tuple, list)):
+        return tuple(_runtime_tensor_signature(item) for item in value)
+    shape = tuple(int(item) for item in value.shape)
+    stride = tuple(int(value.stride(index)) for index in range(len(shape)))
+    return (str(value.device), str(value.dtype), shape, stride)
+
+
+def log_cache_layout(fixture: CacheFixture) -> None:
+    """Print deduplicated config/runtime layouts before connector parsing."""
+
+    config = fixture.kv_cache_config
+    raw_by_layer = {
+        layer_name: raw
+        for raw in getattr(config, "kv_cache_tensors", ())
+        # vllm 0.29: KVCacheTensor.shared_by 改名 layers（L 序）
+        for layer_name in (getattr(raw, "layers", None) or raw.shared_by)
+    }
+    log(
+        "KVCacheConfig: "
+        f"num_blocks={config.num_blocks}, "
+        f"groups={len(config.kv_cache_groups)}, "
+        f"raw_tensors={len(getattr(config, 'kv_cache_tensors', ()))}"
+    )
+    for group_id, group in enumerate(config.kv_cache_groups):
+        nested = getattr(group.kv_cache_spec, "kv_cache_specs", None) or {}
+        signatures: dict[tuple[Any, ...], list[str]] = {}
+        for layer_name in group.layer_names:
+            layer_spec = nested.get(layer_name, group.kv_cache_spec)
+            raw = raw_by_layer.get(layer_name)
+            raw_signature = (
+                int(getattr(raw, "block_stride", 0)),
+                int(getattr(raw, "size", 0)),
+            )
+            signature = (
+                type(layer_spec).__name__,
+                int(getattr(layer_spec, "block_size", 0)),
+                int(
+                    getattr(
+                        layer_spec,
+                        "storage_block_size",
+                        getattr(layer_spec, "block_size", 0),
+                    )
+                ),
+                tuple(getattr(layer_spec, "shapes", ()) or ()),
+                raw_signature,
+                _runtime_tensor_signature(fixture.kv_caches[layer_name]),
+            )
+            signatures.setdefault(signature, []).append(layer_name)
+        for signature, layer_names in signatures.items():
+            raw = raw_by_layer.get(layer_names[0])
+            log(
+                f"KV group {group_id}: count={len(layer_names)}, "
+                f"example={layer_names[0]}, "
+                f"example_raw_offset={int(getattr(raw, 'offset', 0))}, "
+                f"signature={signature}"
+            )
 
 
 # Scheduler request construction and dispatch.
@@ -784,7 +917,10 @@ def make_prompt_tokens(num_tokens: int, salt: int) -> list[int]:
 
 
 def source_prompt_tokens(
-    prompt_token_ids: list[int], kv_cache_config: Any, hash_block_size: int
+    prompt_token_ids: list[int],
+    kv_cache_config: Any,
+    hash_block_size: int,
+    connector_alignment: int | None = None,
 ) -> list[int]:
     """Keep the source prefix at a complete multi-group KV boundary."""
 
@@ -799,6 +935,8 @@ def source_prompt_tokens(
         if specs:
             spec = next(iter(specs.values()))
         block_sizes.append(int(spec.block_size))
+    if connector_alignment is not None:
+        block_sizes.append(int(connector_alignment))
     lcm_block_size = math.lcm(*block_sizes)
     source_tokens = len(prompt_token_ids) - hash_block_size
     source_tokens = source_tokens // lcm_block_size * lcm_block_size
@@ -854,8 +992,11 @@ def make_scheduler_cache_config(worker_kv_cache_config: Any) -> Any:
 
     import vllm.v1.core.kv_cache_utils as kv_utils
 
+    configs = gather_objects(worker_kv_cache_config)
+    if hasattr(kv_utils, "generate_scheduler_kv_cache_config"):
+        return kv_utils.generate_scheduler_kv_cache_config(configs)
     if hasattr(kv_utils, "get_scheduler_kv_cache_config"):
-        return kv_utils.get_scheduler_kv_cache_config([worker_kv_cache_config])
+        return kv_utils.get_scheduler_kv_cache_config(configs)
     scheduler_config = copy.deepcopy(worker_kv_cache_config)
     try:
         from vllm.v1.kv_cache_interface import UniformTypeKVCacheSpecs
@@ -988,6 +1129,14 @@ def finish_async_dumps(worker: Any, request_id: str) -> None:
 def metadata_key_count(metadata: Any, phase: str) -> int:
     """Count UCM keys in ordinary or FAWA dispatch metadata."""
 
+    v2_requests = getattr(metadata, "requests", None)
+    if v2_requests is not None:
+        return sum(
+            len(plan.keys)
+            for request_meta in v2_requests.values()
+            for plan in getattr(request_meta, f"{phase}_plans")
+        )
+
     total = 0
     for request_meta in getattr(metadata, "request_meta", {}).values():
         native = f"{phase}_block_ids"
@@ -996,6 +1145,93 @@ def metadata_key_count(metadata: Any, phase: str) -> int:
         elif hasattr(request_meta, f"{phase}_keys"):
             total += len(getattr(request_meta, f"{phase}_keys"))
     return total
+
+
+def _v2_batch(worker: Any, metadata: Any, phase: str) -> Any | None:
+    """Build the exact v2 pointer batch, or return None for legacy metadata."""
+
+    if not hasattr(metadata, "requests"):
+        return None
+    connector = getattr(worker, "connector", worker)
+    layout = getattr(connector, "layout", None)
+    if layout is None:
+        raise ValueError("connector v2 worker has no registered KV-cache layout")
+    builder = getattr(layout, f"build_{phase}_batches")
+    if not getattr(connector, "use_layerwise", False):
+        return builder(metadata)
+    # Layerwise transfers copy view payloads, not padding between Block First
+    # slots. Fill and compare those payloads using the same per-name partition;
+    # the bulk oracle still checks its complete spans, including padding.
+    batches = [builder(metadata, layer_name=name) for name in layout.layer_id_by_name]
+    return SimpleNamespace(
+        **{
+            field: tuple(value for batch in batches for value in getattr(batch, field))
+            for field in ("block_ids", "offsets", "ptrs", "sizes")
+        }
+    )
+
+
+def _v2_segment_payload(key: bytes, offset: int, size: int) -> bytes:
+    """Generate position-dependent bytes without retaining a second KV copy."""
+
+    offset, size = int(offset), int(size)
+    seed = hashlib.sha256(
+        bytes(key)
+        + offset.to_bytes(8, "little")
+        + int(os.getenv("RANK", "0")).to_bytes(4, "little")
+    ).digest()
+    pattern = bytes((seed[index % len(seed)] + index) % 251 for index in range(251))
+    return (pattern * ((size + len(pattern) - 1) // len(pattern)))[:size]
+
+
+def fill_v2_dump_segments(
+    fixture: Any,
+    worker: Any,
+    metadata: Any,
+) -> int:
+    """Fill every v2 dump byte range with a deterministic offset pattern."""
+
+    from ucm.integration.vllm.v2.ucm_proxy import TorchTensorByteAccess
+
+    batch = _v2_batch(worker, metadata, "dump")
+    if batch is None:
+        raise ValueError("fill_v2_dump_segments received legacy metadata")
+    access = TorchTensorByteAccess()
+    access.register_tensors(fixture.kv_caches)
+    for key, offset, ptr, size in zip(
+        batch.block_ids, batch.offsets, batch.ptrs, batch.sizes, strict=True
+    ):
+        access.write(ptr, _v2_segment_payload(key, offset, size))
+    access.synchronize()
+    return len(batch.sizes)
+
+
+def compare_v2_load_segments(
+    fixture: Any,
+    worker: Any,
+    metadata: Any,
+) -> int:
+    """Compare loaded v2 ranges against their key/offset-derived byte pattern."""
+
+    from ucm.integration.vllm.v2.ucm_proxy import TorchTensorByteAccess
+
+    batch = _v2_batch(worker, metadata, "load")
+    if batch is None:
+        raise ValueError("compare_v2_load_segments received legacy metadata")
+    access = TorchTensorByteAccess()
+    access.register_tensors(fixture.kv_caches)
+    access.synchronize()
+    for index, (key, offset, ptr, size) in enumerate(
+        zip(batch.block_ids, batch.offsets, batch.ptrs, batch.sizes, strict=True)
+    ):
+        expected = _v2_segment_payload(key, offset, size)
+        actual = access.read(ptr, size)
+        if actual != expected:
+            raise AssertionError(
+                "connector v2 byte mismatch: "
+                f"segment={index}, key={key.hex()}, offset={offset}, size={size}"
+            )
+    return len(batch.sizes)
 
 
 def _fawa_segments(
@@ -1342,6 +1578,12 @@ def compare_loaded_blocks(
 ) -> int:
     """Compare saved source blocks with their loaded target blocks."""
 
+    if hasattr(load_metadata, "requests"):
+        compared = compare_v2_load_segments(fixture, worker, load_metadata)
+        if not compared:
+            raise AssertionError("no loaded connector v2 byte ranges were compared")
+        return compared
+
     connector = getattr(worker, "connector", None)
     source_segments = _fawa_segments(save_metadata, "dump", connector)
     target_segments = _fawa_segments(load_metadata, "load", connector)
@@ -1486,6 +1728,7 @@ def schedule(
     tokens: int,
     request_token_salt: int,
     patch_groups: Callable[[Any], None] | None = None,
+    worker: Any | None = None,
 ) -> RequestDispatchFixture:
     """Schedule the aligned source request and return its UCM dump metadata."""
 
@@ -1501,8 +1744,13 @@ def schedule(
     _, hash_block_size = get_scheduler_and_hash_block_size(
         fixture.vllm_config, fixture.kv_cache_config
     )
+    connector = getattr(worker, "connector", worker)
+    connector_spec = getattr(connector, "spec", None)
     source_token_ids = source_prompt_tokens(
-        prompt_token_ids, fixture.kv_cache_config, hash_block_size
+        prompt_token_ids,
+        fixture.kv_cache_config,
+        hash_block_size,
+        getattr(connector_spec, "alignment_block_size", None),
     )
     source = schedule_source(
         fixture, "ucm-kv-shape-check-source", source_token_ids, patch_groups
@@ -1530,6 +1778,7 @@ def verify(
 
     source_ids = dispatch.block_ids
     save_metadata = dispatch.scheduler_output.kv_connector_metadata
+    assert_shared_dispatch(save_metadata)
     dump_count = metadata_key_count(save_metadata, "dump")
     if dump_count == 0:
         raise UnsupportedEnvironment(
@@ -1537,11 +1786,20 @@ def verify(
             "check UCM persist thresholds."
         )
 
-    native_blocks = (
-        _fawa_segments(save_metadata, "dump", getattr(worker, "connector", None))
-        is not None
-    )
-    saved = save_source(fixture, source_ids, synchronize, native_blocks)
+    v2_dump_batch = _v2_batch(worker, save_metadata, "dump")
+    if v2_dump_batch is not None:
+        filled = fill_v2_dump_segments(fixture, worker, save_metadata)
+        if not filled:
+            raise UnsupportedEnvironment(
+                "Scheduler/UCM v2 metadata selected no dump byte ranges."
+            )
+        saved = []
+    else:
+        native_blocks = (
+            _fawa_segments(save_metadata, "dump", getattr(worker, "connector", None))
+            is not None
+        )
+        saved = save_source(fixture, source_ids, synchronize, native_blocks)
     worker.bind_connector_metadata(save_metadata)
     worker.start_load_kv(build_forward_context(fixture.kv_caches))
     call_worker_layer_hooks(worker, fixture, save=True)
@@ -1550,6 +1808,7 @@ def verify(
     worker.clear_connector_metadata()
     synchronize()
     log(f"dump completed: request_id={dispatch.request_id}, dump_keys={dump_count}")
+    sync_workers()
     time.sleep(10)
 
     target = schedule_target(
@@ -1565,9 +1824,11 @@ def verify(
         overlap = (set(source_group) & set(target_group)) - {NATIVE_NULL_BLOCK_ID}
         if overlap:
             raise UnsupportedEnvironment(
-                f"Scheduler reused source physical block ids for target load: {sorted(overlap)}"
+                "Scheduler reused source physical block ids for target load: "
+                f"{sorted(overlap)}"
             )
     load_metadata = target.scheduler_output.kv_connector_metadata
+    assert_shared_dispatch(load_metadata)
     load_count = metadata_key_count(load_metadata, "load")
     if load_count == 0:
         raise UnsupportedEnvironment(
@@ -1590,4 +1851,7 @@ def verify(
         load_metadata,
         worker,
     )
-    log(f"PASS: Scheduler->UCM dump/load, compared_loaded_tensor_blocks={compared}")
+    sync_workers()
+    log(
+        f"PASS: Scheduler->UCM dump/load, rank={os.getenv('RANK', '0')}, compared_loaded_tensor_blocks={compared}"
+    )

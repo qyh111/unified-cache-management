@@ -78,8 +78,11 @@ storage_backends = config.storage_backends
 visible_devices = config.visible_devices
 dtype = config.dtype
 kv_cache_dtype = config.kv_cache_dtype
+connector_module_path = config.connector_module_path
 trust_remote_code = True
-request_token_salt = time.time_ns() ^ os.getpid()
+request_token_salt = int(
+    os.getenv("UCM_MODEL_CHECK_TOKEN_SALT", str(time.time_ns() ^ os.getpid()))
+)
 
 
 def _factory_kwargs_redirect_to_meta(kwargs: dict[str, Any]) -> dict[str, Any]:
@@ -121,6 +124,7 @@ def make_config() -> Any:
         storage_backends,
         use_layerwise,
         "cuda",
+        connector_module_path,
     )
 
 
@@ -263,7 +267,7 @@ def check_config() -> None:
 def main() -> int:
     check_config()
     os.environ["CUDA_VISIBLE_DEVICES"] = visible_devices
-    active_device = torch.device("cuda:0")
+    active_device = torch.device(f"cuda:{os.getenv('LOCAL_RANK', '0')}")
     torch.cuda.set_device(active_device)
     log(f"CUDA_VISIBLE_DEVICES={visible_devices}, device={active_device}")
     vllm_config = None
@@ -276,7 +280,7 @@ def main() -> int:
         # UCM's MLA shared buffer is created by the worker.  The scheduler reads
         # the worker-published id, so initialize the worker before Scheduler.
         worker = make_worker(fixture)
-        dispatch = schedule(fixture, tokens, request_token_salt)
+        dispatch = schedule(fixture, tokens, request_token_salt, worker=worker)
         verify(fixture, dispatch, worker, torch.cuda.synchronize)
         return 0
     finally:
