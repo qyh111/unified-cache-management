@@ -73,10 +73,17 @@ class HLARequestMeta(RequestMeta):
 
 @dataclass
 class HLARequestDispatchMeta(RequestDispatchMeta):
-    """Extends RequestDispatchMeta with full-attn block count for MLA rank scoping."""
+    """Extends RequestDispatchMeta with full-attn block count for MLA rank scoping.
+
+    ``load_slices``/``dump_slices`` carry the per-group ``GroupSlice``
+    entries behind the flat pair lists, so per-group physical resolution
+    (group-schema layouts) can reconstruct which group owns which keys.
+    """
 
     load_full_attn_count: int = 0
     dump_full_attn_count: int = 0
+    load_slices: tuple = ()
+    dump_slices: tuple = ()
 
 
 
@@ -853,6 +860,8 @@ class UCMHybridLinearAttentionConnector(UCMDirectConnector, SupportsHMA):
             dump_block_ids=(dump_ucm_block_ids, dump_vllm_block_ids),
             load_full_attn_count=load_full_attn_count,
             dump_full_attn_count=dump_full_attn_count,
+            load_slices=tuple(load_slices),
+            dump_slices=tuple(dump_slices),
         )
 
     def build_connector_meta(

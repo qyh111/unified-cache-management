@@ -147,6 +147,51 @@ class StoreSchema:
             )
         return schema
 
+    def resolve_group(
+        self,
+        group_id: int,
+        blocks: Sequence[int] | np.ndarray,
+        *,
+        token_offsets: np.ndarray | None = None,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """One group's keys over the full slot table; the other groups ghost.
+
+        Per-group physical addressing for independent block-id chains: the
+        group's own slots resolve through its record template, every other
+        group's slots keep the declared width with ``ptr=0``. ``blocks``
+        carries ``key_count * tail_blocks`` vLLM block ids of this group's
+        chain. Returns flattened ``(offsets, ptrs, sizes)`` of length
+        ``key_count * len(slots)``, key-major.
+        """
+        start, count = self.group_spans[group_id]
+        record = self._records[group_id]
+        block_ids = np.asarray(blocks, dtype=np.uint64)
+        rows = len(block_ids) // record.blocks_per_key
+        if len(block_ids) % record.blocks_per_key:
+            raise ValueError("blocks must contain complete access windows")
+        total = len(self.slots)
+        offsets = np.zeros((rows, total), dtype=np.uint64)
+        ptrs = np.zeros((rows, total), dtype=np.uint64)
+        sizes = np.tile(
+            np.asarray(self.tensor_size_list, dtype=np.uint64), (rows, 1)
+        )
+        # Ghost groups keep their template offsets with null pointers.
+        for gid, (gstart, gcount) in self.group_spans.items():
+            gtemplate = self._records[gid].ucm_block_offsets.reshape(-1)
+            offsets[:, gstart : gstart + gcount] = np.tile(
+                np.asarray(self.group_bases[gid], dtype=np.uint64) + gtemplate,
+                (rows, 1),
+            )
+        real_offsets, real_ptrs, _, _ = record.resolve(
+            block_ids, rows, token_offsets=token_offsets
+        )
+        offsets[:, start : start + count] = (
+            np.asarray(self.group_bases[group_id], dtype=np.uint64)
+            + real_offsets.reshape(rows, count)
+        )
+        ptrs[:, start : start + count] = real_ptrs.reshape(rows, count)
+        return offsets.reshape(-1), ptrs.reshape(-1), sizes.reshape(-1)
+
     def resolve(
         self,
         kind: str,

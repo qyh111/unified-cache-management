@@ -1322,11 +1322,15 @@ class GroupSchemaLayout(KVCacheLayout):
     and validated against the live tensors, replacing the
     collect-and-guess path of the base layouts.
 
-    Increment scope: one non-sliding full-attention KV group (plain
-    models), which the base connector's single-chain dispatch serves
-    unchanged -- ``extract_block_addrs`` and the size properties are
-    inherited. Multi-group hybrids and sliding windows need the per-group
-    dispatch integration and raise until that lands.
+    Bulk supports multi-group hybrids (FA + mamba State): the slot table
+    spans all groups in dispatch-route order, and
+    :meth:`resolve_group` resolves one group's keys with the other
+    groups' slots ghosted -- per-group physical addressing over
+    independent block-id chains. ``extract_block_addrs`` stays available
+    for the single-group case and raises for multi-group (a flat list
+    cannot address independent chains). Sliding windows and multi-row
+    windows still raise; layerwise is single-group until the per-layer
+    dispatch integration lands.
     """
 
     def __init__(
@@ -1360,57 +1364,84 @@ class GroupSchemaLayout(KVCacheLayout):
             device_type=device_type,
             num_hidden_layers=self.num_hidden_layers or None,
         )
-        if len(spec.groups) != 1:
+        if any(group.is_sliding_window for group in spec.groups):
             raise NotImplementedError(
-                "GroupSchemaLayout currently supports exactly one KV group; "
-                f"got {len(spec.groups)} (multi-group hybrids need the "
-                "per-group dispatch integration)"
-            )
-        group = spec.groups[0]
-        if group.is_sliding_window or group.is_state_snapshot:
-            raise NotImplementedError(
-                "GroupSchemaLayout currently supports full-attention groups "
-                "only; sliding windows need the window-row dispatch"
+                "GroupSchemaLayout does not support sliding-window groups "
+                "yet; they need the window-row dispatch integration"
             )
         group_layouts = build_group_layouts(spec, kvcaches)
-        layout = group_layouts[group.group_id]
-        record = GroupRecordLayout.build(group, layout, spec.ucm_cache_block_size)
-        if record.blocks_per_key != 1:
-            raise NotImplementedError(
-                "GroupSchemaLayout currently supports one window row per key "
-                f"(tail_blocks={record.blocks_per_key})"
+        records = {}
+        for group in spec.groups:
+            layout = group_layouts.get(group.group_id)
+            if layout is None:
+                continue
+            record = GroupRecordLayout.build(
+                group, layout, spec.ucm_cache_block_size
             )
+            if record.blocks_per_key != 1:
+                raise NotImplementedError(
+                    "GroupSchemaLayout currently supports one window row per "
+                    f"key (group {group.group_id} tail_blocks="
+                    f"{record.blocks_per_key})"
+                )
+            records[group.group_id] = record
+        if not records:
+            raise ValueError("GroupSchemaLayout found no addressable KV group")
         self._spec = spec
-        self._group = group
-        self._group_layout = layout
-        self._record = record
-        routes = (("FA", (group.group_id,)),)
-        self._store_schema = StoreSchema.build(routes, {group.group_id: record})
-        self._layer_shards = LayerShardSchema.build(routes, {group.group_id: record})
+        self._group_layouts = group_layouts
+        self._records = records
+        self._routes = tuple(
+            (kind, tuple(g.group_id for g in groups))
+            for kind, groups in spec.dispatch_routes()
+        )
+        self.store_schema = StoreSchema.build(self._routes, records)
+        if self.use_layerwise:
+            if len(spec.groups) != 1:
+                raise NotImplementedError(
+                    "GroupSchemaLayout layerwise supports one KV group; "
+                    "multi-group layerwise needs the per-layer dispatch "
+                    "integration"
+                )
+            self._layer_shards = LayerShardSchema.build(
+                self._routes, {group_id: records[group_id] for group_id in records}
+            )
         self._materialize()
 
     def _materialize(self) -> None:
         """Emit the base-layout arrays from the compiled slot table.
 
-        Bulk: one row of real columns. Layerwise: one row per model layer;
-        every row presents the same slot list, and slots the layer does not
-        own follow the ghost convention (``base_ptr=0, block_stride=0``,
-        declared width kept) so the store registration filters them.
+        Bulk: the groups' real columns concatenated in dispatch-route
+        order -- exactly the StoreSchema slot order. Layerwise (single
+        group): one row per model layer; every row presents the same slot
+        list, and slots the layer does not own follow the ghost convention
+        (``base_ptr=0, block_stride=0``, declared width kept) so the store
+        registration filters them.
         """
-        layout = self._group_layout
-        record = self._record
         if not self.use_layerwise:
-            self.base_ptrs = layout.base_ptrs.copy()
-            self.block_stride_lists = layout.block_strides.copy()
-            self.tensor_size_lists = record.access.segment_bytes[0].copy()
-            self.buffer_sizes = layout.payload_bytes.copy()
+            ptrs, strides, sizes, buffers = [], [], [], []
+            for slot in self.store_schema.slots:
+                layout = self._group_layouts[slot.group_id]
+                column = slot.row * len(layout.layer_names) + self._slot_column(
+                    slot
+                )
+                ptrs.append(int(layout.base_ptrs[column]))
+                strides.append(int(layout.block_strides[column]))
+                sizes.append(slot.size_bytes)
+                buffers.append(int(layout.payload_bytes[column]))
+            self.base_ptrs = np.asarray(ptrs, dtype=np.uint64)
+            self.block_stride_lists = np.asarray(strides, dtype=np.uint64)
+            self.tensor_size_lists = np.asarray(sizes, dtype=np.uint64)
+            self.buffer_sizes = np.asarray(buffers, dtype=np.uint64)
             logger.info(
-                "GroupSchemaLayout bulk: slots=%d, record_bytes=%d",
-                len(self.tensor_size_lists),
+                "GroupSchemaLayout bulk: groups=%d, slots=%d, record_bytes=%d",
+                len(self._group_layouts),
+                len(self.store_schema.slots),
                 int(self.tensor_size_lists.sum()),
             )
             return
 
+        layout = next(iter(self._group_layouts.values()))
+        record = next(iter(self._records.values()))
         sizes = list(self._layer_shards.tensor_size_list)
         n_slots = len(sizes)
         ptr_rows, stride_rows, size_rows, buffer_rows = [], [], [], []
@@ -1441,11 +1472,49 @@ class GroupSchemaLayout(KVCacheLayout):
         self.tensor_size_lists = np.asarray(size_rows, dtype=np.uint64)
         self.buffer_sizes = np.asarray(buffer_rows, dtype=np.uint64)
         logger.info(
-            "GroupSchemaLayout layerwise: layers=%d, slots=%d, "
-            "shard_bytes=%d",
+            "GroupSchemaLayout layerwise: layers=%d, slots=%d, shard_bytes=%d",
             len(ptr_rows),
             n_slots,
             int(self.tensor_size_lists[0].sum()),
+        )
+
+    @staticmethod
+    def _slot_column(slot) -> int:
+        """Column index of one slot inside its group's layout columns.
+
+        With ``tail_blocks == 1`` enforced, the slot's row is 0 and its
+        column is its position within the group's span.
+        """
+        return slot.row
+
+    def extract_block_addrs(
+        self, vllm_block_ids: List[int], layer_first: bool = False
+    ) -> np.ndarray:
+        if len(self._group_layouts) > 1:
+            raise ValueError(
+                "multi-group layouts resolve per group via resolve_group(); "
+                "one flat block-id list cannot address independent group "
+                "chains"
+            )
+        return super().extract_block_addrs(
+            vllm_block_ids, layer_first=layer_first
+        )
+
+    def resolve_group(
+        self,
+        group_id: int,
+        vllm_block_ids: List[int],
+        *,
+        token_offsets=None,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """One group's keys over the full slot table; other groups ghost.
+
+        Returns flattened ``(offsets, ptrs, sizes)`` of length
+        ``len(vllm_block_ids) * len(slots)``, key-major -- the submission
+        grid the bulk store path consumes.
+        """
+        return self.store_schema.resolve_group(
+            group_id, vllm_block_ids, token_offsets=token_offsets
         )
 
 
@@ -3513,6 +3582,15 @@ class UCMConnector(KVConnectorBase_V1, SupportsHMA):
             and self.launch_config.get("hybrid_linear_attention_layerwise", True)
         )
 
+        if self.launch_config.get("use_group_schema_layout"):
+            from ucm.integration.vllm.group_connector import (
+                UCMGroupSchemaConnector,
+            )
+
+            self.connector = UCMGroupSchemaConnector(
+                vllm_config, role, kv_cache_config
+            )
+            return
         if UCMFAWAConnector.can_handle_kv_cache_config(kv_cache_config):
             self.connector = UCMFAWAConnector(vllm_config, role, kv_cache_config)
         elif use_ratio_rate:
