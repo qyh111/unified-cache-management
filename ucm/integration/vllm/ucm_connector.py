@@ -35,7 +35,9 @@ from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import RequestStatus
 
-from ucm.integration.vllm.device import create_device, get_current_device_id
+from ucm.integration.vllm.device import (
+    create_device, get_current_device_id, cpu_simulation_enabled,
+)
 from ucm.integration.vllm.metrics import (
     UCM_HAS_PROM_METRICS,
     UCMConnectorStats,
@@ -1425,6 +1427,10 @@ class UCMDirectConnector(KVConnectorBase_V1):
             logger.info("NPU device is available.")
             torch_dev = torch.npu
             dev_name = "npu"
+        elif cpu_simulation_enabled():
+            logger.info("CPU Model-check simulation enabled; requires simu native libraries.")
+            torch_dev = torch
+            dev_name = "cpu"
         else:
             raise RuntimeError("Unsupported device platform for UCMDirectConnector.")
 
@@ -3368,6 +3374,10 @@ class UCMConnector(KVConnectorBase_V1, SupportsHMA):
 
         if UCMFAWAConnector.can_handle_kv_cache_config(kv_cache_config):
             self.connector = UCMFAWAConnector(vllm_config, role, kv_cache_config)
+        elif self.launch_config.get("use_hybrid_connector", False):
+            from ucm.integration.vllm.hybrid_connector import UCMHybridConnector
+
+            self.connector = UCMHybridConnector(vllm_config, role, kv_cache_config)
         elif use_ratio_rate:
             self.connector = UCMMockConnector(vllm_config, role, kv_cache_config)
         elif use_cp_parallel:

@@ -80,8 +80,8 @@ def init_builtin_tools() -> None:
     if _TOOLS:
         return
     from .tools.dev_sandbox import DevSandboxTool
-    from .tools.metrics_view import MetricsViewTool
     from .tools.model_check import ModelCheckTool
+    from .tools.metrics_view import MetricsViewTool
     from .tools.nic_monitor import NicMonitorTool
     from .tools.posix_aio import PosixAioTool
     from .tools.precheck import PrecheckTool

@@ -10,6 +10,7 @@ cache stream waits for event before D2H. This avoids blocking the CPU.
 import os
 import re
 import subprocess
+import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from itertools import accumulate
@@ -106,6 +107,41 @@ class Device(ABC):
             f"[store_cores]={store_cores}"
         )
         return worker_cores, store_cores
+
+
+def cpu_simulation_enabled() -> bool:
+    """Opt-in host transfer support for Model-check with simu native libraries."""
+    return (
+        current_platform.device_type == "cpu"
+        and os.environ.get("UCM_CPU_SIMULATION") == "1"
+    )
+
+
+class CpuDevice(Device):
+    """Synchronous host tensor operations; native task waits still drain IO."""
+
+    def get_event_handle(self) -> int:
+        return 0
+
+    def synchronize(self):
+        # CPU tensor writes are synchronous; store tasks are waited separately.
+        pass
+
+    def record_timing_event(self) -> Any:
+        return time.perf_counter()
+
+    def elapsed_time_ms(self, start_event: Any, end_event: Any) -> float:
+        return (end_event - start_event) * 1000.0
+
+    def destroy_event_handles(self):
+        self.events.clear()
+
+    def destroy_event_handle(self, event_handle: int):
+        self.events.pop(event_handle, None)
+
+    def get_cpu_affinity(self, local_rank: int) -> Optional[str]:
+        # Keep the Model-check process's existing CPU binding.
+        return None
 
 
 class CudaDevice(Device):
@@ -697,6 +733,9 @@ class NpuDevice(Device):
 
 
 def create_device() -> Optional[Device]:
+    if cpu_simulation_enabled():
+        return CpuDevice()
+
     if current_platform.is_cuda_alike():
         return CudaDevice()
 
@@ -707,7 +746,13 @@ def create_device() -> Optional[Device]:
 
 
 def get_current_device_id() -> int:
-    """Return the current process-visible accelerator device ordinal."""
+    """Return the accelerator ordinal, or a nonnegative simu worker id."""
+    if cpu_simulation_enabled():
+        rank = int(os.environ.get("LOCAL_RANK", "0"))
+        if rank < 0:
+            raise ValueError("CPU simulation LOCAL_RANK must be nonnegative")
+        return rank
+
     if current_platform.is_cuda_alike():
         return int(torch.cuda.current_device())
 

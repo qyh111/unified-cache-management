@@ -17,6 +17,11 @@ STORAGE_BACKENDS_ENV = "UCM_MODEL_CHECK_STORAGE_BACKENDS"
 DEVICE_ENV = "UCM_MODEL_CHECK_DEVICE_ID"
 DTYPE_ENV = "UCM_MODEL_CHECK_DTYPE"
 KV_CACHE_DTYPE_ENV = "UCM_MODEL_CHECK_KV_CACHE_DTYPE"
+CONNECTOR_MODULE_PATH_ENV = "UCM_MODEL_CHECK_CONNECTOR_MODULE_PATH"
+HYBRID_ENV = "UCM_MODEL_CHECK_HYBRID"
+EXCLUSIVE_ENV = "UCM_MODEL_CHECK_CACHE_LOAD_EXCLUSIVE_BUFFER_NUMBER"
+BUFFER_GB_ENV = "UCM_MODEL_CHECK_CACHE_BUFFER_CAPACITY_GB"
+LEGACY_CONNECTOR_MODULE = "ucm.integration.vllm.ucm_connector"
 
 
 def _bool_env(name: str, default: bool) -> bool:
@@ -68,11 +73,20 @@ class ModelCheckConfig:
     visible_devices: str
     dtype: str
     kv_cache_dtype: str
+    connector_module_path: str
+    tp: int = 1
+    pp: int = 1
+    pcp: int = 1
+    dcp: int = 1
 
 
 def load_config() -> ModelCheckConfig:
     """Load model-check configuration from the child-process environment."""
     return ModelCheckConfig(
+        tp=_int_env("UCM_MODEL_CHECK_TP", 1),
+        pp=_int_env("UCM_MODEL_CHECK_PP", 1),
+        pcp=_int_env("UCM_MODEL_CHECK_PCP", 1),
+        dcp=_int_env("UCM_MODEL_CHECK_DCP", 1),
         model=os.environ.get(MODEL_ENV, "/models/Qwen2.5-14B-Instruct"),
         tokens=_int_env(TOKENS_ENV, 4096),
         block_size=_int_env(BLOCK_SIZE_ENV, 64),
@@ -83,4 +97,26 @@ def load_config() -> ModelCheckConfig:
         visible_devices=os.environ.get(DEVICE_ENV, "0"),
         dtype=os.environ.get(DTYPE_ENV, "auto"),
         kv_cache_dtype=os.environ.get(KV_CACHE_DTYPE_ENV, "auto"),
+        connector_module_path=os.environ.get(
+            CONNECTOR_MODULE_PATH_ENV, LEGACY_CONNECTOR_MODULE
+        ),
     )
+
+
+def configure_worker_rank(vllm_config):
+    """Mirror WorkerBase's rank wiring in the direct-construction harness."""
+    rank = _int_env("RANK", 0)
+    if rank < 0:
+        raise ValueError("RANK must be nonnegative")
+    vllm_config.parallel_config.rank = rank
+
+
+def cpu_gqa_block_sizes():
+    """Use the engine's native constraint type; never approximate it as [16]."""
+    try:
+        from vllm.v1.attention.backend import MultipleOf
+    except ImportError as exc:
+        raise RuntimeError(
+            "CPU CUDA-layout simulation requires native MultipleOf block constraints"
+        ) from exc
+    return [MultipleOf(16)]

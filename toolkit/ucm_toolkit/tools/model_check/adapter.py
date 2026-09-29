@@ -13,10 +13,17 @@ from ...registry import ToolAdapter
 from ...runner import run_command
 from .config import (
     ADDITIONAL_CONFIG_ENV,
+    HYBRID_ENV,
+    BUFFER_GB_ENV,
+    EXCLUSIVE_ENV,
+    _bool_env,
+    _int_env,
     BLOCK_SIZE_ENV,
+    CONNECTOR_MODULE_PATH_ENV,
     DEVICE_ENV,
     DTYPE_ENV,
     KV_CACHE_DTYPE_ENV,
+    LEGACY_CONNECTOR_MODULE,
     MODEL_ENV,
     STORAGE_BACKENDS_ENV,
     STORE_PIPELINE_ENV,
@@ -43,6 +50,7 @@ def _detect_platform() -> str:
     if importlib.util.find_spec("vllm") is not None:
         try:
             from importlib.metadata import version as _pkg_version
+
             if "+cpu" in _pkg_version("vllm"):
                 return "cpu"
         except Exception:
@@ -70,6 +78,8 @@ class ModelCheckTool(ToolAdapter):
             "--model",
             help="model directory or Hugging Face model identifier",
         )
+        for dimension in ("tp", "pp", "pcp", "dcp"):
+            parser.add_argument(f"--{dimension}", type=int, default=1)
         parser.add_argument("--tokens", type=int, help="synthetic request length")
         parser.add_argument(
             "--block-size", type=int, help="vLLM KV-cache block size in tokens"
@@ -85,6 +95,22 @@ class ModelCheckTool(ToolAdapter):
             type=_json_object,
             help="vLLM additional_config as a JSON object",
         )
+        parser.add_argument(
+            "--hybrid",
+            action=argparse.BooleanOptionalAction,
+            default=None,
+            help="select UCMHybridConnector through the standard facade",
+        )
+        parser.add_argument(
+            "--cache-buffer-capacity-gb",
+            type=int,
+            help="host cache capacity per private buffer (default: 16)",
+        )
+        parser.add_argument(
+            "--cache-load-exclusive-buffer-number",
+            type=int,
+            help="reserved load buffers (checker default: 512)",
+        )
         parser.add_argument("--store-pipeline", help="UCM store pipeline")
         parser.add_argument(
             "--storage-backends",
@@ -97,6 +123,11 @@ class ModelCheckTool(ToolAdapter):
         )
         parser.add_argument("--dtype", help="vLLM model dtype")
         parser.add_argument("--kv-cache-dtype", help="vLLM KV-cache dtype")
+        parser.add_argument(
+            "--connector-module-path",
+            default=LEGACY_CONNECTOR_MODULE,
+            help="module containing the UCMConnector facade",
+        )
 
     def _build_run_parser(self) -> argparse.ArgumentParser:
         parser = argparse.ArgumentParser(
@@ -115,7 +146,43 @@ class ModelCheckTool(ToolAdapter):
                 return exc.code
             return 0 if exc.code is None else 1
 
+        if min(args.tp, args.pp, args.pcp, args.dcp) < 1 or args.tp % args.dcp:
+            raise ToolkitError("Parallel sizes must be positive and DCP must divide TP")
+        hybrid = (
+            args.hybrid if args.hybrid is not None else _bool_env(HYBRID_ENV, False)
+        )
+        capacity = (
+            args.cache_buffer_capacity_gb
+            if args.cache_buffer_capacity_gb is not None
+            else _int_env(BUFFER_GB_ENV, 16)
+        )
+        exclusive = (
+            args.cache_load_exclusive_buffer_number
+            if args.cache_load_exclusive_buffer_number is not None
+            else _int_env(EXCLUSIVE_ENV, 512)
+        )
+        if exclusive <= 0:
+            raise ToolkitError("Exclusive load buffer count must be positive")
+        if capacity <= 0:
+            raise ToolkitError("Cache buffer capacity must be positive")
+        if hybrid and (
+            args.connector_module_path != LEGACY_CONNECTOR_MODULE
+            or max(args.pp, args.pcp, args.dcp) > 1
+        ):
+            raise ToolkitError("Hybrid requires the standard facade and PP/PCP/DCP=1")
         env = os.environ.copy()
+        if args.cache_load_exclusive_buffer_number is not None:
+            env[EXCLUSIVE_ENV] = str(exclusive)
+        if args.hybrid is not None:
+            env[HYBRID_ENV] = str(hybrid).lower()
+        if args.cache_buffer_capacity_gb is not None:
+            env[BUFFER_GB_ENV] = str(capacity)
+        for dimension in ("tp", "pp", "pcp", "dcp"):
+            env[f"UCM_MODEL_CHECK_{dimension.upper()}"] = str(getattr(args, dimension))
+        import time
+
+        env["UCM_MODEL_CHECK_TOKEN_SALT"] = str(time.time_ns())
+        env.setdefault("VLLM_DIST_IDENT", env["UCM_MODEL_CHECK_TOKEN_SALT"])
         platform = _detect_platform()
         string_options = (
             ("model", MODEL_ENV),
@@ -135,12 +202,29 @@ class ModelCheckTool(ToolAdapter):
         if args.layerwise is not None:
             env[USE_LAYERWISE_ENV] = str(args.layerwise).lower()
         env[DEVICE_ENV] = args.device_id
+        env[CONNECTOR_MODULE_PATH_ENV] = args.connector_module_path
         if platform == "cuda":
             env["CUDA_VISIBLE_DEVICES"] = args.device_id
         elif platform == "ascend":
             env["ASCEND_RT_VISIBLE_DEVICES"] = args.device_id
         # cpu: no device-visibility variable needed
         module = f"{__package__}.{platform}"
+        world = args.tp * args.pp * args.pcp
+        if world > 1:
+            if platform != "cpu" and len(args.device_id.split(",")) < world:
+                raise ToolkitError(f"Need {world} visible devices for this topology")
+            return run_command(
+                [
+                    sys.executable,
+                    "-m",
+                    "torch.distributed.run",
+                    "--standalone",
+                    f"--nproc-per-node={world}",
+                    "--module",
+                    module,
+                ],
+                env=env,
+            )
         return run_command([sys.executable, "-m", module], env=env)
 
     def doctor(self, args: argparse.Namespace | None = None) -> int:
