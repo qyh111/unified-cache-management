@@ -5,7 +5,6 @@ preemption helpers. No new store method or publication protocol is introduced.
 """
 
 import copy
-import hashlib
 import importlib.metadata
 import json
 import math
@@ -20,6 +19,7 @@ from vllm.platforms import current_platform
 
 from ucm.integration.vllm.device import create_device
 from ucm.integration.vllm.hybrid.scheduler import UCMDispatcher
+from ucm.integration.vllm.hybrid.namespace import storage_namespace
 from ucm.integration.vllm.hybrid.spec import parse_kv_cache_config
 from ucm.integration.vllm.hybrid.store_layout import HybridStoreLayout, validate_spec
 from ucm.integration.vllm.request_hasher import RequestHasher
@@ -119,39 +119,27 @@ class UCMHybridConnector(UCMDirectConnector, SupportsHMA):
         self.blocks_per_chunk = 1
         # A separate, versioned namespace is necessary: padded Hybrid records
         # are not byte-compatible with Direct/HLA or the v2 reference Proxy.
-        identity = {
-            "device": current_platform.device_type,
-            "cache_dtype": str(vllm_config.cache_config.cache_dtype),
-            "model": (
+        versions = {}
+        for package in ("vllm", "vllm-ascend"):
+            try:
+                versions[package] = importlib.metadata.version(package)
+            except importlib.metadata.PackageNotFoundError:
+                versions[package] = "unknown"
+        self._namespace = storage_namespace(
+            self.spec,
+            model=(
                 text_config.to_dict()
                 if hasattr(text_config, "to_dict")
                 else vars(text_config)
             ),
-            "tp": self.tp_size,
-            # Group numbers only have meaning within this ordered semantic
-            # schema. Exclude allocation capacity and device pointers.
-            "groups": [
-                {
-                    "id": group.group_id,
-                    "tokens": group.token_block_size,
-                    "layers": [
-                        (layer.layer_name, str(layer.kv_cache_spec))
-                        for layer in group.layers
-                    ],
-                }
-                for group in self.spec.groups
-            ],
-        }
-        for package in ("vllm", "vllm-ascend"):
-            try:
-                identity[package] = importlib.metadata.version(package)
-            except importlib.metadata.PackageNotFoundError:
-                identity[package] = "unknown"
-        digest = hashlib.sha256(
-            json.dumps(identity, sort_keys=True, default=str).encode()
-        ).hexdigest()[:16]
-        self._namespace = (
-            f"hybrid-v1-r3-{digest}-b{self.block_size}-lw{int(self.use_layerwise)}"
+            device=current_platform.device_type,
+            cache_dtype=vllm_config.cache_config.cache_dtype,
+            model_dtype=vllm_config.model_config.dtype,
+            tp=self.tp_size,
+            layerwise=self.use_layerwise,
+            versions=versions,
+            additional_config=getattr(vllm_config, "additional_config", None),
+            quantization=getattr(vllm_config.model_config, "quantization", None),
         )
         self.kv_cache_layout = None
         self._load_tasks = {}

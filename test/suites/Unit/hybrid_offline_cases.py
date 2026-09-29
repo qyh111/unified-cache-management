@@ -751,6 +751,71 @@ class LayoutTests(unittest.TestCase):
             )
 
 
+class NamespaceTests(unittest.TestCase):
+    def test_compressed_scheduler_specs_share_worker_namespace(self):
+        from dataclasses import replace
+        from ucm.integration.vllm.hybrid.namespace import storage_namespace
+
+        names = ["model.layers.0.attn", "model.layers.0.indexer", "model.layers.1.attn"]
+        worker, _ = cache_spec([(names, FullAttentionSpec())])
+        group = worker.groups[0]
+        # Model the engine's per-layer spec map followed by representative compression.
+        physical = tuple(
+            replace(
+                layer,
+                kv_cache_spec=NS(
+                    block_size=4,
+                    head_size=128 if "indexer" in layer.layer_name else 576,
+                ),
+            )
+            for layer in group.layers
+        )
+        worker = replace(worker, groups=(replace(group, layers=physical),))
+        scheduler = replace(
+            worker,
+            groups=(
+                replace(
+                    group,
+                    layers=tuple(
+                        replace(
+                            layer, kv_cache_spec=physical[0].kv_cache_spec, num_blocks=2
+                        )
+                        for layer in physical
+                    ),
+                ),
+            ),
+        )
+        kwargs = dict(
+            model={"model_type": "glm_moe_dsa"},
+            device="npu",
+            cache_dtype="auto",
+            model_dtype="bf16",
+            tp=2,
+            layerwise=True,
+            versions={"vllm": "test"},
+            additional_config={"enable_sparse_li_c8": False},
+        )
+        self.assertNotEqual(
+            str(worker.groups[0].layers[1].kv_cache_spec),
+            str(scheduler.groups[0].layers[1].kv_cache_spec),
+        )
+        expected = storage_namespace(worker, **kwargs)
+        self.assertEqual(storage_namespace(scheduler, **kwargs), expected)
+        for key, value in (
+            ("additional_config", {"enable_sparse_li_c8": True}),
+            ("quantization", "ascend"),
+            ("model_dtype", "fp16"),
+            ("cache_dtype", "int8"),
+            ("layerwise", False),
+            ("tp", 4),
+        ):
+            self.assertNotEqual(
+                storage_namespace(worker, **(kwargs | {key: value})), expected
+            )
+        changed = replace(worker, groups=(replace(worker.groups[0], group_id=1),))
+        self.assertNotEqual(storage_namespace(changed, **kwargs), expected)
+
+
 class SchedulerTests(unittest.TestCase):
     def setUp(self):
         self.spec, _ = cache_spec(
