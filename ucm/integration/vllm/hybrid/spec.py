@@ -140,7 +140,7 @@ class UCMKVCacheSpec:
     ]:
         """The routing table every dump/load works over: key kind -> groups.
 
-        FA holds the full-attention groups; WA the sliding groups that
+        Each native group owns a separate record. FA holds attention; WA the sliding groups that
         re-store a window tail (tail 0 groups store nothing); State the
         mamba snapshot groups. Empty kinds are absent, and
         ``group_ucm_block_ids`` / dispatch plans index these in order.
@@ -149,15 +149,14 @@ class UCMKVCacheSpec:
         routes: list[
             tuple[Literal["FA", "WA", "State"], tuple["UCMKVCacheGroupInfo", ...]]
         ] = []
-        if self.fa_groups:
-            routes.append(("FA", self.fa_groups))
-        wa_stored = tuple(
-            group for group in self.wa_groups if (group.tail_tokens or 0) > 0
-        )
-        if wa_stored:
-            routes.append(("WA", wa_stored))
-        if self.state_groups:
-            routes.append(("State", self.state_groups))
+        for label, groups in (
+            ("FA", self.fa_groups),
+            ("WA", self.wa_groups),
+            ("State", self.state_groups),
+        ):
+            for group in groups:
+                if label != "WA" or (group.tail_tokens or 0) > 0:
+                    routes.append((label, (group,)))
         return tuple(routes)
 
     @property

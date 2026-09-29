@@ -2,8 +2,8 @@
 
 ``compile_access`` converts local token ranges to per-segment byte offsets and
 sizes. ``BlockAccess.resolve`` supplies the physical block IDs. Neither needs
-hash keys or UCM window rules; record_layout.py composes their results into
-records. Whole Block First spans retain padding for the existing fast path.
+hash keys or UCM window rules. HybridStoreLayout consumes layer_views
+directly to build the v1 semantic slot schema. Whole Block First spans retain padding for the existing fast path.
 
 Each column is a contiguous token segment, not necessarily an entire view.
 """
@@ -144,7 +144,7 @@ class KVCacheGroupLayout:
 
     ``extract_segments`` answers (ptr, size) grids for per-block token
     windows; ``block_first_segments`` the group-span special case;
-    Storage offsets and record packing are owned by GroupRecordLayout.
+    Storage offsets and record packing are owned by HybridStoreLayout.
     """
 
     def __init__(

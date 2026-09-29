@@ -1,5 +1,10 @@
 # UCMHybridConnector v1 Pipeline 交付（2026-09-29）
 
+## 2026-09-29 r2 布局修订
+
+当前版本改为每个原生 group 独立 key/记录，专用槽位策略见
+[布局与生命周期清单](connector-hybrid-r2-layout-and-lifecycle.md)。旧 r1 的 FA/State 合并、尾部补行已取消；下文第六轮结果仅作为 r1 历史证据，不能当作 r2 runtime PASS。
+
 ## 基线与状态
 
 - 开发分支：`dev_qyh_0928`，基于 fetch 后的 `origin/develop@2d24ab39`。
@@ -37,15 +42,9 @@ ucm_connectors:
 
 `hybrid/layout/` 只解释实际 view 地址、stride、segment 长度；`hybrid/store_layout.py` 独立生成固定存储模板。
 
-每个 FA key 包含全部 FA groups 的本地数据，State key 包含全部 State groups 的本地快照，两者使用不同 key 类型但同一个 store。bulk 将各自真实 segments 紧密排列；layerwise 按模型层形成行，每种 key 类型使用自己的稠密行号。两种类型不必有相同层数，缺少的尾行以 ghost 表达，仍下发完整固定 shard 数量。
+每个 native group 独立保存自己的 block，在 key 中编码 group_id。不同 group 共用固定 store schema；当前要求各 group 本地模型层数相同，不再隐式补大批空行。layerwise 每层一行，bulk 将同一 group 的层模板组合为一行；单 group bulk 保持真实 segments 紧凑布局。
 
-固定槽位由所有行的 segment 边界并集形成；大的真实 segment 被拆成多段，小的行在尾部补 null slots。每行总 payload 不超过该模式下最大的行，而不是把所有模型层或所有 group 的最大尺寸相加。每段真实搬运长度来自 view，不把 padding 字节加到 device read 长度上。物理 block stride 与 copy size 分离。
-
-GLM52 即使只有一个 group，也进入这套机制：无 Indexer 的层、BF16 Indexer、C8 Indexer 及 scale 段都参与初始化模板计算。bulk 的单 FA 类型没有为了 layerwise 强加 ghost；FA/State 两类 bulk 记录长度不同时，单 store 仍需固定模板 padding。
-
-动态 block IDs 通过 NumPy 批量展开为 C-contiguous uint64 地址矩阵；不会将每个地址转换成 Python 整数列表。固定 `tensor_size_list` 初始化一次。`ucm_block_offsets` 为 `row_index × aligned_shard_size + slot_offset`，只用于描述模板，不作为新参数下发 store。
-
-同一模型层可能有多个注册名字。只有一行涉及的全部名字都收到保存 hook 后才提前下发，否则在 forward 结束补齐；State 在 forward 结束保存。最后 shard 在 `wait_for_save` 阶段下发，仍由原 store 自动发布。Mamba 未结束在完整边界时不保存过时的边界状态，null block 0 不发布 State key。
+GLM Shared Indexer、MiniMax-M3、FA+State 和普通 attention 分别选择语义槽位策略。公共编译器只在各语义槽内做必要分段，不再把所有真实数据拍平后统一补尾。地址、stride、payload 取自 LayerView；NumPy 批量展开、v1 null 地址跳过、任务等待和发布方式不变。
 
 ## 与旧 v1 的关系
 
@@ -53,7 +52,7 @@ GLM52 即使只有一个 group，也进入这套机制：无 Indexer 的层、BF
 - 沿用 `RankConsistencyManager` 的提交、等待、失败上报和旧事件清理。
 - Cache 的空地址槽位跳过能力已存在于 native copy 实现，本轮未修改。
 - Cache 完成、Posix 发布、跨 rank 数据完整性仍是原 v1 的能力边界；没有引入显式 commit、全 rank 发布事务或新的 store 服务。
-- 模板文件放入单独的 `hybrid-v1-r1-…` namespace，隔离 bulk/layerwise、模型配置、包版本、设备和 cache dtype 等信息；不要将旧 Direct/HLA/v2 文件直接搬入这个目录。
+- 模板文件放入单独的 `hybrid-v1-r2-…` namespace，隔离 bulk/layerwise、模型配置、包版本、设备和 cache dtype 等信息；不要将旧 Direct/HLA/v2 文件直接搬入这个目录。
 - TP 各 rank 分别产生物理 key，沿用 rank0 lookup + 原 consistency manager 的策略；不假设所有 rank 共用一个文件。
 - 为防不同 schema 共享 host buffer，Hybrid 的默认 `share_buffer_enable` 为 false，各 rank 的 unique ID 隔离。若显式启用共享 buffer，也不会把不同 rank 的 buffer 合并。`cache_buffer_capacity_gb` 可按需调整，一般每私有 buffer 不超过 128 GiB，须另核算多 rank 总内存。
 - GC 需要真实的对齐后 block_size，由 worker 按旧机制发布；若启动顺序不能读到它，须配置准确值，首版不根据 head_size 猜测 Mamba/indexer 的大小。

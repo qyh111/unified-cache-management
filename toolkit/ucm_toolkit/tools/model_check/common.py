@@ -634,6 +634,7 @@ def assert_shared_dispatch(metadata):
             request_id,
             phase,
             plan.hash_group,
+            getattr(plan, "group_id", None),
             plan.keys,
             plan.token_start,
             plan.token_end,

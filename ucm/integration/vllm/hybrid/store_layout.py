@@ -1,7 +1,7 @@
 """Compile physical segments into one fixed v1 Pipeline Store schema.
 
-The union of segment boundaries splits real segments; it never rounds a device
-read up to a larger size. Short rows have null pointer slots at their tail.
+Dedicated policies choose semantic regions; boundaries are partitioned only
+within each region. Missing roles use null pointers without device overreads.
 Addresses are expanded over block IDs in NumPy, without a Python loop per key.
 """
 
@@ -10,6 +10,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from .layout import build_group_layouts
+from .layout.policies import compile_policy
 
 
 def validate_spec(spec):
@@ -67,81 +68,148 @@ class HybridStoreLayout:
         self.spec = spec
         self.layerwise = layerwise
         self.group_layouts = build_group_layouts(spec, kv_caches)
-        self.routes = dict(spec.dispatch_routes())
+        self.routes = {
+            groups[0].group_id: groups for _, groups in spec.dispatch_routes()
+        }
+        self.kinds = {
+            groups[0].group_id: kind for kind, groups in spec.dispatch_routes()
+        }
         self.layer_name_to_id = {
             layer.layer_name: layer.layer_index
             for group in spec.groups
             for layer in group.layers
         }
-        raw_rows = {}
-        for kind, groups in self.routes.items():
-            layers = sorted(
-                {layer.layer_index for group in groups for layer in group.layers}
+        layer_rows, layer_ids, names_by_group = {}, {}, {}
+        for group_id, (group,) in self.routes.items():
+            layout = self.group_layouts[group_id]
+            ids = sorted({layer.layer_index for layer in group.layers})
+            layer_ids[group_id] = ids
+            layer_rows[group_id], names_by_group[group_id] = [], []
+            for layer_id in ids:
+                entries = [
+                    (layer, layout.layer_views[layer.layer_name])
+                    for layer in sorted(group.layers, key=lambda x: x.layer_name)
+                    if layer.layer_index == layer_id
+                ]
+                layer_rows[group_id].append((self.kinds[group_id], entries))
+                names_by_group[group_id].append(
+                    frozenset(layer.layer_name for layer, _ in entries)
+                )
+        counts = {len(rows) for rows in layer_rows.values()}
+        if len(counts) != 1:
+            raise ValueError(
+                "Single-store groups require equal local layer counts; no implicit ghost rows"
             )
-            rows = []
-            for layer_id in layers if layerwise else [None]:
-                segments, names = [], set()
-                for position, group in enumerate(groups):
-                    layout = self.group_layouts[group.group_id]
-                    for layer in sorted(
-                        group.layers,
-                        key=lambda item: (item.layer_index, item.layer_name),
-                    ):
-                        if layer_id is not None and layer.layer_index != layer_id:
-                            continue
-                        names.add(layer.layer_name)
-                        for segment in layout.layer_views[layer.layer_name].segments:
-                            segments.append((position, segment, layer.num_blocks))
-                rows.append((layer_id, frozenset(names), segments))
-            raw_rows[kind] = rows
-        self.sizes = slot_sizes(
-            [segment.payload_bytes for _, segment, _ in segments]
-            for rows in raw_rows.values()
-            for _, _, segments in rows
-        )
-        starts = np.cumsum(self.sizes) - self.sizes
-        self.row_count = max(len(rows) for rows in raw_rows.values())
+        # Single-group bulk retains compact real segments, without per-layer padding.
+        if not layerwise and len(self.routes) == 1:
+            self.policy, regions = "compact", ("payload",)
+            mapped = {
+                gid: [
+                    {
+                        "payload": tuple(
+                            s
+                            for _, entries in rows
+                            for _, view in entries
+                            for s in view.segments
+                        )
+                    }
+                ]
+                for gid, rows in layer_rows.items()
+            }
+            layer_ids = {gid: [None] for gid in self.routes}
+            names_by_group = {
+                gid: [frozenset().union(*names)]
+                for gid, names in names_by_group.items()
+            }
+        else:
+            self.policy, regions, mapped = compile_policy(
+                layer_rows, bool(spec.state_groups)
+            )
+        # Compile a common partition WITHIN each semantic region. Padding may
+        # occur between conv, state/K, V and scale, never by repacking roles.
+        region_sizes, region_columns = {}, {}
+        sizes = []
+        for region in regions:
+            parts = slot_sizes(
+                [s.payload_bytes for s in row.get(region, ())]
+                for rows in mapped.values()
+                for row in rows
+            )
+            region_sizes[region] = parts
+            region_columns[region] = len(sizes)
+            sizes.extend(parts.tolist())
+        self.sizes = np.asarray(sizes, dtype=np.uint64)
         self.rows = {}
-        for kind, rows in raw_rows.items():
+        for group_id, mapped_rows in mapped.items():
+            group = self.routes[group_id][0]
+            # Derive allocation bounds from the owning source segment even
+            # when a policy has split it into multiple semantic slots.
+            sources = [
+                (s, layer.num_blocks)
+                for layer in group.layers
+                for s in self.group_layouts[group_id]
+                .layer_views[layer.layer_name]
+                .segments
+            ]
             compiled = []
-            for layer_id, names, segments in rows:
-                cursor = 0
-                positions, bases, strides, columns, limits = [], [], [], [], []
-                for position, segment, limit in segments:
-                    end = cursor + segment.payload_bytes
-                    cols = np.flatnonzero((starts >= cursor) & (starts < end))
-                    positions.extend([position] * len(cols))
-                    bases.extend((segment.base_ptr + starts[cols] - cursor).tolist())
-                    strides.extend([segment.block_stride_bytes] * len(cols))
-                    columns.extend(cols.tolist())
-                    limits.extend([limit] * len(cols))
-                    cursor = end
+            for index, roles in enumerate(mapped_rows):
+                bases, strides, columns, limits = [], [], [], []
+                for region in regions:
+                    starts = np.cumsum(region_sizes[region]) - region_sizes[region]
+                    cursor = 0
+                    for segment in roles.get(region, ()):
+                        end = cursor + segment.payload_bytes
+                        cols = np.flatnonzero((starts >= cursor) & (starts < end))
+                        candidates = [
+                            limit
+                            for src, limit in sources
+                            if src.block_stride_bytes == segment.block_stride_bytes
+                            and src.base_ptr <= segment.base_ptr
+                            and segment.base_ptr + segment.payload_bytes
+                            <= src.base_ptr + src.payload_bytes
+                        ]
+                        if not candidates:
+                            raise ValueError(
+                                "Policy segment is outside its physical source"
+                            )
+                        bases.extend(
+                            (segment.base_ptr + starts[cols] - cursor).tolist()
+                        )
+                        strides.extend([segment.block_stride_bytes] * len(cols))
+                        columns.extend((cols + region_columns[region]).tolist())
+                        limits.extend([min(candidates)] * len(cols))
+                        cursor = end
                 compiled.append(
                     Row(
-                        layer_id,
-                        names,
-                        np.asarray(positions, dtype=np.intp),
+                        layer_ids[group_id][index],
+                        names_by_group[group_id][index],
+                        np.zeros(len(columns), dtype=np.intp),
                         np.asarray(bases, dtype=np.uint64),
                         np.asarray(strides, dtype=np.uint64),
                         np.asarray(columns, dtype=np.intp),
                         np.asarray(limits, dtype=np.uint64),
                     )
                 )
-            # Every key uses all fixed shards, including tail ghosts. This
-            # preserves the existing last-shard publication convention.
-            for _ in range(self.row_count - len(compiled)):
-                compiled.append(
+            self.rows[group_id] = tuple(compiled)
+        if not layerwise and self.policy != "compact":
+            # Bulk packs the per-layer semantic template of ONE native group.
+            width = len(self.sizes)
+            self.sizes = np.tile(self.sizes, next(iter(counts)))
+            for gid, rows in self.rows.items():
+                self.rows[gid] = (
                     Row(
                         None,
-                        frozenset(),
-                        np.empty(0, dtype=np.intp),
-                        np.empty(0, dtype=np.uint64),
-                        np.empty(0, dtype=np.uint64),
-                        np.empty(0, dtype=np.intp),
-                        np.empty(0, dtype=np.uint64),
-                    )
+                        frozenset().union(*(r.names for r in rows)),
+                        np.concatenate([r.group_positions for r in rows]),
+                        np.concatenate([r.bases for r in rows]),
+                        np.concatenate([r.strides for r in rows]),
+                        np.concatenate(
+                            [r.columns + i * width for i, r in enumerate(rows)]
+                        ),
+                        np.concatenate([r.limits for r in rows]),
+                    ),
                 )
-            self.rows[kind] = tuple(compiled)
+        self.row_count = len(next(iter(self.rows.values())))
         # Register the actual allocations, never ghost pointers or padded sizes.
         allocations = {}
         for value in kv_caches.values():
@@ -173,10 +241,12 @@ class HybridStoreLayout:
         )
 
     def resolve(self, plan, row_index):
-        row = self.rows[plan.hash_group][row_index]
+        if self.kinds[plan.group_id] != plan.hash_group:
+            raise ValueError("Plan kind does not match its native group")
+        row = self.rows[plan.group_id][row_index]
         count = len(plan.keys)
         windows = tuple(np.asarray(ids, dtype=np.int64) for ids in plan.windows)
-        if len(windows) != len(self.routes[plan.hash_group]) or any(
+        if len(windows) != len(self.routes[plan.group_id]) or any(
             ids.shape != (count,) for ids in windows
         ):
             raise ValueError(

@@ -114,10 +114,10 @@ def view(width, offset=0):
     return Tensor(backing[:, offset : offset + width])
 
 
-def plan(kind, ids, keys=None):
+def plan(kind, ids, keys=None, group_id=0):
     keys = keys or tuple(bytes([i + 1]) * 16 for i in range(len(ids[0])))
     return UCMGroupDispatchPlan(
-        kind, keys, 0, len(keys) * 4, tuple(np.asarray(row) for row in ids)
+        kind, keys, 0, len(keys) * 4, tuple(np.asarray(row) for row in ids), group_id
     )
 
 
@@ -187,22 +187,38 @@ class LayoutTests(unittest.TestCase):
                 with self.subTest(state=state, layerwise=layerwise):
                     names = ["model.layers.0.attn", "model.layers.2.attn"]
                     groups = [(names, FullAttentionSpec())]
-                    views = {names[0]: view(16), names[1]: (view(8), view(4))}
+                    views = {name: (view(8), view(8)) for name in names}
                     if state:
-                        groups.append((["model.layers.1.mamba"], MambaSpec()))
-                        views["model.layers.1.mamba"] = (view(12), view(20))
+                        groups.append(
+                            (
+                                ["model.layers.1.mamba", "model.layers.3.mamba"],
+                                MambaSpec(),
+                            )
+                        )
+                        for i in (1, 3):
+                            views[f"model.layers.{i}.mamba"] = (view(3), view(8))
                     spec, _ = cache_spec(groups)
                     layout = HybridStoreLayout(spec, views, layerwise=layerwise)
                     impl = checker_connector()
                     impl.kv_cache_layout = layout
                     worker = NS(connector=impl)
                     source = [
-                        plan(kind, [[1]], keys=(kind.encode(),))
-                        for kind in layout.routes
+                        plan(
+                            layout.kinds[gid],
+                            [[1]],
+                            keys=(str(gid).encode(),),
+                            group_id=gid,
+                        )
+                        for gid in layout.routes
                     ]
                     target = [
-                        plan(kind, [[3]], keys=(kind.encode(),))
-                        for kind in layout.routes
+                        plan(
+                            layout.kinds[gid],
+                            [[3]],
+                            keys=(str(gid).encode(),),
+                            group_id=gid,
+                        )
+                        for gid in layout.routes
                     ]
                     metadata = NS(
                         requests={"r": NS(dump_plans=source, load_plans=target)}
@@ -276,31 +292,48 @@ class LayoutTests(unittest.TestCase):
     def test_independent_mamba_allocations_and_group_block_ids(self):
         fa = "model.layers.3.attn"
         states = [f"model.layers.{i}.mamba" for i in range(3)]
-        spec, _ = cache_spec([([fa], FullAttentionSpec()), (states, MambaSpec())])
-        views = {fa: view(16), **{name: (view(3), view(13)) for name in states}}
-        layout = HybridStoreLayout(spec, views, layerwise=True)
-        self.assertEqual(layout.row_count, 3)
-        fa_transfer = layout.resolve(plan("FA", [[2]]), 0)
-        self.assertEqual(
-            int(fa_transfer.ptrs[0, 0]),
-            views[fa].data_ptr() + views[fa].array.strides[0] * 2,
+        spec, _ = cache_spec(
+            [([fa], FullAttentionSpec())] + [([name], MambaSpec()) for name in states]
         )
-        self.assertFalse(layout.resolve(plan("FA", [[2]]), 2).ptrs.any())
-        state_transfer = layout.resolve(plan("State", [[1]]), 1)
-        self.assertEqual(
-            int(state_transfer.ptrs[0, 0]),
-            views[states[1]][0].data_ptr() + views[states[1]][0].array.strides[0],
-        )
-        self.assertEqual(layout.resolve(plan("State", [[0]]), 0).ptrs.shape[0], 0)
+        views = {
+            fa: (view(16), view(16)),
+            **{name: (view(3), view(16)) for name in states},
+        }
+        for layerwise in (False, True):
+            layout = HybridStoreLayout(spec, views, layerwise=layerwise)
+            self.assertEqual(layout.row_count, 1)
+            self.assertEqual(layout.tensor_size_list, [3, 16, 16])
+            fa_transfer = layout.resolve(plan("FA", [[2]]), 0)
+            self.assertEqual(fa_transfer.ptrs[0, 0], 0)
+            self.assertEqual(
+                int(fa_transfer.ptrs[0, 1]), views[fa][0].array[2].ctypes.data
+            )
+            for gid, name in enumerate(states, 1):
+                transfer = layout.resolve(plan("State", [[gid]], group_id=gid), 0)
+                self.assertEqual(
+                    transfer.ptrs.tolist(),
+                    [
+                        [
+                            views[name][0].array[gid].ctypes.data,
+                            views[name][1].array[gid].ctypes.data,
+                            0,
+                        ]
+                    ],
+                )
+                self.assertEqual(
+                    layout.resolve(plan("State", [[0]], group_id=gid), 0).ptrs.shape[0],
+                    0,
+                )
 
     def test_multiple_fa_groups_use_their_own_block_tables(self):
         a, b = "model.layers.0.attn", "model.layers.1.attn"
         spec, _ = cache_spec([([a], FullAttentionSpec()), ([b], FullAttentionSpec())])
-        views = {a: view(8), b: view(12)}
+        views = {a: view(8), b: view(8)}
         layout = HybridStoreLayout(spec, views, layerwise=False)
-        transfer = layout.resolve(plan("FA", [[1, 2], [3, 4]]), 0)
+        transfer = layout.resolve(plan("FA", [[1, 2]], group_id=0), 0)
+        other = layout.resolve(plan("FA", [[3, 4]], group_id=1), 0)
         self.assertEqual(int(transfer.ptrs[0, 0]), views[a].array[1].ctypes.data)
-        self.assertEqual(int(transfer.ptrs[0, 1]), views[b].array[3].ctypes.data)
+        self.assertEqual(int(other.ptrs[0, 0]), views[b].array[3].ctypes.data)
         self.assertEqual(transfer.ptrs.dtype, np.uint64)
         self.assertTrue(transfer.ptrs.flags.c_contiguous)
 
@@ -330,6 +363,91 @@ class LayoutTests(unittest.TestCase):
             int(layout.resolve(plan("FA", [[4]]), 1).ptrs[0, 0]),
             backing[4, 1].ctypes.data,
         )
+
+    def test_semantic_indexer_slots_and_minimax_dense_layers(self):
+        for role in ("indexer", "index_cache"):
+            names = [f"model.layers.{i}.attn" for i in range(3)]
+            indexes = [f"model.layers.{i}.{role}" for i in (0, 2)]
+            spec, _ = cache_spec([(names + indexes, FullAttentionSpec())])
+            views = {name: view(16) for name in names}
+            views[indexes[0]] = view(16)
+            views[indexes[1]] = (view(8), view(4)) if role == "indexer" else view(16)
+            layout = HybridStoreLayout(spec, views, layerwise=True)
+            if role == "indexer":
+                self.assertEqual(layout.tensor_size_list, [16, 8, 8, 4])
+                self.assertEqual(layout.rows[0][0].columns.tolist(), [0, 1, 2])
+                self.assertEqual(layout.rows[0][2].columns.tolist(), [0, 1, 3])
+                ptrs = layout.resolve(plan("FA", [[2]]), 0).ptrs[0]
+                self.assertEqual(
+                    int(ptrs[2]), views[indexes[0]].array[2].ctypes.data + 8
+                )
+                self.assertEqual(ptrs[3], 0)
+            else:
+                self.assertEqual(layout.policy, "minimax_m3")
+                self.assertEqual(layout.tensor_size_list, [16, 16])
+            self.assertEqual(layout.rows[0][1].columns.tolist(), [0])
+
+    def test_full_c8_does_not_reserve_bf16_tail(self):
+        names = ["model.layers.0.attn", "model.layers.1.attn", "model.layers.0.indexer"]
+        spec, _ = cache_spec([(names, FullAttentionSpec())])
+        layout = HybridStoreLayout(
+            spec,
+            {names[0]: view(16), names[1]: view(16), names[2]: (view(8), view(4))},
+            layerwise=True,
+        )
+        self.assertEqual(layout.tensor_size_list, [16, 8, 4])
+        self.assertEqual(layout.rows[0][1].columns.tolist(), [0])
+
+    def test_state_combined_page_and_no_implicit_extra_rows(self):
+        fa, state = "model.layers.1.attn", "model.layers.0.mamba"
+        raw_state = MambaSpec(shapes=((3,), (8,)))
+        raw_state.dtypes = (NS(itemsize=1), NS(itemsize=1))
+        spec, _ = cache_spec([([fa], FullAttentionSpec()), ([state], raw_state)])
+        views = {fa: (view(8), view(8)), state: view(11)}
+        layout = HybridStoreLayout(spec, views, layerwise=True)
+        transfer = layout.resolve(plan("State", [[2]], group_id=1), 0)
+        self.assertEqual(layout.tensor_size_list, [3, 8, 8])
+        self.assertEqual(
+            transfer.ptrs.tolist(),
+            [
+                [
+                    views[state].array[2].ctypes.data,
+                    views[state].array[2].ctypes.data + 3,
+                    0,
+                ]
+            ],
+        )
+        spec, _ = cache_spec(
+            [
+                ([fa], FullAttentionSpec()),
+                ([state, "model.layers.2.mamba"], MambaSpec()),
+            ]
+        )
+        views[state] = (view(3), view(8))
+        views["model.layers.2.mamba"] = (view(3), view(8))
+        with self.assertRaisesRegex(ValueError, "equal local layer"):
+            HybridStoreLayout(spec, views, layerwise=True)
+
+    def test_qwen_four_groups_capacity_and_real_slot_sizes(self):
+        groups, views = [], {}
+        fa_parts = (view(1572864), view(1572864))
+        state_parts = (view(30720), view(1572864))
+        for offset in (3, 0, 1, 2):
+            names = [f"model.layers.{i}.cache" for i in range(offset, 64, 4)]
+            groups.append((names, FullAttentionSpec() if offset == 3 else MambaSpec()))
+            views.update(
+                {name: fa_parts if offset == 3 else state_parts for name in names}
+            )
+        spec, _ = cache_spec(groups)
+        for layerwise in (True, False):
+            layout = HybridStoreLayout(spec, views, layerwise=layerwise)
+            self.assertEqual(layout.row_count, 16 if layerwise else 1)
+            self.assertEqual(
+                layout.tensor_size_list,
+                [30720, 1572864, 1572864] * (1 if layerwise else 16),
+            )
+            self.assertEqual(layout.block_size, 50823168)
+            self.assertEqual(set(layout.rows), {0, 1, 2, 3})
 
     def test_bad_block_ids_and_bad_window_shape_fail_before_io(self):
         name = "model.layers.0.attn"
@@ -378,6 +496,51 @@ class SchedulerTests(unittest.TestCase):
         )
         self.dispatcher = UCMDispatcher(self.spec, self.lookup, self.hasher, b"seed")
         self.request = NS(request_id="r", all_token_ids=list(range(16)))
+
+    def test_group_key_isolation_and_common_state_boundary(self):
+        spec, _ = cache_spec(
+            [(["model.layers.3.attn"], FullAttentionSpec())]
+            + [([f"model.layers.{i}.state"], MambaSpec()) for i in range(3)]
+        )
+        d = UCMDispatcher(spec, self.lookup, self.hasher, b"seed")
+        chains = d.lookup(self.request, 0).group_ucm_block_ids
+        self.assertEqual(len({keys[1] for keys in chains}), 4)
+        # Latest hits are 3, 2, 3; index 2 is NOT a common boundary.
+        # The true common boundary is index 0 (4 tokens).
+        present = set(chains[1][i] for i in (0, 2))
+        present.update(chains[2][i] for i in (0, 1))
+        present.update(chains[3][i] for i in (0, 2))
+        self.lookup.lookup_on_prefix = lambda keys: len(keys) - 1
+        self.lookup.lookup_on_reverse = lambda keys: next(
+            (i for i in range(len(keys) - 1, -1, -1) if keys[i] in present), -1
+        )
+        self.assertEqual(d.lookup(self.request, 0).external_hit_tokens, 4)
+        present.remove(chains[2][0])
+        self.assertEqual(d.lookup(self.request, 0).external_hit_tokens, 0)
+        self.lookup.lookup_on_prefix = lambda keys: -1
+        d.lookup(self.request, 0)
+        d.update_blocks("r", [[1, 2, 3, 4]] * 4, append=False)
+        plans = d.build_metadata({"r": 4}).requests["r"].dump_plans
+        self.assertEqual([p.group_id for p in plans], [0, 1, 2, 3])
+        self.assertTrue(all(len(p.windows) == 1 for p in plans))
+
+    def test_group_tag_overflow_rejected_and_fa_prefix_intersected(self):
+        from ucm.integration.vllm.hybrid.scheduler import _key_tag
+
+        self.assertNotEqual(
+            _key_tag("State", group_id=0), _key_tag("State", group_id=15)
+        )
+        with self.assertRaisesRegex(ValueError, "4-bit"):
+            _key_tag("State", group_id=16)
+        spec, _ = cache_spec(
+            [([f"model.layers.{i}.attn"], FullAttentionSpec()) for i in range(2)]
+        )
+        dispatcher = UCMDispatcher(spec, self.lookup, self.hasher, b"seed")
+        chains = dispatcher.lookup(self.request, 0).group_ucm_block_ids
+        self.lookup.lookup_on_prefix = lambda keys: (
+            0 if keys[0] == chains[1][0] else len(keys) - 1
+        )
+        self.assertEqual(dispatcher.lookup(self.request, 0).external_hit_tokens, 4)
 
     def test_state_not_published_at_a_stale_boundary(self):
         self.dispatcher.lookup(self.request, 0)

@@ -49,6 +49,7 @@ class UCMGroupDispatchPlan:
     # window shape lives on the spec's groups (``tail_blocks``), so
     # only the ids travel.
     windows: tuple[np.ndarray, ...]
+    group_id: int = 0
 
 
 @dataclass(frozen=True)
@@ -73,17 +74,21 @@ def _token_ids(request: "Request") -> tuple[int, ...]:
 _KEY_TYPE_BITS: Mapping[str, int] = {"FA": 0, "WA": 1, "State": 2}
 
 
-def _key_tag(chain: str, tp_rank: int = 0, pp_rank: int = 0) -> bytes:
+def _key_tag(
+    chain: str, tp_rank: int = 0, pp_rank: int = 0, group_id: int = 0
+) -> bytes:
     """The 2-byte suffix of a UCM key, big-endian bit layout:
 
-    type(2) group(4) tp_rank(4) pp_rank(4) reserved(2).  Every group of a
-    chain shares one record, so no group bits are set today; the layout
-    keeps them for a future per-group split.  Ranks default to the
+    type(2) group(4) tp_rank(4) pp_rank(4) reserved(2). Every
+    native group has its own record and group bits. Ranks default to the
     logical rank-0 key namespace the scheduler hashes in.
     """
 
+    if not 0 <= group_id < 16:
+        raise ValueError("Hybrid key group_id must fit the 4-bit group field")
     value = (
         (_KEY_TYPE_BITS[chain] << 14)
+        | (group_id << 10)
         | ((tp_rank & 0b1111) << 6)
         | ((pp_rank & 0b1111) << 2)
     )
@@ -121,7 +126,8 @@ class UCMDispatcher:
         # built once: FA, then the tail-storing WA groups, then State.
         self._routes = kv_cache_spec.dispatch_routes()
         self._chain_tags = tuple(
-            (label, _key_tag(label, tp_rank, pp_rank)) for label, _ in self._routes
+            (label, _key_tag(label, tp_rank, pp_rank, groups[0].group_id))
+            for label, groups in self._routes
         )
 
     def _chain(
@@ -186,8 +192,8 @@ class UCMDispatcher:
         chains are boundary records -- restoring requires a complete FA
         prefix up to some boundary and that boundary's tail or snapshot.
         Each boundary chain is reverse-scanned to its latest hit; the
-        restore boundary is the earliest of those (the latest boundary
-        where every chain hits), never past the FA prefix.
+        restore boundary is found by intersecting their hits, never past
+        the common FA prefix. Taking just their minimum latest hit is unsafe.
         """
 
         ucm_block_size = self.spec.ucm_cache_block_size
@@ -198,22 +204,29 @@ class UCMDispatcher:
         # semantics -- a full hit still recomputes recompute_tokens).
         last = max(len(token_ids) - self.recompute_tokens, 0) // ucm_block_size
         first = hbm // ucm_block_size
-        fa_end = hbm
+        fa_end = last * ucm_block_size
+        boundary_keys = []
         for (label, _tag), keys in zip(self._chain_tags, group_ucm_block_ids):
             if label == "FA":
                 hits = self.proxy.lookup_on_prefix(keys[first:last])
-                if hits >= 0:
-                    fa_end = max((first + hits + 1) * ucm_block_size, hbm)
+                fa_end = min(fa_end, max((first + hits + 1) * ucm_block_size, hbm))
+            else:
+                boundary_keys.append(keys)
+        # Intersect sparse boundary chains. A minimum of independently found
+        # latest hits is NOT sufficient: another group may lack that boundary.
+        end = fa_end // ucm_block_size
+        while boundary_keys and end > first:
+            hits = [
+                self.proxy.lookup_on_reverse(keys[first:end]) for keys in boundary_keys
+            ]
+            if any(hit < 0 for hit in hits):
+                end = first
                 break
-        restore_end = fa_end
-        for (label, _tag), keys in zip(self._chain_tags, group_ucm_block_ids):
-            if label == "FA":
-                continue
-            hits = self.proxy.lookup_on_reverse(keys[first : fa_end // ucm_block_size])
-            if hits < 0:
-                restore_end = hbm  # no boundary record: nothing may restore
+            next_end = min(first + hit + 1 for hit in hits)
+            if next_end == end:
                 break
-            restore_end = min(restore_end, (first + hits + 1) * ucm_block_size)
+            end = next_end
+        restore_end = max(hbm, end * ucm_block_size)
         return UCMLookupResult(max(restore_end - hbm, 0), group_ucm_block_ids)
 
     def update_blocks(
@@ -373,6 +386,7 @@ class UCMDispatcher:
                         self._group_blocks(hash_group, group, state, start, end)
                         for group in physical_groups
                     ),
+                    group_id=physical_groups[0].group_id,
                 )
             )
         return tuple(plans)

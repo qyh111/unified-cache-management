@@ -128,6 +128,19 @@ class UCMHybridConnector(UCMDirectConnector, SupportsHMA):
                 else vars(text_config)
             ),
             "tp": self.tp_size,
+            # Group numbers only have meaning within this ordered semantic
+            # schema. Exclude allocation capacity and device pointers.
+            "groups": [
+                {
+                    "id": group.group_id,
+                    "tokens": group.token_block_size,
+                    "layers": [
+                        (layer.layer_name, str(layer.kv_cache_spec))
+                        for layer in group.layers
+                    ],
+                }
+                for group in self.spec.groups
+            ],
         }
         for package in ("vllm", "vllm-ascend"):
             try:
@@ -138,7 +151,7 @@ class UCMHybridConnector(UCMDirectConnector, SupportsHMA):
             json.dumps(identity, sort_keys=True, default=str).encode()
         ).hexdigest()[:16]
         self._namespace = (
-            f"hybrid-v1-r1-{digest}-b{self.block_size}-lw{int(self.use_layerwise)}"
+            f"hybrid-v1-r2-{digest}-b{self.block_size}-lw{int(self.use_layerwise)}"
         )
         self.kv_cache_layout = None
         self._load_tasks = {}
@@ -223,7 +236,9 @@ class UCMHybridConnector(UCMDirectConnector, SupportsHMA):
         self.block_data_size = self.kv_cache_layout.block_size
         self.device = create_device()
         if self.device is None:
-            raise RuntimeError("Hybrid requires CUDA, Ascend, or explicit CPU Model-check simulation")
+            raise RuntimeError(
+                "Hybrid requires CUDA, Ascend, or explicit CPU Model-check simulation"
+            )
         worker_cores, store_cores = (
             self.device.split_cores(self.device_id)
             if _use_ucm_connector_cpu_affinity()
@@ -236,6 +251,8 @@ class UCMHybridConnector(UCMDirectConnector, SupportsHMA):
             root.mkdir(parents=True, exist_ok=True)
             schema = {
                 "namespace": self._namespace,
+                "layout_policy": self.kv_cache_layout.policy,
+                "group_kinds": self.kv_cache_layout.kinds,
                 "rank": self.tp_rank,
                 "tensor_size_list": self.kv_cache_layout.tensor_size_list,
                 "ucm_block_offsets": self.kv_cache_layout.ucm_block_offsets.tolist(),
@@ -321,7 +338,7 @@ class UCMHybridConnector(UCMDirectConnector, SupportsHMA):
         self.device.synchronize()
         for request_id, request in self._get_connector_metadata().requests.items():
             for plan in request.load_plans:
-                for index, row in enumerate(self.kv_cache_layout.rows[plan.hash_group]):
+                for index, row in enumerate(self.kv_cache_layout.rows[plan.group_id]):
                     try:
                         transfer = self.kv_cache_layout.resolve(plan, index)
                         if not transfer.keys:
@@ -364,7 +381,7 @@ class UCMHybridConnector(UCMDirectConnector, SupportsHMA):
             if request_id in self._failed_load_reqs:
                 continue
             for plan in request.dump_plans:
-                if plan.hash_group != kind:
+                if plan.group_id != kind:
                     continue
                 transfer = self.kv_cache_layout.resolve(plan, row_index)
                 if not transfer.keys:
@@ -401,7 +418,7 @@ class UCMHybridConnector(UCMDirectConnector, SupportsHMA):
             # A row containing multiple logical views must not be copied when
             # only one view has finished. Missing hooks are handled at end of
             # forward. State snapshots are always saved at end of forward.
-            if kind == "State":
+            if self.kv_cache_layout.kinds[kind] == "State":
                 continue
             for index, row in enumerate(rows):
                 if (
