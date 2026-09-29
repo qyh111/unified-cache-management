@@ -1,0 +1,3135 @@
+{
+  "source": "476fa42c; model-check native layout diagnostic 2026-09-29, TP1, logical block 4352",
+  "num_blocks": 30,
+  "tensors": [
+    {
+      "name": "language_model.model.layers.3.self_attn.attn",
+      "group": 0,
+      "descriptor": {
+        "size": 133693440,
+        "layers": [
+          "language_model.model.layers.3.self_attn.attn",
+          "language_model.model.layers.0.self_attn",
+          "language_model.model.layers.1.self_attn",
+          "language_model.model.layers.2.self_attn"
+        ],
+        "layer_stride": 0,
+        "block_stride": 4456448,
+        "offset": 0,
+        "host_resident": false
+      },
+      "position": 0,
+      "views": [
+        {
+          "shape": [
+            1020,
+            128,
+            1,
+            512
+          ],
+          "stride": [
+            65536,
+            512,
+            512,
+            1
+          ],
+          "dtype": "torch.bfloat16",
+          "storage_bytes": 135790592,
+          "offset": 0
+        },
+        {
+          "shape": [
+            1020,
+            128,
+            1,
+            0
+          ],
+          "stride": [
+            65536,
+            512,
+            512,
+            1
+          ],
+          "dtype": "torch.bfloat16",
+          "storage_bytes": 135790592,
+          "offset": -20617076146176
+        }
+      ]
+    },
+    {
+      "name": "language_model.model.layers.7.self_attn.attn",
+      "group": 0,
+      "descriptor": {
+        "size": 133693440,
+        "layers": [
+          "language_model.model.layers.7.self_attn.attn",
+          "language_model.model.layers.4.self_attn",
+          "language_model.model.layers.5.self_attn",
+          "language_model.model.layers.6.self_attn"
+        ],
+        "layer_stride": 0,
+        "block_stride": 4456448,
+        "offset": 0,
+        "host_resident": false
+      },
+      "position": 0,
+      "views": [
+        {
+          "shape": [
+            1020,
+            128,
+            1,
+            512
+          ],
+          "stride": [
+            65536,
+            512,
+            512,
+            1
+          ],
+          "dtype": "torch.bfloat16",
+          "storage_bytes": 135790592,
+          "offset": 0
+        },
+        {
+          "shape": [
+            1020,
+            128,
+            1,
+            0
+          ],
+          "stride": [
+            65536,
+            512,
+            512,
+            1
+          ],
+          "dtype": "torch.bfloat16",
+          "storage_bytes": 135790592,
+          "offset": -20617212461056
+        }
+      ]
+    },
+    {
+      "name": "language_model.model.layers.11.self_attn.attn",
+      "group": 0,
+      "descriptor": {
+        "size": 133693440,
+        "layers": [
+          "language_model.model.layers.11.self_attn.attn",
+          "language_model.model.layers.8.self_attn",
+          "language_model.model.layers.9.self_attn",
+          "language_model.model.layers.10.self_attn"
+        ],
+        "layer_stride": 0,
+        "block_stride": 4456448,
+        "offset": 0,
+        "host_resident": false
+      },
+      "position": 0,
+      "views": [
+        {
+          "shape": [
+            1020,
+            128,
+            1,
+            512
+          ],
+          "stride": [
+            65536,
+            512,
+            512,
+            1
+          ],
+          "dtype": "torch.bfloat16",
+          "storage_bytes": 135790592,
+          "offset": 0
+        },
+        {
+          "shape": [
+            1020,
+            128,
+            1,
+            0
+          ],
+          "stride": [
+            65536,
+            512,
+            512,
+            1
+          ],
+          "dtype": "torch.bfloat16",
+          "storage_bytes": 135790592,
+          "offset": -20617348775936
+        }
+      ]
+    },
+    {
+      "name": "language_model.model.layers.15.self_attn.attn",
+      "group": 0,
+      "descriptor": {
+        "size": 133693440,
+        "layers": [
+          "language_model.model.layers.15.self_attn.attn",
+          "language_model.model.layers.12.self_attn",
+          "language_model.model.layers.13.self_attn",
+          "language_model.model.layers.14.self_attn"
+        ],
+        "layer_stride": 0,
+        "block_stride": 4456448,
+        "offset": 0,
+        "host_resident": false
+      },
+      "position": 0,
+      "views": [
+        {
+          "shape": [
+            1020,
+            128,
+            1,
+            512
+          ],
+          "stride": [
+            65536,
+            512,
+            512,
+            1
+          ],
+          "dtype": "torch.bfloat16",
+          "storage_bytes": 135790592,
+          "offset": 0
+        },
+        {
+          "shape": [
+            1020,
+            128,
+            1,
+            0
+          ],
+          "stride": [
+            65536,
+            512,
+            512,
+            1
+          ],
+          "dtype": "torch.bfloat16",
+          "storage_bytes": 135790592,
+          "offset": -20617485090816
+        }
+      ]
+    },
+    {
+      "name": "language_model.model.layers.19.self_attn.attn",
+      "group": 0,
+      "descriptor": {
+        "size": 133693440,
+        "layers": [
+          "language_model.model.layers.19.self_attn.attn",
+          "language_model.model.layers.16.self_attn",
+          "language_model.model.layers.17.self_attn",
+          "language_model.model.layers.18.self_attn"
+        ],
+        "layer_stride": 0,
+        "block_stride": 4456448,
+        "offset": 0,
+        "host_resident": false
+      },
+      "position": 0,
+      "views": [
+        {
+          "shape": [
+            1020,
+            128,
+            1,
+            512
+          ],
+          "stride": [
+            65536,
+            512,
+            512,
+            1
+          ],
+          "dtype": "torch.bfloat16",
+          "storage_bytes": 135790592,
+          "offset": 0
+        },
+        {
+          "shape": [
+            1020,
+            128,
+            1,
+            0
+          ],
+          "stride": [
+            65536,
+            512,
+            512,
+            1
+          ],
+          "dtype": "torch.bfloat16",
+          "storage_bytes": 135790592,
+          "offset": -20617621405696
+        }
+      ]
+    },
+    {
+      "name": "language_model.model.layers.23.self_attn.attn",
+      "group": 0,
+      "descriptor": {
+        "size": 133693440,
+        "layers": [
+          "language_model.model.layers.23.self_attn.attn",
+          "language_model.model.layers.20.self_attn",
+          "language_model.model.layers.21.self_attn",
+          "language_model.model.layers.22.self_attn"
+        ],
+        "layer_stride": 0,
+        "block_stride": 4456448,
+        "offset": 0,
+        "host_resident": false
+      },
+      "position": 0,
+      "views": [
+        {
+          "shape": [
+            1020,
+            128,
+            1,
+            512
+          ],
+          "stride": [
+            65536,
+            512,
+            512,
+            1
+          ],
+          "dtype": "torch.bfloat16",
+          "storage_bytes": 135790592,
+          "offset": 0
+        },
+        {
+          "shape": [
+            1020,
+            128,
+            1,
+            0
+          ],
+          "stride": [
+            65536,
+            512,
+            512,
+            1
+          ],
+          "dtype": "torch.bfloat16",
+          "storage_bytes": 135790592,
+          "offset": -20617757720576
+        }
+      ]
+    },
+    {
+      "name": "language_model.model.layers.27.self_attn.attn",
+      "group": 0,
+      "descriptor": {
+        "size": 133693440,
+        "layers": [
+          "language_model.model.layers.27.self_attn.attn",
+          "language_model.model.layers.24.self_attn",
+          "language_model.model.layers.25.self_attn",
+          "language_model.model.layers.26.self_attn"
+        ],
+        "layer_stride": 0,
+        "block_stride": 4456448,
+        "offset": 0,
+        "host_resident": false
+      },
+      "position": 0,
+      "views": [
+        {
+          "shape": [
+            1020,
+            128,
+            1,
+            512
+          ],
+          "stride": [
+            65536,
+            512,
+            512,
+            1
+          ],
+          "dtype": "torch.bfloat16",
+          "storage_bytes": 135790592,
+          "offset": 0
+        },
+        {
+          "shape": [
+            1020,
+            128,
+            1,
+            0
+          ],
+          "stride": [
+            65536,
+            512,
+            512,
+            1
+          ],
+          "dtype": "torch.bfloat16",
+          "storage_bytes": 135790592,
+          "offset": -20622285471744
+        }
+      ]
+    },
+    {
+      "name": "language_model.model.layers.31.self_attn.attn",
+      "group": 0,
+      "descriptor": {
+        "size": 133693440,
+        "layers": [
+          "language_model.model.layers.31.self_attn.attn",
+          "language_model.model.layers.28.self_attn",
+          "language_model.model.layers.29.self_attn",
+          "language_model.model.layers.30.self_attn"
+        ],
+        "layer_stride": 0,
+        "block_stride": 4456448,
+        "offset": 0,
+        "host_resident": false
+      },
+      "position": 0,
+      "views": [
+        {
+          "shape": [
+            1020,
+            128,
+            1,
+            512
+          ],
+          "stride": [
+            65536,
+            512,
+            512,
+            1
+          ],
+          "dtype": "torch.bfloat16",
+          "storage_bytes": 135790592,
+          "offset": 0
+        },
+        {
+          "shape": [
+            1020,
+            128,
+            1,
+            0
+          ],
+          "stride": [
+            65536,
+            512,
+            512,
+            1
+          ],
+          "dtype": "torch.bfloat16",
+          "storage_bytes": 135790592,
+          "offset": -20622421786624
+        }
+      ]
+    },
+    {
+      "name": "language_model.model.layers.35.self_attn.attn",
+      "group": 0,
+      "descriptor": {
+        "size": 133693440,
+        "layers": [
+          "language_model.model.layers.35.self_attn.attn",
+          "language_model.model.layers.32.self_attn",
+          "language_model.model.layers.33.self_attn",
+          "language_model.model.layers.34.self_attn"
+        ],
+        "layer_stride": 0,
+        "block_stride": 4456448,
+        "offset": 0,
+        "host_resident": false
+      },
+      "position": 0,
+      "views": [
+        {
+          "shape": [
+            1020,
+            128,
+            1,
+            512
+          ],
+          "stride": [
+            65536,
+            512,
+            512,
+            1
+          ],
+          "dtype": "torch.bfloat16",
+          "storage_bytes": 135790592,
+          "offset": 0
+        },
+        {
+          "shape": [
+            1020,
+            128,
+            1,
+            0
+          ],
+          "stride": [
+            65536,
+            512,
+            512,
+            1
+          ],
+          "dtype": "torch.bfloat16",
+          "storage_bytes": 135790592,
+          "offset": -20622558101504
+        }
+      ]
+    },
+    {
+      "name": "language_model.model.layers.39.self_attn.attn",
+      "group": 0,
+      "descriptor": {
+        "size": 133693440,
+        "layers": [
+          "language_model.model.layers.39.self_attn.attn",
+          "language_model.model.layers.36.self_attn",
+          "language_model.model.layers.37.self_attn",
+          "language_model.model.layers.38.self_attn"
+        ],
+        "layer_stride": 0,
+        "block_stride": 4456448,
+        "offset": 0,
+        "host_resident": false
+      },
+      "position": 0,
+      "views": [
+        {
+          "shape": [
+            1020,
+            128,
+            1,
+            512
+          ],
+          "stride": [
+            65536,
+            512,
+            512,
+            1
+          ],
+          "dtype": "torch.bfloat16",
+          "storage_bytes": 135790592,
+          "offset": 0
+        },
+        {
+          "shape": [
+            1020,
+            128,
+            1,
+            0
+          ],
+          "stride": [
+            65536,
+            512,
+            512,
+            1
+          ],
+          "dtype": "torch.bfloat16",
+          "storage_bytes": 135790592,
+          "offset": -20622694416384
+        }
+      ]
+    },
+    {
+      "name": "language_model.model.layers.43.self_attn.attn",
+      "group": 0,
+      "descriptor": {
+        "size": 133693440,
+        "layers": [
+          "language_model.model.layers.43.self_attn.attn",
+          "language_model.model.layers.40.self_attn",
+          "language_model.model.layers.41.self_attn",
+          "language_model.model.layers.42.self_attn"
+        ],
+        "layer_stride": 0,
+        "block_stride": 4456448,
+        "offset": 0,
+        "host_resident": false
+      },
+      "position": 0,
+      "views": [
+        {
+          "shape": [
+            1020,
+            128,
+            1,
+            512
+          ],
+          "stride": [
+            65536,
+            512,
+            512,
+            1
+          ],
+          "dtype": "torch.bfloat16",
+          "storage_bytes": 135790592,
+          "offset": 0
+        },
+        {
+          "shape": [
+            1020,
+            128,
+            1,
+            0
+          ],
+          "stride": [
+            65536,
+            512,
+            512,
+            1
+          ],
+          "dtype": "torch.bfloat16",
+          "storage_bytes": 135790592,
+          "offset": -20622830731264
+        }
+      ]
+    },
+    {
+      "name": "language_model.model.layers.3.self_attn.indexer.k_cache",
+      "group": 0,
+      "descriptor": {
+        "size": 8355840,
+        "layers": [
+          "language_model.model.layers.3.self_attn.indexer.k_cache",
+          "language_model.model.layers.3.self_attn.indexer.tail_cache"
+        ],
+        "layer_stride": 0,
+        "block_stride": 278528,
+        "offset": 0,
+        "host_resident": false
+      },
+      "position": 0,
+      "views": [
+        {
+          "shape": [
+            1020,
+            32,
+            1,
+            128
+          ],
+          "stride": [
+            4096,
+            128,
+            128,
+            1
+          ],
+          "dtype": "torch.bfloat16",
+          "storage_bytes": 10452992,
+          "offset": 0
+        }
+      ]
+    },
+    {
+      "name": "language_model.model.layers.7.self_attn.indexer.k_cache",
+      "group": 0,
+      "descriptor": {
+        "size": 8355840,
+        "layers": [
+          "language_model.model.layers.7.self_attn.indexer.k_cache",
+          "language_model.model.layers.7.self_attn.indexer.tail_cache"
+        ],
+        "layer_stride": 0,
+        "block_stride": 278528,
+        "offset": 0,
+        "host_resident": false
+      },
+      "position": 0,
+      "views": [
+        {
+          "shape": [
+            1020,
+            32,
+            1,
+            128
+          ],
+          "stride": [
+            4096,
+            128,
+            128,
+            1
+          ],
+          "dtype": "torch.bfloat16",
+          "storage_bytes": 10452992,
+          "offset": 32256
+        }
+      ]
+    },
+    {
+      "name": "language_model.model.layers.11.self_attn.indexer.k_cache",
+      "group": 0,
+      "descriptor": {
+        "size": 8355840,
+        "layers": [
+          "language_model.model.layers.11.self_attn.indexer.k_cache",
+          "language_model.model.layers.11.self_attn.indexer.tail_cache"
+        ],
+        "layer_stride": 0,
+        "block_stride": 278528,
+        "offset": 0,
+        "host_resident": false
+      },
+      "position": 0,
+      "views": [
+        {
+          "shape": [
+            1020,
+            32,
+            1,
+            128
+          ],
+          "stride": [
+            4096,
+            128,
+            128,
+            1
+          ],
+          "dtype": "torch.bfloat16",
+          "storage_bytes": 10452992,
+          "offset": 0
+        }
+      ]
+    },
+    {
+      "name": "language_model.model.layers.15.self_attn.indexer.k_cache",
+      "group": 0,
+      "descriptor": {
+        "size": 8355840,
+        "layers": [
+          "language_model.model.layers.15.self_attn.indexer.k_cache",
+          "language_model.model.layers.15.self_attn.indexer.tail_cache"
+        ],
+        "layer_stride": 0,
+        "block_stride": 278528,
+        "offset": 0,
+        "host_resident": false
+      },
+      "position": 0,
+      "views": [
+        {
+          "shape": [
+            1020,
+            32,
+            1,
+            128
+          ],
+          "stride": [
+            4096,
+            128,
+            128,
+            1
+          ],
+          "dtype": "torch.bfloat16",
+          "storage_bytes": 10452992,
+          "offset": 32256
+        }
+      ]
+    },
+    {
+      "name": "language_model.model.layers.19.self_attn.indexer.k_cache",
+      "group": 0,
+      "descriptor": {
+        "size": 8355840,
+        "layers": [
+          "language_model.model.layers.19.self_attn.indexer.k_cache",
+          "language_model.model.layers.19.self_attn.indexer.tail_cache"
+        ],
+        "layer_stride": 0,
+        "block_stride": 278528,
+        "offset": 0,
+        "host_resident": false
+      },
+      "position": 0,
+      "views": [
+        {
+          "shape": [
+            1020,
+            32,
+            1,
+            128
+          ],
+          "stride": [
+            4096,
+            128,
+            128,
+            1
+          ],
+          "dtype": "torch.bfloat16",
+          "storage_bytes": 10452992,
+          "offset": 0
+        }
+      ]
+    },
+    {
+      "name": "language_model.model.layers.23.self_attn.indexer.k_cache",
+      "group": 0,
+      "descriptor": {
+        "size": 8355840,
+        "layers": [
+          "language_model.model.layers.23.self_attn.indexer.k_cache",
+          "language_model.model.layers.23.self_attn.indexer.tail_cache"
+        ],
+        "layer_stride": 0,
+        "block_stride": 278528,
+        "offset": 0,
+        "host_resident": false
+      },
+      "position": 0,
+      "views": [
+        {
+          "shape": [
+            1020,
+            32,
+            1,
+            128
+          ],
+          "stride": [
+            4096,
+            128,
+            128,
+            1
+          ],
+          "dtype": "torch.bfloat16",
+          "storage_bytes": 10452992,
+          "offset": 32256
+        }
+      ]
+    },
+    {
+      "name": "language_model.model.layers.27.self_attn.indexer.k_cache",
+      "group": 0,
+      "descriptor": {
+        "size": 8355840,
+        "layers": [
+          "language_model.model.layers.27.self_attn.indexer.k_cache",
+          "language_model.model.layers.27.self_attn.indexer.tail_cache"
+        ],
+        "layer_stride": 0,
+        "block_stride": 278528,
+        "offset": 0,
+        "host_resident": false
+      },
+      "position": 0,
+      "views": [
+        {
+          "shape": [
+            1020,
+            32,
+            1,
+            128
+          ],
+          "stride": [
+            4096,
+            128,
+            128,
+            1
+          ],
+          "dtype": "torch.bfloat16",
+          "storage_bytes": 10452992,
+          "offset": 0
+        }
+      ]
+    },
+    {
+      "name": "language_model.model.layers.31.self_attn.indexer.k_cache",
+      "group": 0,
+      "descriptor": {
+        "size": 8355840,
+        "layers": [
+          "language_model.model.layers.31.self_attn.indexer.k_cache",
+          "language_model.model.layers.31.self_attn.indexer.tail_cache"
+        ],
+        "layer_stride": 0,
+        "block_stride": 278528,
+        "offset": 0,
+        "host_resident": false
+      },
+      "position": 0,
+      "views": [
+        {
+          "shape": [
+            1020,
+            32,
+            1,
+            128
+          ],
+          "stride": [
+            4096,
+            128,
+            128,
+            1
+          ],
+          "dtype": "torch.bfloat16",
+          "storage_bytes": 10452992,
+          "offset": 32256
+        }
+      ]
+    },
+    {
+      "name": "language_model.model.layers.35.self_attn.indexer.k_cache",
+      "group": 0,
+      "descriptor": {
+        "size": 8355840,
+        "layers": [
+          "language_model.model.layers.35.self_attn.indexer.k_cache",
+          "language_model.model.layers.35.self_attn.indexer.tail_cache"
+        ],
+        "layer_stride": 0,
+        "block_stride": 278528,
+        "offset": 0,
+        "host_resident": false
+      },
+      "position": 0,
+      "views": [
+        {
+          "shape": [
+            1020,
+            32,
+            1,
+            128
+          ],
+          "stride": [
+            4096,
+            128,
+            128,
+            1
+          ],
+          "dtype": "torch.bfloat16",
+          "storage_bytes": 10452992,
+          "offset": 0
+        }
+      ]
+    },
+    {
+      "name": "language_model.model.layers.39.self_attn.indexer.k_cache",
+      "group": 0,
+      "descriptor": {
+        "size": 8355840,
+        "layers": [
+          "language_model.model.layers.39.self_attn.indexer.k_cache",
+          "language_model.model.layers.39.self_attn.indexer.tail_cache"
+        ],
+        "layer_stride": 0,
+        "block_stride": 278528,
+        "offset": 0,
+        "host_resident": false
+      },
+      "position": 0,
+      "views": [
+        {
+          "shape": [
+            1020,
+            32,
+            1,
+            128
+          ],
+          "stride": [
+            4096,
+            128,
+            128,
+            1
+          ],
+          "dtype": "torch.bfloat16",
+          "storage_bytes": 10452992,
+          "offset": 32256
+        }
+      ]
+    },
+    {
+      "name": "language_model.model.layers.43.self_attn.indexer.k_cache",
+      "group": 0,
+      "descriptor": {
+        "size": 8355840,
+        "layers": [
+          "language_model.model.layers.43.self_attn.indexer.k_cache",
+          "language_model.model.layers.43.self_attn.indexer.tail_cache"
+        ],
+        "layer_stride": 0,
+        "block_stride": 278528,
+        "offset": 0,
+        "host_resident": false
+      },
+      "position": 0,
+      "views": [
+        {
+          "shape": [
+            1020,
+            32,
+            1,
+            128
+          ],
+          "stride": [
+            4096,
+            128,
+            128,
+            1
+          ],
+          "dtype": "torch.bfloat16",
+          "storage_bytes": 10452992,
+          "offset": 0
+        }
+      ]
+    },
+    {
+      "name": "language_model.model.layers.3.self_attn.indexer.tail_cache",
+      "group": 1,
+      "descriptor": {
+        "size": 8355840,
+        "layers": [
+          "language_model.model.layers.3.self_attn.indexer.k_cache",
+          "language_model.model.layers.3.self_attn.indexer.tail_cache"
+        ],
+        "layer_stride": 0,
+        "block_stride": 278528,
+        "offset": 0,
+        "host_resident": false
+      },
+      "position": 1,
+      "views": [
+        {
+          "shape": [
+            30,
+            2,
+            4,
+            128
+          ],
+          "stride": [
+            69632,
+            512,
+            128,
+            1
+          ],
+          "dtype": "torch.float32",
+          "storage_bytes": 10452992,
+          "offset": 0
+        }
+      ]
+    },
+    {
+      "name": "language_model.model.layers.7.self_attn.indexer.tail_cache",
+      "group": 1,
+      "descriptor": {
+        "size": 8355840,
+        "layers": [
+          "language_model.model.layers.7.self_attn.indexer.k_cache",
+          "language_model.model.layers.7.self_attn.indexer.tail_cache"
+        ],
+        "layer_stride": 0,
+        "block_stride": 278528,
+        "offset": 0,
+        "host_resident": false
+      },
+      "position": 1,
+      "views": [
+        {
+          "shape": [
+            30,
+            2,
+            4,
+            128
+          ],
+          "stride": [
+            69632,
+            512,
+            128,
+            1
+          ],
+          "dtype": "torch.float32",
+          "storage_bytes": 10452992,
+          "offset": 32256
+        }
+      ]
+    },
+    {
+      "name": "language_model.model.layers.11.self_attn.indexer.tail_cache",
+      "group": 1,
+      "descriptor": {
+        "size": 8355840,
+        "layers": [
+          "language_model.model.layers.11.self_attn.indexer.k_cache",
+          "language_model.model.layers.11.self_attn.indexer.tail_cache"
+        ],
+        "layer_stride": 0,
+        "block_stride": 278528,
+        "offset": 0,
+        "host_resident": false
+      },
+      "position": 1,
+      "views": [
+        {
+          "shape": [
+            30,
+            2,
+            4,
+            128
+          ],
+          "stride": [
+            69632,
+            512,
+            128,
+            1
+          ],
+          "dtype": "torch.float32",
+          "storage_bytes": 10452992,
+          "offset": 0
+        }
+      ]
+    },
+    {
+      "name": "language_model.model.layers.15.self_attn.indexer.tail_cache",
+      "group": 1,
+      "descriptor": {
+        "size": 8355840,
+        "layers": [
+          "language_model.model.layers.15.self_attn.indexer.k_cache",
+          "language_model.model.layers.15.self_attn.indexer.tail_cache"
+        ],
+        "layer_stride": 0,
+        "block_stride": 278528,
+        "offset": 0,
+        "host_resident": false
+      },
+      "position": 1,
+      "views": [
+        {
+          "shape": [
+            30,
+            2,
+            4,
+            128
+          ],
+          "stride": [
+            69632,
+            512,
+            128,
+            1
+          ],
+          "dtype": "torch.float32",
+          "storage_bytes": 10452992,
+          "offset": 32256
+        }
+      ]
+    },
+    {
+      "name": "language_model.model.layers.19.self_attn.indexer.tail_cache",
+      "group": 1,
+      "descriptor": {
+        "size": 8355840,
+        "layers": [
+          "language_model.model.layers.19.self_attn.indexer.k_cache",
+          "language_model.model.layers.19.self_attn.indexer.tail_cache"
+        ],
+        "layer_stride": 0,
+        "block_stride": 278528,
+        "offset": 0,
+        "host_resident": false
+      },
+      "position": 1,
+      "views": [
+        {
+          "shape": [
+            30,
+            2,
+            4,
+            128
+          ],
+          "stride": [
+            69632,
+            512,
+            128,
+            1
+          ],
+          "dtype": "torch.float32",
+          "storage_bytes": 10452992,
+          "offset": 0
+        }
+      ]
+    },
+    {
+      "name": "language_model.model.layers.23.self_attn.indexer.tail_cache",
+      "group": 1,
+      "descriptor": {
+        "size": 8355840,
+        "layers": [
+          "language_model.model.layers.23.self_attn.indexer.k_cache",
+          "language_model.model.layers.23.self_attn.indexer.tail_cache"
+        ],
+        "layer_stride": 0,
+        "block_stride": 278528,
+        "offset": 0,
+        "host_resident": false
+      },
+      "position": 1,
+      "views": [
+        {
+          "shape": [
+            30,
+            2,
+            4,
+            128
+          ],
+          "stride": [
+            69632,
+            512,
+            128,
+            1
+          ],
+          "dtype": "torch.float32",
+          "storage_bytes": 10452992,
+          "offset": 32256
+        }
+      ]
+    },
+    {
+      "name": "language_model.model.layers.27.self_attn.indexer.tail_cache",
+      "group": 1,
+      "descriptor": {
+        "size": 8355840,
+        "layers": [
+          "language_model.model.layers.27.self_attn.indexer.k_cache",
+          "language_model.model.layers.27.self_attn.indexer.tail_cache"
+        ],
+        "layer_stride": 0,
+        "block_stride": 278528,
+        "offset": 0,
+        "host_resident": false
+      },
+      "position": 1,
+      "views": [
+        {
+          "shape": [
+            30,
+            2,
+            4,
+            128
+          ],
+          "stride": [
+            69632,
+            512,
+            128,
+            1
+          ],
+          "dtype": "torch.float32",
+          "storage_bytes": 10452992,
+          "offset": 0
+        }
+      ]
+    },
+    {
+      "name": "language_model.model.layers.31.self_attn.indexer.tail_cache",
+      "group": 1,
+      "descriptor": {
+        "size": 8355840,
+        "layers": [
+          "language_model.model.layers.31.self_attn.indexer.k_cache",
+          "language_model.model.layers.31.self_attn.indexer.tail_cache"
+        ],
+        "layer_stride": 0,
+        "block_stride": 278528,
+        "offset": 0,
+        "host_resident": false
+      },
+      "position": 1,
+      "views": [
+        {
+          "shape": [
+            30,
+            2,
+            4,
+            128
+          ],
+          "stride": [
+            69632,
+            512,
+            128,
+            1
+          ],
+          "dtype": "torch.float32",
+          "storage_bytes": 10452992,
+          "offset": 32256
+        }
+      ]
+    },
+    {
+      "name": "language_model.model.layers.35.self_attn.indexer.tail_cache",
+      "group": 1,
+      "descriptor": {
+        "size": 8355840,
+        "layers": [
+          "language_model.model.layers.35.self_attn.indexer.k_cache",
+          "language_model.model.layers.35.self_attn.indexer.tail_cache"
+        ],
+        "layer_stride": 0,
+        "block_stride": 278528,
+        "offset": 0,
+        "host_resident": false
+      },
+      "position": 1,
+      "views": [
+        {
+          "shape": [
+            30,
+            2,
+            4,
+            128
+          ],
+          "stride": [
+            69632,
+            512,
+            128,
+            1
+          ],
+          "dtype": "torch.float32",
+          "storage_bytes": 10452992,
+          "offset": 0
+        }
+      ]
+    },
+    {
+      "name": "language_model.model.layers.39.self_attn.indexer.tail_cache",
+      "group": 1,
+      "descriptor": {
+        "size": 8355840,
+        "layers": [
+          "language_model.model.layers.39.self_attn.indexer.k_cache",
+          "language_model.model.layers.39.self_attn.indexer.tail_cache"
+        ],
+        "layer_stride": 0,
+        "block_stride": 278528,
+        "offset": 0,
+        "host_resident": false
+      },
+      "position": 1,
+      "views": [
+        {
+          "shape": [
+            30,
+            2,
+            4,
+            128
+          ],
+          "stride": [
+            69632,
+            512,
+            128,
+            1
+          ],
+          "dtype": "torch.float32",
+          "storage_bytes": 10452992,
+          "offset": 32256
+        }
+      ]
+    },
+    {
+      "name": "language_model.model.layers.43.self_attn.indexer.tail_cache",
+      "group": 1,
+      "descriptor": {
+        "size": 8355840,
+        "layers": [
+          "language_model.model.layers.43.self_attn.indexer.k_cache",
+          "language_model.model.layers.43.self_attn.indexer.tail_cache"
+        ],
+        "layer_stride": 0,
+        "block_stride": 278528,
+        "offset": 0,
+        "host_resident": false
+      },
+      "position": 1,
+      "views": [
+        {
+          "shape": [
+            30,
+            2,
+            4,
+            128
+          ],
+          "stride": [
+            69632,
+            512,
+            128,
+            1
+          ],
+          "dtype": "torch.float32",
+          "storage_bytes": 10452992,
+          "offset": 0
+        }
+      ]
+    },
+    {
+      "name": "language_model.model.layers.0.self_attn",
+      "group": 2,
+      "descriptor": {
+        "size": 133693440,
+        "layers": [
+          "language_model.model.layers.3.self_attn.attn",
+          "language_model.model.layers.0.self_attn",
+          "language_model.model.layers.1.self_attn",
+          "language_model.model.layers.2.self_attn"
+        ],
+        "layer_stride": 0,
+        "block_stride": 4456448,
+        "offset": 0,
+        "host_resident": false
+      },
+      "position": 1,
+      "views": [
+        {
+          "shape": [
+            30,
+            3,
+            24576
+          ],
+          "stride": [
+            2228224,
+            24576,
+            1
+          ],
+          "dtype": "torch.bfloat16",
+          "storage_bytes": 135790592,
+          "offset": 0
+        },
+        {
+          "shape": [
+            30,
+            64,
+            128,
+            128
+          ],
+          "stride": [
+            1114112,
+            16384,
+            128,
+            1
+          ],
+          "dtype": "torch.float32",
+          "storage_bytes": 135790592,
+          "offset": 147456
+        }
+      ]
+    },
+    {
+      "name": "language_model.model.layers.4.self_attn",
+      "group": 2,
+      "descriptor": {
+        "size": 133693440,
+        "layers": [
+          "language_model.model.layers.7.self_attn.attn",
+          "language_model.model.layers.4.self_attn",
+          "language_model.model.layers.5.self_attn",
+          "language_model.model.layers.6.self_attn"
+        ],
+        "layer_stride": 0,
+        "block_stride": 4456448,
+        "offset": 0,
+        "host_resident": false
+      },
+      "position": 1,
+      "views": [
+        {
+          "shape": [
+            30,
+            3,
+            24576
+          ],
+          "stride": [
+            2228224,
+            24576,
+            1
+          ],
+          "dtype": "torch.bfloat16",
+          "storage_bytes": 135790592,
+          "offset": 0
+        },
+        {
+          "shape": [
+            30,
+            64,
+            128,
+            128
+          ],
+          "stride": [
+            1114112,
+            16384,
+            128,
+            1
+          ],
+          "dtype": "torch.float32",
+          "storage_bytes": 135790592,
+          "offset": 147456
+        }
+      ]
+    },
+    {
+      "name": "language_model.model.layers.8.self_attn",
+      "group": 2,
+      "descriptor": {
+        "size": 133693440,
+        "layers": [
+          "language_model.model.layers.11.self_attn.attn",
+          "language_model.model.layers.8.self_attn",
+          "language_model.model.layers.9.self_attn",
+          "language_model.model.layers.10.self_attn"
+        ],
+        "layer_stride": 0,
+        "block_stride": 4456448,
+        "offset": 0,
+        "host_resident": false
+      },
+      "position": 1,
+      "views": [
+        {
+          "shape": [
+            30,
+            3,
+            24576
+          ],
+          "stride": [
+            2228224,
+            24576,
+            1
+          ],
+          "dtype": "torch.bfloat16",
+          "storage_bytes": 135790592,
+          "offset": 0
+        },
+        {
+          "shape": [
+            30,
+            64,
+            128,
+            128
+          ],
+          "stride": [
+            1114112,
+            16384,
+            128,
+            1
+          ],
+          "dtype": "torch.float32",
+          "storage_bytes": 135790592,
+          "offset": 147456
+        }
+      ]
+    },
+    {
+      "name": "language_model.model.layers.12.self_attn",
+      "group": 2,
+      "descriptor": {
+        "size": 133693440,
+        "layers": [
+          "language_model.model.layers.15.self_attn.attn",
+          "language_model.model.layers.12.self_attn",
+          "language_model.model.layers.13.self_attn",
+          "language_model.model.layers.14.self_attn"
+        ],
+        "layer_stride": 0,
+        "block_stride": 4456448,
+        "offset": 0,
+        "host_resident": false
+      },
+      "position": 1,
+      "views": [
+        {
+          "shape": [
+            30,
+            3,
+            24576
+          ],
+          "stride": [
+            2228224,
+            24576,
+            1
+          ],
+          "dtype": "torch.bfloat16",
+          "storage_bytes": 135790592,
+          "offset": 0
+        },
+        {
+          "shape": [
+            30,
+            64,
+            128,
+            128
+          ],
+          "stride": [
+            1114112,
+            16384,
+            128,
+            1
+          ],
+          "dtype": "torch.float32",
+          "storage_bytes": 135790592,
+          "offset": 147456
+        }
+      ]
+    },
+    {
+      "name": "language_model.model.layers.16.self_attn",
+      "group": 2,
+      "descriptor": {
+        "size": 133693440,
+        "layers": [
+          "language_model.model.layers.19.self_attn.attn",
+          "language_model.model.layers.16.self_attn",
+          "language_model.model.layers.17.self_attn",
+          "language_model.model.layers.18.self_attn"
+        ],
+        "layer_stride": 0,
+        "block_stride": 4456448,
+        "offset": 0,
+        "host_resident": false
+      },
+      "position": 1,
+      "views": [
+        {
+          "shape": [
+            30,
+            3,
+            24576
+          ],
+          "stride": [
+            2228224,
+            24576,
+            1
+          ],
+          "dtype": "torch.bfloat16",
+          "storage_bytes": 135790592,
+          "offset": 0
+        },
+        {
+          "shape": [
+            30,
+            64,
+            128,
+            128
+          ],
+          "stride": [
+            1114112,
+            16384,
+            128,
+            1
+          ],
+          "dtype": "torch.float32",
+          "storage_bytes": 135790592,
+          "offset": 147456
+        }
+      ]
+    },
+    {
+      "name": "language_model.model.layers.20.self_attn",
+      "group": 2,
+      "descriptor": {
+        "size": 133693440,
+        "layers": [
+          "language_model.model.layers.23.self_attn.attn",
+          "language_model.model.layers.20.self_attn",
+          "language_model.model.layers.21.self_attn",
+          "language_model.model.layers.22.self_attn"
+        ],
+        "layer_stride": 0,
+        "block_stride": 4456448,
+        "offset": 0,
+        "host_resident": false
+      },
+      "position": 1,
+      "views": [
+        {
+          "shape": [
+            30,
+            3,
+            24576
+          ],
+          "stride": [
+            2228224,
+            24576,
+            1
+          ],
+          "dtype": "torch.bfloat16",
+          "storage_bytes": 135790592,
+          "offset": 0
+        },
+        {
+          "shape": [
+            30,
+            64,
+            128,
+            128
+          ],
+          "stride": [
+            1114112,
+            16384,
+            128,
+            1
+          ],
+          "dtype": "torch.float32",
+          "storage_bytes": 135790592,
+          "offset": 147456
+        }
+      ]
+    },
+    {
+      "name": "language_model.model.layers.24.self_attn",
+      "group": 2,
+      "descriptor": {
+        "size": 133693440,
+        "layers": [
+          "language_model.model.layers.27.self_attn.attn",
+          "language_model.model.layers.24.self_attn",
+          "language_model.model.layers.25.self_attn",
+          "language_model.model.layers.26.self_attn"
+        ],
+        "layer_stride": 0,
+        "block_stride": 4456448,
+        "offset": 0,
+        "host_resident": false
+      },
+      "position": 1,
+      "views": [
+        {
+          "shape": [
+            30,
+            3,
+            24576
+          ],
+          "stride": [
+            2228224,
+            24576,
+            1
+          ],
+          "dtype": "torch.bfloat16",
+          "storage_bytes": 135790592,
+          "offset": 0
+        },
+        {
+          "shape": [
+            30,
+            64,
+            128,
+            128
+          ],
+          "stride": [
+            1114112,
+            16384,
+            128,
+            1
+          ],
+          "dtype": "torch.float32",
+          "storage_bytes": 135790592,
+          "offset": 147456
+        }
+      ]
+    },
+    {
+      "name": "language_model.model.layers.28.self_attn",
+      "group": 2,
+      "descriptor": {
+        "size": 133693440,
+        "layers": [
+          "language_model.model.layers.31.self_attn.attn",
+          "language_model.model.layers.28.self_attn",
+          "language_model.model.layers.29.self_attn",
+          "language_model.model.layers.30.self_attn"
+        ],
+        "layer_stride": 0,
+        "block_stride": 4456448,
+        "offset": 0,
+        "host_resident": false
+      },
+      "position": 1,
+      "views": [
+        {
+          "shape": [
+            30,
+            3,
+            24576
+          ],
+          "stride": [
+            2228224,
+            24576,
+            1
+          ],
+          "dtype": "torch.bfloat16",
+          "storage_bytes": 135790592,
+          "offset": 0
+        },
+        {
+          "shape": [
+            30,
+            64,
+            128,
+            128
+          ],
+          "stride": [
+            1114112,
+            16384,
+            128,
+            1
+          ],
+          "dtype": "torch.float32",
+          "storage_bytes": 135790592,
+          "offset": 147456
+        }
+      ]
+    },
+    {
+      "name": "language_model.model.layers.32.self_attn",
+      "group": 2,
+      "descriptor": {
+        "size": 133693440,
+        "layers": [
+          "language_model.model.layers.35.self_attn.attn",
+          "language_model.model.layers.32.self_attn",
+          "language_model.model.layers.33.self_attn",
+          "language_model.model.layers.34.self_attn"
+        ],
+        "layer_stride": 0,
+        "block_stride": 4456448,
+        "offset": 0,
+        "host_resident": false
+      },
+      "position": 1,
+      "views": [
+        {
+          "shape": [
+            30,
+            3,
+            24576
+          ],
+          "stride": [
+            2228224,
+            24576,
+            1
+          ],
+          "dtype": "torch.bfloat16",
+          "storage_bytes": 135790592,
+          "offset": 0
+        },
+        {
+          "shape": [
+            30,
+            64,
+            128,
+            128
+          ],
+          "stride": [
+            1114112,
+            16384,
+            128,
+            1
+          ],
+          "dtype": "torch.float32",
+          "storage_bytes": 135790592,
+          "offset": 147456
+        }
+      ]
+    },
+    {
+      "name": "language_model.model.layers.36.self_attn",
+      "group": 2,
+      "descriptor": {
+        "size": 133693440,
+        "layers": [
+          "language_model.model.layers.39.self_attn.attn",
+          "language_model.model.layers.36.self_attn",
+          "language_model.model.layers.37.self_attn",
+          "language_model.model.layers.38.self_attn"
+        ],
+        "layer_stride": 0,
+        "block_stride": 4456448,
+        "offset": 0,
+        "host_resident": false
+      },
+      "position": 1,
+      "views": [
+        {
+          "shape": [
+            30,
+            3,
+            24576
+          ],
+          "stride": [
+            2228224,
+            24576,
+            1
+          ],
+          "dtype": "torch.bfloat16",
+          "storage_bytes": 135790592,
+          "offset": 0
+        },
+        {
+          "shape": [
+            30,
+            64,
+            128,
+            128
+          ],
+          "stride": [
+            1114112,
+            16384,
+            128,
+            1
+          ],
+          "dtype": "torch.float32",
+          "storage_bytes": 135790592,
+          "offset": 147456
+        }
+      ]
+    },
+    {
+      "name": "language_model.model.layers.40.self_attn",
+      "group": 2,
+      "descriptor": {
+        "size": 133693440,
+        "layers": [
+          "language_model.model.layers.43.self_attn.attn",
+          "language_model.model.layers.40.self_attn",
+          "language_model.model.layers.41.self_attn",
+          "language_model.model.layers.42.self_attn"
+        ],
+        "layer_stride": 0,
+        "block_stride": 4456448,
+        "offset": 0,
+        "host_resident": false
+      },
+      "position": 1,
+      "views": [
+        {
+          "shape": [
+            30,
+            3,
+            24576
+          ],
+          "stride": [
+            2228224,
+            24576,
+            1
+          ],
+          "dtype": "torch.bfloat16",
+          "storage_bytes": 135790592,
+          "offset": 0
+        },
+        {
+          "shape": [
+            30,
+            64,
+            128,
+            128
+          ],
+          "stride": [
+            1114112,
+            16384,
+            128,
+            1
+          ],
+          "dtype": "torch.float32",
+          "storage_bytes": 135790592,
+          "offset": 147456
+        }
+      ]
+    },
+    {
+      "name": "language_model.model.layers.44.self_attn",
+      "group": 2,
+      "descriptor": {
+        "size": 133693440,
+        "layers": [
+          "language_model.model.layers.44.self_attn"
+        ],
+        "layer_stride": 0,
+        "block_stride": 4456448,
+        "offset": 0,
+        "host_resident": false
+      },
+      "position": 0,
+      "views": [
+        {
+          "shape": [
+            30,
+            3,
+            24576
+          ],
+          "stride": [
+            2228224,
+            24576,
+            1
+          ],
+          "dtype": "torch.bfloat16",
+          "storage_bytes": 135790592,
+          "offset": 0
+        },
+        {
+          "shape": [
+            30,
+            64,
+            128,
+            128
+          ],
+          "stride": [
+            1114112,
+            16384,
+            128,
+            1
+          ],
+          "dtype": "torch.float32",
+          "storage_bytes": 135790592,
+          "offset": 147456
+        }
+      ]
+    },
+    {
+      "name": "language_model.model.layers.1.self_attn",
+      "group": 3,
+      "descriptor": {
+        "size": 133693440,
+        "layers": [
+          "language_model.model.layers.3.self_attn.attn",
+          "language_model.model.layers.0.self_attn",
+          "language_model.model.layers.1.self_attn",
+          "language_model.model.layers.2.self_attn"
+        ],
+        "layer_stride": 0,
+        "block_stride": 4456448,
+        "offset": 0,
+        "host_resident": false
+      },
+      "position": 2,
+      "views": [
+        {
+          "shape": [
+            30,
+            3,
+            24576
+          ],
+          "stride": [
+            2228224,
+            24576,
+            1
+          ],
+          "dtype": "torch.bfloat16",
+          "storage_bytes": 135790592,
+          "offset": 0
+        },
+        {
+          "shape": [
+            30,
+            64,
+            128,
+            128
+          ],
+          "stride": [
+            1114112,
+            16384,
+            128,
+            1
+          ],
+          "dtype": "torch.float32",
+          "storage_bytes": 135790592,
+          "offset": 147456
+        }
+      ]
+    },
+    {
+      "name": "language_model.model.layers.5.self_attn",
+      "group": 3,
+      "descriptor": {
+        "size": 133693440,
+        "layers": [
+          "language_model.model.layers.7.self_attn.attn",
+          "language_model.model.layers.4.self_attn",
+          "language_model.model.layers.5.self_attn",
+          "language_model.model.layers.6.self_attn"
+        ],
+        "layer_stride": 0,
+        "block_stride": 4456448,
+        "offset": 0,
+        "host_resident": false
+      },
+      "position": 2,
+      "views": [
+        {
+          "shape": [
+            30,
+            3,
+            24576
+          ],
+          "stride": [
+            2228224,
+            24576,
+            1
+          ],
+          "dtype": "torch.bfloat16",
+          "storage_bytes": 135790592,
+          "offset": 0
+        },
+        {
+          "shape": [
+            30,
+            64,
+            128,
+            128
+          ],
+          "stride": [
+            1114112,
+            16384,
+            128,
+            1
+          ],
+          "dtype": "torch.float32",
+          "storage_bytes": 135790592,
+          "offset": 147456
+        }
+      ]
+    },
+    {
+      "name": "language_model.model.layers.9.self_attn",
+      "group": 3,
+      "descriptor": {
+        "size": 133693440,
+        "layers": [
+          "language_model.model.layers.11.self_attn.attn",
+          "language_model.model.layers.8.self_attn",
+          "language_model.model.layers.9.self_attn",
+          "language_model.model.layers.10.self_attn"
+        ],
+        "layer_stride": 0,
+        "block_stride": 4456448,
+        "offset": 0,
+        "host_resident": false
+      },
+      "position": 2,
+      "views": [
+        {
+          "shape": [
+            30,
+            3,
+            24576
+          ],
+          "stride": [
+            2228224,
+            24576,
+            1
+          ],
+          "dtype": "torch.bfloat16",
+          "storage_bytes": 135790592,
+          "offset": 0
+        },
+        {
+          "shape": [
+            30,
+            64,
+            128,
+            128
+          ],
+          "stride": [
+            1114112,
+            16384,
+            128,
+            1
+          ],
+          "dtype": "torch.float32",
+          "storage_bytes": 135790592,
+          "offset": 147456
+        }
+      ]
+    },
+    {
+      "name": "language_model.model.layers.13.self_attn",
+      "group": 3,
+      "descriptor": {
+        "size": 133693440,
+        "layers": [
+          "language_model.model.layers.15.self_attn.attn",
+          "language_model.model.layers.12.self_attn",
+          "language_model.model.layers.13.self_attn",
+          "language_model.model.layers.14.self_attn"
+        ],
+        "layer_stride": 0,
+        "block_stride": 4456448,
+        "offset": 0,
+        "host_resident": false
+      },
+      "position": 2,
+      "views": [
+        {
+          "shape": [
+            30,
+            3,
+            24576
+          ],
+          "stride": [
+            2228224,
+            24576,
+            1
+          ],
+          "dtype": "torch.bfloat16",
+          "storage_bytes": 135790592,
+          "offset": 0
+        },
+        {
+          "shape": [
+            30,
+            64,
+            128,
+            128
+          ],
+          "stride": [
+            1114112,
+            16384,
+            128,
+            1
+          ],
+          "dtype": "torch.float32",
+          "storage_bytes": 135790592,
+          "offset": 147456
+        }
+      ]
+    },
+    {
+      "name": "language_model.model.layers.17.self_attn",
+      "group": 3,
+      "descriptor": {
+        "size": 133693440,
+        "layers": [
+          "language_model.model.layers.19.self_attn.attn",
+          "language_model.model.layers.16.self_attn",
+          "language_model.model.layers.17.self_attn",
+          "language_model.model.layers.18.self_attn"
+        ],
+        "layer_stride": 0,
+        "block_stride": 4456448,
+        "offset": 0,
+        "host_resident": false
+      },
+      "position": 2,
+      "views": [
+        {
+          "shape": [
+            30,
+            3,
+            24576
+          ],
+          "stride": [
+            2228224,
+            24576,
+            1
+          ],
+          "dtype": "torch.bfloat16",
+          "storage_bytes": 135790592,
+          "offset": 0
+        },
+        {
+          "shape": [
+            30,
+            64,
+            128,
+            128
+          ],
+          "stride": [
+            1114112,
+            16384,
+            128,
+            1
+          ],
+          "dtype": "torch.float32",
+          "storage_bytes": 135790592,
+          "offset": 147456
+        }
+      ]
+    },
+    {
+      "name": "language_model.model.layers.21.self_attn",
+      "group": 3,
+      "descriptor": {
+        "size": 133693440,
+        "layers": [
+          "language_model.model.layers.23.self_attn.attn",
+          "language_model.model.layers.20.self_attn",
+          "language_model.model.layers.21.self_attn",
+          "language_model.model.layers.22.self_attn"
+        ],
+        "layer_stride": 0,
+        "block_stride": 4456448,
+        "offset": 0,
+        "host_resident": false
+      },
+      "position": 2,
+      "views": [
+        {
+          "shape": [
+            30,
+            3,
+            24576
+          ],
+          "stride": [
+            2228224,
+            24576,
+            1
+          ],
+          "dtype": "torch.bfloat16",
+          "storage_bytes": 135790592,
+          "offset": 0
+        },
+        {
+          "shape": [
+            30,
+            64,
+            128,
+            128
+          ],
+          "stride": [
+            1114112,
+            16384,
+            128,
+            1
+          ],
+          "dtype": "torch.float32",
+          "storage_bytes": 135790592,
+          "offset": 147456
+        }
+      ]
+    },
+    {
+      "name": "language_model.model.layers.25.self_attn",
+      "group": 3,
+      "descriptor": {
+        "size": 133693440,
+        "layers": [
+          "language_model.model.layers.27.self_attn.attn",
+          "language_model.model.layers.24.self_attn",
+          "language_model.model.layers.25.self_attn",
+          "language_model.model.layers.26.self_attn"
+        ],
+        "layer_stride": 0,
+        "block_stride": 4456448,
+        "offset": 0,
+        "host_resident": false
+      },
+      "position": 2,
+      "views": [
+        {
+          "shape": [
+            30,
+            3,
+            24576
+          ],
+          "stride": [
+            2228224,
+            24576,
+            1
+          ],
+          "dtype": "torch.bfloat16",
+          "storage_bytes": 135790592,
+          "offset": 0
+        },
+        {
+          "shape": [
+            30,
+            64,
+            128,
+            128
+          ],
+          "stride": [
+            1114112,
+            16384,
+            128,
+            1
+          ],
+          "dtype": "torch.float32",
+          "storage_bytes": 135790592,
+          "offset": 147456
+        }
+      ]
+    },
+    {
+      "name": "language_model.model.layers.29.self_attn",
+      "group": 3,
+      "descriptor": {
+        "size": 133693440,
+        "layers": [
+          "language_model.model.layers.31.self_attn.attn",
+          "language_model.model.layers.28.self_attn",
+          "language_model.model.layers.29.self_attn",
+          "language_model.model.layers.30.self_attn"
+        ],
+        "layer_stride": 0,
+        "block_stride": 4456448,
+        "offset": 0,
+        "host_resident": false
+      },
+      "position": 2,
+      "views": [
+        {
+          "shape": [
+            30,
+            3,
+            24576
+          ],
+          "stride": [
+            2228224,
+            24576,
+            1
+          ],
+          "dtype": "torch.bfloat16",
+          "storage_bytes": 135790592,
+          "offset": 0
+        },
+        {
+          "shape": [
+            30,
+            64,
+            128,
+            128
+          ],
+          "stride": [
+            1114112,
+            16384,
+            128,
+            1
+          ],
+          "dtype": "torch.float32",
+          "storage_bytes": 135790592,
+          "offset": 147456
+        }
+      ]
+    },
+    {
+      "name": "language_model.model.layers.33.self_attn",
+      "group": 3,
+      "descriptor": {
+        "size": 133693440,
+        "layers": [
+          "language_model.model.layers.35.self_attn.attn",
+          "language_model.model.layers.32.self_attn",
+          "language_model.model.layers.33.self_attn",
+          "language_model.model.layers.34.self_attn"
+        ],
+        "layer_stride": 0,
+        "block_stride": 4456448,
+        "offset": 0,
+        "host_resident": false
+      },
+      "position": 2,
+      "views": [
+        {
+          "shape": [
+            30,
+            3,
+            24576
+          ],
+          "stride": [
+            2228224,
+            24576,
+            1
+          ],
+          "dtype": "torch.bfloat16",
+          "storage_bytes": 135790592,
+          "offset": 0
+        },
+        {
+          "shape": [
+            30,
+            64,
+            128,
+            128
+          ],
+          "stride": [
+            1114112,
+            16384,
+            128,
+            1
+          ],
+          "dtype": "torch.float32",
+          "storage_bytes": 135790592,
+          "offset": 147456
+        }
+      ]
+    },
+    {
+      "name": "language_model.model.layers.37.self_attn",
+      "group": 3,
+      "descriptor": {
+        "size": 133693440,
+        "layers": [
+          "language_model.model.layers.39.self_attn.attn",
+          "language_model.model.layers.36.self_attn",
+          "language_model.model.layers.37.self_attn",
+          "language_model.model.layers.38.self_attn"
+        ],
+        "layer_stride": 0,
+        "block_stride": 4456448,
+        "offset": 0,
+        "host_resident": false
+      },
+      "position": 2,
+      "views": [
+        {
+          "shape": [
+            30,
+            3,
+            24576
+          ],
+          "stride": [
+            2228224,
+            24576,
+            1
+          ],
+          "dtype": "torch.bfloat16",
+          "storage_bytes": 135790592,
+          "offset": 0
+        },
+        {
+          "shape": [
+            30,
+            64,
+            128,
+            128
+          ],
+          "stride": [
+            1114112,
+            16384,
+            128,
+            1
+          ],
+          "dtype": "torch.float32",
+          "storage_bytes": 135790592,
+          "offset": 147456
+        }
+      ]
+    },
+    {
+      "name": "language_model.model.layers.41.self_attn",
+      "group": 3,
+      "descriptor": {
+        "size": 133693440,
+        "layers": [
+          "language_model.model.layers.43.self_attn.attn",
+          "language_model.model.layers.40.self_attn",
+          "language_model.model.layers.41.self_attn",
+          "language_model.model.layers.42.self_attn"
+        ],
+        "layer_stride": 0,
+        "block_stride": 4456448,
+        "offset": 0,
+        "host_resident": false
+      },
+      "position": 2,
+      "views": [
+        {
+          "shape": [
+            30,
+            3,
+            24576
+          ],
+          "stride": [
+            2228224,
+            24576,
+            1
+          ],
+          "dtype": "torch.bfloat16",
+          "storage_bytes": 135790592,
+          "offset": 0
+        },
+        {
+          "shape": [
+            30,
+            64,
+            128,
+            128
+          ],
+          "stride": [
+            1114112,
+            16384,
+            128,
+            1
+          ],
+          "dtype": "torch.float32",
+          "storage_bytes": 135790592,
+          "offset": 147456
+        }
+      ]
+    },
+    {
+      "name": "language_model.model.layers.2.self_attn",
+      "group": 4,
+      "descriptor": {
+        "size": 133693440,
+        "layers": [
+          "language_model.model.layers.3.self_attn.attn",
+          "language_model.model.layers.0.self_attn",
+          "language_model.model.layers.1.self_attn",
+          "language_model.model.layers.2.self_attn"
+        ],
+        "layer_stride": 0,
+        "block_stride": 4456448,
+        "offset": 0,
+        "host_resident": false
+      },
+      "position": 3,
+      "views": [
+        {
+          "shape": [
+            30,
+            3,
+            24576
+          ],
+          "stride": [
+            2228224,
+            24576,
+            1
+          ],
+          "dtype": "torch.bfloat16",
+          "storage_bytes": 135790592,
+          "offset": 0
+        },
+        {
+          "shape": [
+            30,
+            64,
+            128,
+            128
+          ],
+          "stride": [
+            1114112,
+            16384,
+            128,
+            1
+          ],
+          "dtype": "torch.float32",
+          "storage_bytes": 135790592,
+          "offset": 147456
+        }
+      ]
+    },
+    {
+      "name": "language_model.model.layers.6.self_attn",
+      "group": 4,
+      "descriptor": {
+        "size": 133693440,
+        "layers": [
+          "language_model.model.layers.7.self_attn.attn",
+          "language_model.model.layers.4.self_attn",
+          "language_model.model.layers.5.self_attn",
+          "language_model.model.layers.6.self_attn"
+        ],
+        "layer_stride": 0,
+        "block_stride": 4456448,
+        "offset": 0,
+        "host_resident": false
+      },
+      "position": 3,
+      "views": [
+        {
+          "shape": [
+            30,
+            3,
+            24576
+          ],
+          "stride": [
+            2228224,
+            24576,
+            1
+          ],
+          "dtype": "torch.bfloat16",
+          "storage_bytes": 135790592,
+          "offset": 0
+        },
+        {
+          "shape": [
+            30,
+            64,
+            128,
+            128
+          ],
+          "stride": [
+            1114112,
+            16384,
+            128,
+            1
+          ],
+          "dtype": "torch.float32",
+          "storage_bytes": 135790592,
+          "offset": 147456
+        }
+      ]
+    },
+    {
+      "name": "language_model.model.layers.10.self_attn",
+      "group": 4,
+      "descriptor": {
+        "size": 133693440,
+        "layers": [
+          "language_model.model.layers.11.self_attn.attn",
+          "language_model.model.layers.8.self_attn",
+          "language_model.model.layers.9.self_attn",
+          "language_model.model.layers.10.self_attn"
+        ],
+        "layer_stride": 0,
+        "block_stride": 4456448,
+        "offset": 0,
+        "host_resident": false
+      },
+      "position": 3,
+      "views": [
+        {
+          "shape": [
+            30,
+            3,
+            24576
+          ],
+          "stride": [
+            2228224,
+            24576,
+            1
+          ],
+          "dtype": "torch.bfloat16",
+          "storage_bytes": 135790592,
+          "offset": 0
+        },
+        {
+          "shape": [
+            30,
+            64,
+            128,
+            128
+          ],
+          "stride": [
+            1114112,
+            16384,
+            128,
+            1
+          ],
+          "dtype": "torch.float32",
+          "storage_bytes": 135790592,
+          "offset": 147456
+        }
+      ]
+    },
+    {
+      "name": "language_model.model.layers.14.self_attn",
+      "group": 4,
+      "descriptor": {
+        "size": 133693440,
+        "layers": [
+          "language_model.model.layers.15.self_attn.attn",
+          "language_model.model.layers.12.self_attn",
+          "language_model.model.layers.13.self_attn",
+          "language_model.model.layers.14.self_attn"
+        ],
+        "layer_stride": 0,
+        "block_stride": 4456448,
+        "offset": 0,
+        "host_resident": false
+      },
+      "position": 3,
+      "views": [
+        {
+          "shape": [
+            30,
+            3,
+            24576
+          ],
+          "stride": [
+            2228224,
+            24576,
+            1
+          ],
+          "dtype": "torch.bfloat16",
+          "storage_bytes": 135790592,
+          "offset": 0
+        },
+        {
+          "shape": [
+            30,
+            64,
+            128,
+            128
+          ],
+          "stride": [
+            1114112,
+            16384,
+            128,
+            1
+          ],
+          "dtype": "torch.float32",
+          "storage_bytes": 135790592,
+          "offset": 147456
+        }
+      ]
+    },
+    {
+      "name": "language_model.model.layers.18.self_attn",
+      "group": 4,
+      "descriptor": {
+        "size": 133693440,
+        "layers": [
+          "language_model.model.layers.19.self_attn.attn",
+          "language_model.model.layers.16.self_attn",
+          "language_model.model.layers.17.self_attn",
+          "language_model.model.layers.18.self_attn"
+        ],
+        "layer_stride": 0,
+        "block_stride": 4456448,
+        "offset": 0,
+        "host_resident": false
+      },
+      "position": 3,
+      "views": [
+        {
+          "shape": [
+            30,
+            3,
+            24576
+          ],
+          "stride": [
+            2228224,
+            24576,
+            1
+          ],
+          "dtype": "torch.bfloat16",
+          "storage_bytes": 135790592,
+          "offset": 0
+        },
+        {
+          "shape": [
+            30,
+            64,
+            128,
+            128
+          ],
+          "stride": [
+            1114112,
+            16384,
+            128,
+            1
+          ],
+          "dtype": "torch.float32",
+          "storage_bytes": 135790592,
+          "offset": 147456
+        }
+      ]
+    },
+    {
+      "name": "language_model.model.layers.22.self_attn",
+      "group": 4,
+      "descriptor": {
+        "size": 133693440,
+        "layers": [
+          "language_model.model.layers.23.self_attn.attn",
+          "language_model.model.layers.20.self_attn",
+          "language_model.model.layers.21.self_attn",
+          "language_model.model.layers.22.self_attn"
+        ],
+        "layer_stride": 0,
+        "block_stride": 4456448,
+        "offset": 0,
+        "host_resident": false
+      },
+      "position": 3,
+      "views": [
+        {
+          "shape": [
+            30,
+            3,
+            24576
+          ],
+          "stride": [
+            2228224,
+            24576,
+            1
+          ],
+          "dtype": "torch.bfloat16",
+          "storage_bytes": 135790592,
+          "offset": 0
+        },
+        {
+          "shape": [
+            30,
+            64,
+            128,
+            128
+          ],
+          "stride": [
+            1114112,
+            16384,
+            128,
+            1
+          ],
+          "dtype": "torch.float32",
+          "storage_bytes": 135790592,
+          "offset": 147456
+        }
+      ]
+    },
+    {
+      "name": "language_model.model.layers.26.self_attn",
+      "group": 4,
+      "descriptor": {
+        "size": 133693440,
+        "layers": [
+          "language_model.model.layers.27.self_attn.attn",
+          "language_model.model.layers.24.self_attn",
+          "language_model.model.layers.25.self_attn",
+          "language_model.model.layers.26.self_attn"
+        ],
+        "layer_stride": 0,
+        "block_stride": 4456448,
+        "offset": 0,
+        "host_resident": false
+      },
+      "position": 3,
+      "views": [
+        {
+          "shape": [
+            30,
+            3,
+            24576
+          ],
+          "stride": [
+            2228224,
+            24576,
+            1
+          ],
+          "dtype": "torch.bfloat16",
+          "storage_bytes": 135790592,
+          "offset": 0
+        },
+        {
+          "shape": [
+            30,
+            64,
+            128,
+            128
+          ],
+          "stride": [
+            1114112,
+            16384,
+            128,
+            1
+          ],
+          "dtype": "torch.float32",
+          "storage_bytes": 135790592,
+          "offset": 147456
+        }
+      ]
+    },
+    {
+      "name": "language_model.model.layers.30.self_attn",
+      "group": 4,
+      "descriptor": {
+        "size": 133693440,
+        "layers": [
+          "language_model.model.layers.31.self_attn.attn",
+          "language_model.model.layers.28.self_attn",
+          "language_model.model.layers.29.self_attn",
+          "language_model.model.layers.30.self_attn"
+        ],
+        "layer_stride": 0,
+        "block_stride": 4456448,
+        "offset": 0,
+        "host_resident": false
+      },
+      "position": 3,
+      "views": [
+        {
+          "shape": [
+            30,
+            3,
+            24576
+          ],
+          "stride": [
+            2228224,
+            24576,
+            1
+          ],
+          "dtype": "torch.bfloat16",
+          "storage_bytes": 135790592,
+          "offset": 0
+        },
+        {
+          "shape": [
+            30,
+            64,
+            128,
+            128
+          ],
+          "stride": [
+            1114112,
+            16384,
+            128,
+            1
+          ],
+          "dtype": "torch.float32",
+          "storage_bytes": 135790592,
+          "offset": 147456
+        }
+      ]
+    },
+    {
+      "name": "language_model.model.layers.34.self_attn",
+      "group": 4,
+      "descriptor": {
+        "size": 133693440,
+        "layers": [
+          "language_model.model.layers.35.self_attn.attn",
+          "language_model.model.layers.32.self_attn",
+          "language_model.model.layers.33.self_attn",
+          "language_model.model.layers.34.self_attn"
+        ],
+        "layer_stride": 0,
+        "block_stride": 4456448,
+        "offset": 0,
+        "host_resident": false
+      },
+      "position": 3,
+      "views": [
+        {
+          "shape": [
+            30,
+            3,
+            24576
+          ],
+          "stride": [
+            2228224,
+            24576,
+            1
+          ],
+          "dtype": "torch.bfloat16",
+          "storage_bytes": 135790592,
+          "offset": 0
+        },
+        {
+          "shape": [
+            30,
+            64,
+            128,
+            128
+          ],
+          "stride": [
+            1114112,
+            16384,
+            128,
+            1
+          ],
+          "dtype": "torch.float32",
+          "storage_bytes": 135790592,
+          "offset": 147456
+        }
+      ]
+    },
+    {
+      "name": "language_model.model.layers.38.self_attn",
+      "group": 4,
+      "descriptor": {
+        "size": 133693440,
+        "layers": [
+          "language_model.model.layers.39.self_attn.attn",
+          "language_model.model.layers.36.self_attn",
+          "language_model.model.layers.37.self_attn",
+          "language_model.model.layers.38.self_attn"
+        ],
+        "layer_stride": 0,
+        "block_stride": 4456448,
+        "offset": 0,
+        "host_resident": false
+      },
+      "position": 3,
+      "views": [
+        {
+          "shape": [
+            30,
+            3,
+            24576
+          ],
+          "stride": [
+            2228224,
+            24576,
+            1
+          ],
+          "dtype": "torch.bfloat16",
+          "storage_bytes": 135790592,
+          "offset": 0
+        },
+        {
+          "shape": [
+            30,
+            64,
+            128,
+            128
+          ],
+          "stride": [
+            1114112,
+            16384,
+            128,
+            1
+          ],
+          "dtype": "torch.float32",
+          "storage_bytes": 135790592,
+          "offset": 147456
+        }
+      ]
+    },
+    {
+      "name": "language_model.model.layers.42.self_attn",
+      "group": 4,
+      "descriptor": {
+        "size": 133693440,
+        "layers": [
+          "language_model.model.layers.43.self_attn.attn",
+          "language_model.model.layers.40.self_attn",
+          "language_model.model.layers.41.self_attn",
+          "language_model.model.layers.42.self_attn"
+        ],
+        "layer_stride": 0,
+        "block_stride": 4456448,
+        "offset": 0,
+        "host_resident": false
+      },
+      "position": 3,
+      "views": [
+        {
+          "shape": [
+            30,
+            3,
+            24576
+          ],
+          "stride": [
+            2228224,
+            24576,
+            1
+          ],
+          "dtype": "torch.bfloat16",
+          "storage_bytes": 135790592,
+          "offset": 0
+        },
+        {
+          "shape": [
+            30,
+            64,
+            128,
+            128
+          ],
+          "stride": [
+            1114112,
+            16384,
+            128,
+            1
+          ],
+          "dtype": "torch.float32",
+          "storage_bytes": 135790592,
+          "offset": 147456
+        }
+      ]
+    }
+  ]
+}
