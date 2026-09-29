@@ -1,8 +1,8 @@
 # UCMHybridConnector v1 Pipeline 交付（2026-09-29）
 
-## 2026-09-29 r2 布局修订
+## 2026-09-29 r2/r3 布局修订
 
-当前版本改为每个原生 group 独立 key/记录，专用槽位策略见
+当前r3版本：CPU/CUDA的FA+State采用验证边界的完整原生page，Ascend保留State语义槽位padding。每个原生 group 独立 key/记录，专用槽位策略见
 [布局与生命周期清单](connector-hybrid-r2-layout-and-lifecycle.md)。旧 r1 的 FA/State 合并、尾部补行已取消；下文第六轮结果仅作为 r1 历史证据，不能当作 r2 runtime PASS。
 
 ## 基线与状态
@@ -52,7 +52,7 @@ GLM Shared Indexer、MiniMax-M3、FA+State 和普通 attention 分别选择语�
 - 沿用 `RankConsistencyManager` 的提交、等待、失败上报和旧事件清理。
 - Cache 的空地址槽位跳过能力已存在于 native copy 实现，本轮未修改。
 - Cache 完成、Posix 发布、跨 rank 数据完整性仍是原 v1 的能力边界；没有引入显式 commit、全 rank 发布事务或新的 store 服务。
-- 模板文件放入单独的 `hybrid-v1-r2-…` namespace，隔离 bulk/layerwise、模型配置、包版本、设备和 cache dtype 等信息；不要将旧 Direct/HLA/v2 文件直接搬入这个目录。
+- 模板文件放入单独的 `hybrid-v1-r3-…` namespace，隔离 bulk/layerwise、模型配置、包版本、设备和 cache dtype 等信息；不要将旧 Direct/HLA/v2 文件直接搬入这个目录。
 - TP 各 rank 分别产生物理 key，沿用 rank0 lookup + 原 consistency manager 的策略；不假设所有 rank 共用一个文件。
 - 为防不同 schema 共享 host buffer，Hybrid 的默认 `share_buffer_enable` 为 false，各 rank 的 unique ID 隔离。若显式启用共享 buffer，也不会把不同 rank 的 buffer 合并。`cache_buffer_capacity_gb` 可按需调整，一般每私有 buffer 不超过 128 GiB，须另核算多 rank 总内存。
 - GC 需要真实的对齐后 block_size，由 worker 按旧机制发布；若启动顺序不能读到它，须配置准确值，首版不根据 head_size 猜测 Mamba/indexer 的大小。

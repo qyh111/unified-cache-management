@@ -311,6 +311,126 @@ class LayoutTests(unittest.TestCase):
                     16 if layerwise else 0,
                 )
 
+    def test_cpu_cuda_native_pages_copy_existing_engine_tail_without_slots(self):
+        for device in ("cpu", "cuda"):
+            for layerwise in (False, True):
+                for interleaved in (False, True):
+                    with self.subTest(
+                        device=device, layerwise=layerwise, interleaved=interleaved
+                    ):
+                        groups, views, descriptors, allocations = [], {}, [], []
+                        for gid in range(4):
+                            names = [
+                                f"model.layers.{gid + 4*i}.cache" for i in range(2)
+                            ]
+                            raw = FullAttentionSpec() if gid == 0 else MambaSpec()
+                            raw.page_size_bytes = 32
+                            groups.append((names, raw))
+                            if interleaved:
+                                backing = (
+                                    (np.arange(5 * 2 * 32, dtype=np.uint16) + gid * 17)
+                                    .astype(np.uint8)
+                                    .reshape(5, 2, 32)
+                                )
+                                descriptors.append(
+                                    NS(
+                                        layers=names,
+                                        offset=0,
+                                        layer_stride=32,
+                                        block_stride=64,
+                                    )
+                                )
+                                for i, name in enumerate(names):
+                                    views[name] = Tensor(
+                                        backing[:, i, : 32 if gid == 0 else 19]
+                                    )
+                                allocations.append((gid, backing))
+                            else:
+                                for i, name in enumerate(names):
+                                    backing = (
+                                        (
+                                            np.arange(5 * 32, dtype=np.uint16)
+                                            + gid * 17
+                                            + i * 7
+                                        )
+                                        .astype(np.uint8)
+                                        .reshape(5, 32)
+                                    )
+                                    views[name] = Tensor(
+                                        backing[:, : 32 if gid == 0 else 19]
+                                    )
+                                    allocations.append((gid, backing))
+                        spec, _ = cache_spec(groups, device=device, tensors=descriptors)
+                        layout = HybridStoreLayout(spec, views, layerwise=layerwise)
+                        self.assertEqual(layout.policy, "native_state_page")
+                        self.assertEqual(
+                            layout.tensor_size_list, [32] if layerwise else [32, 32]
+                        )
+                        self.assertTrue(
+                            all(
+                                g["padding_bytes"] == 0
+                                for g in layout.padding_report()["groups"].values()
+                            )
+                        )
+                        store = ByteStore(layout)
+                        for gid in range(4):
+                            src = plan(
+                                "FA" if gid == 0 else "State",
+                                [[1]],
+                                keys=(bytes([gid]) * 16,),
+                                group_id=gid,
+                            )
+                            for row in range(layout.row_count):
+                                store.dump(layout.resolve(src, row))
+                        expected = []
+                        for _, backing in allocations:
+                            reference = backing.copy()
+                            reference[3] = reference[
+                                1
+                            ]  # Entire engine page, including the existing tail.
+                            backing[3] = 0xEE
+                            expected.append((backing, reference))
+                        for gid in range(4):
+                            dst = plan(
+                                "FA" if gid == 0 else "State",
+                                [[3]],
+                                keys=(bytes([gid]) * 16,),
+                                group_id=gid,
+                            )
+                            for row in range(layout.row_count):
+                                store.load(layout.resolve(dst, row))
+                        for actual, reference in expected:
+                            np.testing.assert_array_equal(actual, reference)
+
+    def test_native_page_rejects_unproven_or_out_of_bounds_expansion(self):
+        fa, state = "model.layers.0.attn", "model.layers.1.state"
+        a, b = FullAttentionSpec(), MambaSpec()
+        a.page_size_bytes = b.page_size_bytes = 32
+        spec, _ = cache_spec([([fa], a), ([state], b)], device="cpu")
+        attention = Tensor(np.zeros((5, 32), dtype=np.uint8))
+        # The view fits but the last full page does not.
+        short = np.zeros(4 * 32 + 19, dtype=np.uint8)
+        tensor = Tensor(
+            np.ndarray((5, 19), dtype=np.uint8, buffer=short, strides=(32, 1))
+        )
+        with self.assertRaisesRegex(ValueError, "allocation"):
+            HybridStoreLayout(spec, {fa: attention, state: tensor}, layerwise=True)
+        backing = np.zeros((5, 33), dtype=np.uint8)
+        with self.assertRaisesRegex(ValueError, "descriptor"):
+            HybridStoreLayout(
+                spec, {fa: attention, state: Tensor(backing[:, 1:20])}, layerwise=True
+            )
+        with self.assertRaisesRegex(ValueError, "one registered"):
+            HybridStoreLayout(
+                spec, {fa: attention, state: (view(3), view(16))}, layerwise=True
+            )
+        b.page_size_bytes = 40
+        state_tensor = Tensor(np.zeros((5, 40), dtype=np.uint8))
+        with self.assertRaisesRegex(ValueError, "equal page"):
+            HybridStoreLayout(
+                spec, {fa: attention, state: state_tensor}, layerwise=True
+            )
+
     def test_model_check_with_real_hybrid_layout(self):
         from unittest.mock import patch
 

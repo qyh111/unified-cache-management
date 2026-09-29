@@ -2,13 +2,33 @@
 
 2026-09-29。r2 已完成首版代码和本地测试，目标环境 Model-check 尚未运行。旧六轮仅覆盖 r1。
 
+## r3 平台修正（2026-09-29）
+
+State策略现在按平台分流：Ascend使用conv/data0/data1语义槽位，CPU/CUDA使用`native_state_page`，每个layer一个原生完整page槽。CPU/CUDA不强拆conv/state或packed K/V，也不添加Ascend的ghost槽。仍保留每个原生group独立key。
+
+CPU/CUDA整页路径要求：
+
+- FA/State各层显式声明相同的`page_size_bytes`，注册单个page view，每物理block一行。
+- 有效view在page内且内部dense，block stride不小于page；完整范围包括最后一个block必须在allocation中。
+- 无descriptor时，要求view起点等于allocation起点且block stride等于page。
+- 有descriptor时，验证offset、layer位置、block stride以及层间范围不重叠；支持验证过的block-first跨层stride。
+- 分离conv/state元组、缺少页大小、页大小不一致、无法证明整页边界等明确拒绝；不会套用Ascend padding兜底。
+
+原生page可能包含引擎已有的未使用尾部，本路径原样搬运这些字节；诊断的payload_bytes表示实际传输量，包含原生page尾部。padding_bytes=0指connector没有新增空槽，不表示引擎没有预留空间。
+
+namespace升级为`hybrid-v1-r3`，隔离此前CPU/CUDA语义槽位格式。29项Hybrid本地测试通过，新增CPU/CUDA × bulk/layerwise × 连续/跨层page的8种恢复组合，以及越界、无法证明的起点、元组输入和page不等的拒绝测试。两种平台标签由NumPy离线模拟，不能据此声称CUDA硬件或实际CPU引擎runtime通过；Ascend既有离线矩阵仍通过。
+
+- [ ] 远端从r3提交检出，先CPU Qwen TP2 bulk/layerwise确认`layout_policy=native_state_page`、四group、无conv/data0/data1槽，所有目标page恢复比较通过。
+- [ ] NPU代表用例确认仍走State语义槽位，独立存储目录，不能复用r1/r2缓存。
+- [ ] CUDA实际注册view/descriptor另做runtime验收，不从CPU外推。
+
 ## 布局与 key
 
 - [x] 每个原生 group 独立路由、key、block table 和存储记录。
 - [x] 16 字节 key：前14字节 prefix hash + 2字节 tag；tag 为 type(2)、group(4)、tp(4)、pp(4)、reserved(2)。group_id 限0–15，超出拒绝；实际 TP 隔离沿用旧 RequestHasher/rank consistency。
 - [x] namespace 升级 hybrid-v1-r2；纳入有序 group/layer/spec 身份，排除设备地址和 allocation 容量。r1 缓存不可复用。
 - [x] FA 多 group 取共同前缀；State 多 group 求共同边界，不能仅取各组最近命中的最小值。
-- [x] State 策略：conv、data0、data1；FA 为 ghost/K/V，State 为 conv/state/ghost。packed FA 拆为两个字节范围，不声称每范围一定是 K/V；combined State 按原生 shapes/dtypes 拆分。
+- [x] Ascend State 策略：conv、data0、data1；FA 为 ghost/K/V，State 为 conv/state/ghost。packed FA 拆为两个字节范围，不声称每范围一定是 K/V；combined State 按原生 shapes/dtypes 拆分。
 - [x] Shared Indexer 策略：attention/index/scale；mixed BF16/LI C8 增 index_tail，拆分保留 stride；Shared 层补对应空槽。全 C8 不预留 BF16 尾段。
 - [x] MiniMax-M3 识别 index_cache 角色，dense 层 Indexer 槽为空；普通 attention 要求组件长度一致。
 - [x] 各 group 本地层数必须相同，不等层数明确拒绝，不隐式补大量空行。

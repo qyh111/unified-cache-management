@@ -151,7 +151,7 @@ class UCMHybridConnector(UCMDirectConnector, SupportsHMA):
             json.dumps(identity, sort_keys=True, default=str).encode()
         ).hexdigest()[:16]
         self._namespace = (
-            f"hybrid-v1-r2-{digest}-b{self.block_size}-lw{int(self.use_layerwise)}"
+            f"hybrid-v1-r3-{digest}-b{self.block_size}-lw{int(self.use_layerwise)}"
         )
         self.kv_cache_layout = None
         self._load_tasks = {}

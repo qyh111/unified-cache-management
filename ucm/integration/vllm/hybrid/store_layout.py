@@ -11,6 +11,7 @@ import numpy as np
 
 from .layout import build_group_layouts
 from .layout.policies import compile_policy
+from .layout.pages import build_page_group_layouts
 
 
 def validate_spec(spec):
@@ -67,7 +68,12 @@ class HybridStoreLayout:
         validate_spec(spec)
         self.spec = spec
         self.layerwise = layerwise
-        self.group_layouts = build_group_layouts(spec, kv_caches)
+        native_pages = bool(spec.state_groups) and spec.device_type in ("cpu", "cuda")
+        self.group_layouts = (
+            build_page_group_layouts(spec, kv_caches)
+            if native_pages
+            else build_group_layouts(spec, kv_caches)
+        )
         self.routes = {
             groups[0].group_id: groups for _, groups in spec.dispatch_routes()
         }
@@ -120,6 +126,15 @@ class HybridStoreLayout:
             names_by_group = {
                 gid: [frozenset().union(*names)]
                 for gid, names in names_by_group.items()
+            }
+        elif native_pages:
+            self.policy, regions = "native_state_page", ("page",)
+            mapped = {
+                gid: [
+                    {"page": tuple(s for _, view in entries for s in view.segments)}
+                    for _, entries in rows
+                ]
+                for gid, rows in layer_rows.items()
             }
         else:
             self.policy, regions, mapped = compile_policy(
