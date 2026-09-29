@@ -59,6 +59,7 @@ class UCMKVCacheGroupInfo:
     # nothing); the parser stamps it once the cache block size is known.
     tail_blocks: int = 0
     is_eagle_group: bool = False
+    transient: bool = False
 
     @property
     def num_layers(self) -> int:
@@ -95,6 +96,11 @@ class UCMKVCacheSpec:
     scheduler_block_size: int
     ucm_cache_block_size: int
     device_type: str
+    layout_policy: str = "default"
+
+    @property
+    def persistent_groups(self):
+        return tuple(group for group in self.groups if not group.transient)
 
     @property
     def alignment_block_size(self) -> int:
@@ -111,27 +117,33 @@ class UCMKVCacheSpec:
 
     @property
     def attn_groups(self) -> tuple[UCMKVCacheGroupInfo, ...]:
-        return tuple(group for group in self.groups if group.is_attention)
+        return tuple(group for group in self.persistent_groups if group.is_attention)
 
     @property
     def state_groups(self) -> tuple[UCMKVCacheGroupInfo, ...]:
-        return tuple(group for group in self.groups if group.is_state_snapshot)
+        return tuple(
+            group for group in self.persistent_groups if group.is_state_snapshot
+        )
 
     @property
     def sw_groups(self) -> tuple[UCMKVCacheGroupInfo, ...]:
-        return tuple(group for group in self.groups if group.is_sliding_window)
+        return tuple(
+            group for group in self.persistent_groups if group.is_sliding_window
+        )
 
     @property
     def fa_groups(self) -> tuple[UCMKVCacheGroupInfo, ...]:
         return tuple(
             group
-            for group in self.groups
+            for group in self.persistent_groups
             if group.is_attention and not group.is_sliding_window
         )
 
     @property
     def wa_groups(self) -> tuple[UCMKVCacheGroupInfo, ...]:
-        return tuple(group for group in self.groups if group.is_sliding_window)
+        return tuple(
+            group for group in self.persistent_groups if group.is_sliding_window
+        )
 
     def dispatch_routes(
         self,
@@ -296,6 +308,7 @@ def parse_kv_cache_config(
     device_type: str = "npu",
     attention_tokens_per_state: Mapping[int, int] | None = None,
     num_hidden_layers: int | None = None,
+    layout_policy: str = "default",
 ) -> UCMKVCacheSpec:
     """Describe logical groups and per-layer storage from KVCacheConfig.
 
@@ -306,6 +319,11 @@ def parse_kv_cache_config(
     This mapping applies to full attention, never compressor state tensors.
     """
 
+    if layout_policy not in ("default", "glm53"):
+        raise ValueError("Unknown Hybrid layout policy")
+    glm53 = layout_policy == "glm53"
+    if glm53 and scheduler_block_size % 4:
+        raise ValueError("GLM5.3 restore boundaries must be pool-aligned")
     attention_tokens_per_state = attention_tokens_per_state or {}
 
     # 0.29 kv_cache_tensors carry a layers placement per tensor; 0.26
@@ -329,14 +347,31 @@ def parse_kv_cache_config(
         ]
     ] = []
     layer_indices: dict[str, int] = {}
-    for raw_group in raw_groups:
+    transient_ids = set()
+    for native_id, raw_group in enumerate(raw_groups):
         concrete = _concrete_specs(raw_group)
         layer_indices.update(
             (name, _layer_index(name, device_type, num_hidden_layers))
             for name, _ in concrete
         )
-        kinds = _classify(raw_group, concrete)
-        if not kinds.isdisjoint(_SLIDING_KINDS):
+        tail_types = {"KpoolTailSpec", "AscendIndexerKPoolTailSpec"}
+        is_tail = (
+            glm53
+            and concrete
+            and all(
+                type(item).__name__ in tail_types
+                and name.endswith(".indexer.tail_cache")
+                for name, item in concrete
+            )
+        )
+        if is_tail:
+            if {int(item.block_size) for _, item in concrete} != {4}:
+                raise ValueError("Unsupported GLM5.3 tail pool size")
+            transient_ids.add(native_id)
+            kinds = frozenset((KVCacheSpecKind.SLIDING_WINDOW,))
+        else:
+            kinds = _classify(raw_group, concrete)
+        if not is_tail and not kinds.isdisjoint(_SLIDING_KINDS):
             raise ValueError(
                 "FA/SWA belongs to UCMFAWAConnector, not UCMHybridConnector"
             )
@@ -381,7 +416,7 @@ def parse_kv_cache_config(
     groups: list[UCMKVCacheGroupInfo] = []
     fa_token_blocks: list[int] = []
     attention_tokens_per_state_by_layer: dict[int, int] = {}
-    if has_compression:
+    if has_compression and not glm53:
         for _, concrete, kinds in classified:
             if KVCacheSpecKind.MAMBA in kinds or not kinds.isdisjoint(_SLIDING_KINDS):
                 continue
@@ -428,9 +463,15 @@ def parse_kv_cache_config(
             # states; C128A: 256/128=2; uncompressed specs keep the block).
             logical = int(getattr(spec, "block_size"))
             ratio = _spec_tokens_per_state(spec)
-            if has_compression and kinds.isdisjoint(_SLIDING_KINDS):
+            if has_compression and not glm53 and kinds.isdisjoint(_SLIDING_KINDS):
                 ratio = attention_tokens_per_state_by_layer[layer_indices[name]]
-            if device_type == "npu":
+            if glm53:
+                # Scheduler representative specs lose the main/indexer ratio.
+                ratio = 4 if name.endswith(".indexer.k_cache") else 1
+                if logical % ratio:
+                    raise ValueError("GLM5.3 indexer requires pool-aligned blocks")
+                storage_block_size = logical // ratio
+            elif device_type == "npu":
                 # Ascend's replicated DCP indexer allocates consecutive kernel
                 # rows per logical block, as declared by its native cache spec.
                 storage_block_size = logical * int(
@@ -451,7 +492,9 @@ def parse_kv_cache_config(
                 )
             )
         tail_tokens: int | None = None
-        if not kinds.isdisjoint(_SLIDING_KINDS):
+        if group_id in transient_ids:
+            tail_tokens = 0
+        elif not kinds.isdisjoint(_SLIDING_KINDS):
             # What a sliding group re-stores at each hash boundary -- not
             # necessarily the whole window: swa_cache keeps the full
             # window, a compressor state cache keeps window minus its
@@ -499,6 +542,7 @@ def parse_kv_cache_config(
                 token_block_size=token_block_size,
                 kinds=kinds,
                 tail_tokens=tail_tokens,
+                transient=group_id in transient_ids,
                 is_eagle_group=any(
                     "eagle" in layer.layer_name.lower() for layer in layers
                 ),
@@ -515,7 +559,7 @@ def parse_kv_cache_config(
         mismatched_groups = {
             group.group_id: group.token_block_size
             for group in groups
-            if group.token_block_size != scheduler_block_size
+            if not group.transient and group.token_block_size != scheduler_block_size
         }
         if mismatched_groups:
             raise ValueError(
@@ -591,4 +635,5 @@ def parse_kv_cache_config(
         scheduler_block_size=scheduler_block_size,
         ucm_cache_block_size=selected_block,
         device_type=device_type,
+        layout_policy=layout_policy,
     )

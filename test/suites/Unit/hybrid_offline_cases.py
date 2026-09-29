@@ -1088,5 +1088,120 @@ class LifecycleTests(unittest.TestCase):
         self.assertNotEqual(c._store_keys(keys), list(keys))
 
 
+class Glm53IntegrationTests(unittest.TestCase):
+    def make_glm(self, backend):
+        from test_glm53_layout import fixture, Tensor as CapturedTensor
+
+        capture = fixture(backend)
+        raw_groups, caches = {}, {}
+        descriptors = {}
+        for record in capture["tensors"]:
+            gid, name = record["group"], record["name"]
+            spec_name = (
+                "KpoolTailSpec"
+                if gid == 1
+                else "MambaSpec" if gid >= 2 else "MLAAttentionSpec"
+            )
+            concrete = type(spec_name, (), {})()
+            concrete.block_size = 4 if gid == 1 else 4352
+            concrete.page_size_bytes = record["descriptor"]["block_stride"]
+            concrete.tokens_per_state = 4 if name.endswith(".indexer.k_cache") else 1
+            concrete.mamba_cache_mode = "align"
+            raw_groups.setdefault(gid, {})[name] = concrete
+            caches[name] = tuple(CapturedTensor(v) for v in record["views"])
+            descriptors[tuple(record["descriptor"]["layers"])] = NS(
+                **record["descriptor"]
+            )
+        groups = [
+            NS(
+                layer_names=list(items),
+                kv_cache_spec=NS(
+                    block_size=4 if gid == 1 else 4352, kv_cache_specs=items
+                ),
+            )
+            for gid, items in sorted(raw_groups.items())
+        ]
+        config = NS(
+            num_blocks=capture["num_blocks"],
+            kv_cache_groups=groups,
+            kv_cache_tensors=list(descriptors.values()),
+        )
+        spec = parse_kv_cache_config(
+            config,
+            scheduler_block_size=4352,
+            device_type=backend,
+            layout_policy="glm53",
+        )
+        return spec, caches
+
+    def test_glm53_store_compilation(self):
+        for backend, group_count, row_count, index_bytes in (
+            ("cuda", 6, 11, 143616),
+            ("npu", 5, 12, 278528),
+        ):
+            spec, caches = self.make_glm(backend)
+            self.assertEqual(len(spec.groups), group_count)
+            self.assertTrue(spec.groups[1].transient)
+            self.assertEqual(
+                [g.group_id for g in spec.persistent_groups],
+                [0, *range(2, group_count)],
+            )
+            self.assertFalse(spec.sw_groups)
+            for layerwise in (True, False):
+                with self.subTest(backend=backend, layerwise=layerwise):
+                    layout = HybridStoreLayout(spec, caches, layerwise=layerwise)
+                    self.assertEqual(layout.row_count, row_count if layerwise else 1)
+                    self.assertEqual(
+                        layout.block_size, row_count * (4456448 + index_bytes)
+                    )
+                    self.assertNotIn(1, layout.routes)
+                    for gid, rows in layout.rows.items():
+                        kind = "FA" if gid == 0 else "State"
+                        plan = UCMGroupDispatchPlan(
+                            kind, (b"a", b"b"), 0, 8704, (np.array([1, 2]),), gid
+                        )
+                        for i, row in enumerate(rows):
+                            transfer = layout.resolve(plan, i)
+                            self.assertEqual(
+                                transfer.ptrs.shape, (2, len(layout.sizes))
+                            )
+                            ghost = sorted(
+                                set(range(len(layout.sizes))) - set(row.columns)
+                            )
+                            self.assertFalse(transfer.ptrs[:, ghost].any())
+                            if len(row.columns):
+                                np.testing.assert_array_equal(
+                                    transfer.ptrs[1, row.columns]
+                                    - transfer.ptrs[0, row.columns],
+                                    row.strides,
+                                )
+                            if gid and layerwise:
+                                self.assertFalse(
+                                    transfer.ptrs[
+                                        :,
+                                        [
+                                            j
+                                            for j, r in enumerate(layout.slot_roles)
+                                            if r == "index"
+                                        ],
+                                    ].any()
+                                )
+
+    def test_glm53_keeps_native_tables_and_old_guards(self):
+        spec, caches = self.make_glm("cuda")
+        from ucm.integration.vllm.hybrid.scheduler import RequestState
+
+        dispatcher = UCMDispatcher(spec, None, lambda x: b"x", b"seed")
+        dispatcher.requests["r"] = RequestState(
+            group_vllm_block_ids=tuple([] for _ in spec.groups)
+        )
+        dispatcher.update_blocks("r", ([1], [2], [3], [4], [5], [6]), append=False)
+        self.assertEqual(dispatcher.requests["r"].group_vllm_block_ids[2], [3])
+        self.assertEqual(
+            [groups[0].group_id for _, groups in spec.dispatch_routes()],
+            [0, 2, 3, 4, 5],
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -11,20 +11,22 @@ import numpy as np
 
 from .layout import build_group_layouts
 from .layout.policies import compile_policy
-from .layout.pages import build_page_group_layouts
+from .layout.pages import build_page_group_layouts, PageGroupLayout
+from .layout.glm53 import build_tiled_page_view, compile_glm53_policy
+from .layout.view import build_layer_view
 
 
 def validate_spec(spec):
     if spec.sw_groups:
         raise ValueError("FA/SWA belongs to UCMFAWAConnector, not UCMHybridConnector")
-    sizes = {group.token_block_size for group in spec.groups}
+    sizes = {group.token_block_size for group in spec.persistent_groups}
     if len(sizes) != 1 or spec.ucm_cache_block_size not in sizes:
         raise ValueError(
             "Hybrid requires equal group token_block_size and UCM block size"
         )
     if not spec.fa_groups:
         raise ValueError("Hybrid requires a full-attention group")
-    if any(not group.layers for group in spec.groups):
+    if any(not group.layers for group in spec.persistent_groups):
         raise ValueError(
             "Hybrid does not yet support empty local groups / PP projections"
         )
@@ -68,12 +70,43 @@ class HybridStoreLayout:
         validate_spec(spec)
         self.spec = spec
         self.layerwise = layerwise
+        glm53 = spec.layout_policy == "glm53"
         native_pages = bool(spec.state_groups) and spec.device_type in ("cpu", "cuda")
-        self.group_layouts = (
-            build_page_group_layouts(spec, kv_caches)
-            if native_pages
-            else build_group_layouts(spec, kv_caches)
-        )
+        if glm53:
+            self.group_layouts = {}
+            for group in spec.persistent_groups:
+                views = {}
+                for layer in group.layers:
+                    value = kv_caches[layer.layer_name]
+                    tensors = (
+                        tuple(value) if isinstance(value, (tuple, list)) else (value,)
+                    )
+                    if native_pages:
+                        if len(tensors) != 1:
+                            raise ValueError("CUDA GLM5.3 requires one registered page")
+                        views[layer.layer_name] = build_tiled_page_view(
+                            tensors[0], layer
+                        )
+                    else:
+                        # Zero-width MLA rope is a registered placeholder, not IO.
+                        tensors = tuple(
+                            t for t in tensors if all(int(x) > 0 for x in t.shape)
+                        )
+                        if not tensors:
+                            raise ValueError("GLM5.3 layer has no physical payload")
+                        views[layer.layer_name] = build_layer_view(
+                            tensors,
+                            layer,
+                            state_snapshot=group.is_state_snapshot,
+                            device_type=spec.device_type,
+                        )
+                self.group_layouts[group.group_id] = PageGroupLayout(views)
+        else:
+            self.group_layouts = (
+                build_page_group_layouts(spec, kv_caches)
+                if native_pages
+                else build_group_layouts(spec, kv_caches)
+            )
         self.routes = {
             groups[0].group_id: groups for _, groups in spec.dispatch_routes()
         }
@@ -102,12 +135,21 @@ class HybridStoreLayout:
                     frozenset(layer.layer_name for layer, _ in entries)
                 )
         counts = {len(rows) for rows in layer_rows.values()}
-        if len(counts) != 1:
+        if len(counts) != 1 and not glm53:
             raise ValueError(
                 "Single-store groups require equal local layer counts; no implicit ghost rows"
             )
         # Single-group bulk retains compact real segments, without per-layer padding.
-        if not layerwise and len(self.routes) == 1:
+        if glm53:
+            self.policy, regions, mapped = compile_glm53_policy(layer_rows)
+            row_count = max(counts)
+            for gid, rows in mapped.items():
+                missing = row_count - len(rows)
+                rows.extend({} for _ in range(missing))
+                layer_ids[gid].extend([None] * missing)
+                names_by_group[gid].extend(frozenset() for _ in range(missing))
+            counts = {row_count}
+        elif not layerwise and len(self.routes) == 1:
             self.policy, regions = "compact", ("payload",)
             mapped = {
                 gid: [

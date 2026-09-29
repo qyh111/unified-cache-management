@@ -101,11 +101,18 @@ class UCMHybridConnector(UCMDirectConnector, SupportsHMA):
                 for group in kv_cache_config.kv_cache_groups
             )
         )
+        glm53 = getattr(text_config, "model_type", None) in (
+            "glm5_next",
+            "glm5_next_text",
+        )
+        if glm53 and getattr(vllm_config, "speculative_config", None) is not None:
+            raise ValueError("GLM5.3 Hybrid does not yet support speculative decoding")
         self.spec = parse_kv_cache_config(
             kv_cache_config,
             scheduler_block_size=scheduler_block,
             device_type=current_platform.device_type,
             num_hidden_layers=int(text_config.num_hidden_layers),
+            layout_policy="glm53" if glm53 else "default",
         )
         validate_spec(self.spec)
         configured_block = self.launch_config.get(

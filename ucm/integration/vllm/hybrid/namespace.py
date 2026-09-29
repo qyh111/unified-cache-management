@@ -38,6 +38,9 @@ def storage_namespace(
             for group in spec.groups
         ],
     }
+    if spec.layout_policy != "default":
+        identity["layout_policy"] = spec.layout_policy + "-r1"
+        identity["transient_groups"] = [g.group_id for g in spec.groups if g.transient]
     digest = hashlib.sha256(
         json.dumps(identity, sort_keys=True, default=str).encode()
     ).hexdigest()[:16]
