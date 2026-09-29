@@ -38,6 +38,7 @@ from typing import Any
 import torch
 
 from .config import load_config, cpu_gqa_block_sizes
+from .compute_mocks import glm53_fp8_layout_mock
 from .common import (
     CacheFixture,
     UnsupportedEnvironment,
@@ -469,6 +470,7 @@ def make_model(vllm_config: Any) -> tuple[Any, Any]:
         torch.set_default_dtype(vllm_config.model_config.dtype)
         vllm_config.compilation_config.static_forward_context.clear()
         with (
+            glm53_fp8_layout_mock(vllm_config),
             current_vllm_config_context(vllm_config),
             no_real_device_move_from_meta_context(_factory_kwargs_redirect_to_meta),
             torch.device("meta"),
