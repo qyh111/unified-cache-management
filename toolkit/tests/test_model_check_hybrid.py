@@ -31,6 +31,7 @@ def helper(name):
     ns = dict(
         Any=object,
         CacheFixture=object,
+        ScheduledRequestFixture=object,
         SimpleNamespace=NS,
         is_hybrid_worker=hybrid.is_hybrid_worker,
         HYBRID_ENV=HYBRID_ENV,
@@ -52,6 +53,23 @@ class Offsets:
 
 
 class LayoutDiagnosticsTest(unittest.TestCase):
+    def test_target_skips_native_hbm_lookup_before_scheduling(self):
+        from contextlib import nullcontext
+        fn = helper("schedule_target")
+        request = NS(skip_reading_prefix_cache=False)
+        seen = []
+        fn.__globals__.update(
+            make_vllm_request=lambda *args: request,
+            current_vllm_config_context=lambda config: nullcontext(),
+        )
+        def schedule():
+            seen.append(request.skip_reading_prefix_cache)
+            raise RuntimeError("stop after native scheduler entry")
+        scheduler = NS(add_request=lambda req: None, schedule=schedule)
+        with self.assertRaisesRegex(RuntimeError, "native scheduler entry"):
+            fn(NS(vllm_config=object()), scheduler, "target", [1, 2], 1, 1)
+        self.assertEqual(seen, [True])
+
     def test_ascend_multi_group_does_not_import_single_group_shim(self):
         tree = ast.parse((ROOT / "ucm_toolkit/tools/model_check/ascend.py").read_text())
         node = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "patch_groups")

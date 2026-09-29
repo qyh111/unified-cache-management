@@ -1723,6 +1723,10 @@ def schedule_target(
     """Schedule the target request after dump to obtain UCM load metadata."""
 
     request = make_vllm_request(request_id, prompt_token_ids, hash_block_size)
+    # Keep native allocation/caching enabled, but make this request exercise
+    # external UCM lookup instead of reusing the source's live HBM blocks.
+    if hasattr(request, "skip_reading_prefix_cache"):
+        request.skip_reading_prefix_cache = True
     with current_vllm_config_context(fixture.vllm_config):
         scheduler.add_request(request)
         scheduler_output = scheduler.schedule()
