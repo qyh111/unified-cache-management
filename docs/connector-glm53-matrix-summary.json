@@ -1,0 +1,135 @@
+[
+  {
+    "case": "cpu-tp1-layerwise",
+    "exit": 0,
+    "ranks": {
+      "0": "78"
+    },
+    "block_sizes": [
+      "4352"
+    ]
+  },
+  {
+    "case": "cpu-tp1-no-layerwise",
+    "exit": 0,
+    "ranks": {
+      "0": "78"
+    },
+    "block_sizes": [
+      "4352"
+    ]
+  },
+  {
+    "case": "cpu-tp2-layerwise",
+    "exit": 0,
+    "ranks": {
+      "0": "144",
+      "1": "144"
+    },
+    "block_sizes": [
+      "2176"
+    ]
+  },
+  {
+    "case": "cpu-tp2-no-layerwise",
+    "exit": 0,
+    "ranks": {
+      "1": "144",
+      "0": "144"
+    },
+    "block_sizes": [
+      "2176"
+    ]
+  },
+  {
+    "case": "cpu-tp4-layerwise",
+    "exit": 0,
+    "ranks": {
+      "1": "254",
+      "3": "254",
+      "0": "254",
+      "2": "254"
+    },
+    "block_sizes": [
+      "1152"
+    ]
+  },
+  {
+    "case": "cpu-tp4-no-layerwise",
+    "exit": 0,
+    "ranks": {
+      "3": "254",
+      "0": "254",
+      "2": "254",
+      "1": "254"
+    },
+    "block_sizes": [
+      "1152"
+    ]
+  },
+  {
+    "case": "npu-tp2-layerwise",
+    "exit": 0,
+    "ranks": {
+      "0": "288",
+      "1": "288"
+    },
+    "block_sizes": [
+      "2176"
+    ]
+  },
+  {
+    "case": "npu-tp2-no-layerwise",
+    "exit": 1,
+    "ranks": {
+      "0": "288",
+      "1": "288"
+    },
+    "block_sizes": [
+      "2176"
+    ]
+  },
+  {
+    "case": "npu-tp2-no-layerwise-cards15",
+    "exit": 0,
+    "ranks": {
+      "1": "288",
+      "0": "288"
+    },
+    "block_sizes": [
+      "2176"
+    ]
+  },
+  {
+    "case": "npu-tp2-no-layerwise-retry",
+    "exit": 1,
+    "ranks": {},
+    "block_sizes": [
+      "2176"
+    ]
+  },
+  {
+    "case": "npu-tp4-layerwise",
+    "exit": 1,
+    "ranks": {},
+    "block_sizes": []
+  },
+  {
+    "case": "npu-tp4-layerwise-retry",
+    "exit": 1,
+    "ranks": {},
+    "block_sizes": []
+  },
+  {
+    "case": "npu-tp4-no-layerwise",
+    "exit": 1,
+    "ranks": {},
+    "block_sizes": []
+  },
+  {
+    "case": "npu-tp4-no-layerwise-retry",
+    "exit": 1,
+    "ranks": {},
+    "block_sizes": []
+  }
+]
