@@ -253,6 +253,7 @@ class UCMHybridConnector(UCMDirectConnector, SupportsHMA):
                 "namespace": self._namespace,
                 "layout_policy": self.kv_cache_layout.policy,
                 "group_kinds": self.kv_cache_layout.kinds,
+                "padding": self.kv_cache_layout.padding_report(),
                 "rank": self.tp_rank,
                 "tensor_size_list": self.kv_cache_layout.tensor_size_list,
                 "ucm_block_offsets": self.kv_cache_layout.ucm_block_offsets.tolist(),

@@ -128,7 +128,7 @@ class HybridStoreLayout:
         # Compile a common partition WITHIN each semantic region. Padding may
         # occur between conv, state/K, V and scale, never by repacking roles.
         region_sizes, region_columns = {}, {}
-        sizes = []
+        sizes, slot_roles = [], []
         for region in regions:
             parts = slot_sizes(
                 [s.payload_bytes for s in row.get(region, ())]
@@ -138,7 +138,9 @@ class HybridStoreLayout:
             region_sizes[region] = parts
             region_columns[region] = len(sizes)
             sizes.extend(parts.tolist())
+            slot_roles.extend([region] * len(parts))
         self.sizes = np.asarray(sizes, dtype=np.uint64)
+        self.slot_roles = tuple(slot_roles)
         self.rows = {}
         for group_id, mapped_rows in mapped.items():
             group = self.routes[group_id][0]
@@ -195,6 +197,7 @@ class HybridStoreLayout:
             # Bulk packs the per-layer semantic template of ONE native group.
             width = len(self.sizes)
             self.sizes = np.tile(self.sizes, next(iter(counts)))
+            self.slot_roles = self.slot_roles * next(iter(counts))
             for gid, rows in self.rows.items():
                 self.rows[gid] = (
                     Row(
@@ -239,6 +242,40 @@ class HybridStoreLayout:
             np.arange(self.row_count, dtype=np.uint64)[:, None] * shard_bytes
             + (np.cumsum(self.sizes) - self.sizes)[None, :]
         )
+
+    def padding_report(self):
+        """Explain semantic padding separately from v1 shard alignment.
+
+        Diagnostic only: never scan keys or materialize pointer matrices here.
+        A byte count describes one stored key for the selected native group.
+        """
+        aligned_shard = (self.shard_size + 4095) // 4096 * 4096
+        groups = {}
+        for group_id, rows in self.rows.items():
+            details = []
+            for index, row in enumerate(rows):
+                payload = int(self.sizes[row.columns].sum())
+                real = set(row.columns.tolist())
+                details.append(
+                    {
+                        "shard_index": index,
+                        "layer_id": row.layer_id,
+                        "payload_bytes": payload,
+                        "padding_bytes": self.shard_size - payload,
+                        "padding_columns": [
+                            i for i in range(len(self.sizes)) if i not in real
+                        ],
+                    }
+                )
+            groups[group_id] = {
+                "kind": self.kinds[group_id],
+                "payload_bytes": sum(r["payload_bytes"] for r in details),
+                "padding_bytes": sum(r["padding_bytes"] for r in details),
+                "alignment_bytes": (aligned_shard - self.shard_size) * len(rows),
+                "stored_block_bytes": aligned_shard * len(rows),
+                "rows": details,
+            }
+        return {"slot_roles": self.slot_roles, "groups": groups}
 
     def resolve(self, plan, row_index):
         if self.kinds[plan.group_id] != plan.hash_group:

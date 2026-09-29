@@ -18,6 +18,29 @@
 
 Qwen TP2：16层/group，槽位[30720,1572864,1572864]，每 group block 为50,823,168 B，约48.47 MiB；layerwise为16 shard。必须按真实FA prefix/State boundary访问量统计总空间，不能只比较单key大小。
 
+## Padding 离线验收补充
+
+已完成27项Hybrid测试，其中新增3个参数化测试覆盖20种组合：
+
+| 策略 | 组合 | 覆盖 |
+|---|---|---|
+| GLM | SFA关/开 × BF16/全LI C8/混合 × bulk/layerwise | 12 |
+| State | 独立conv/state或combined page × bulk/layerwise，均4group | 4 |
+| MiniMax | separate K/V或packed attention × bulk/layerwise | 4 |
+
+GLM使用上述GLM设计文档的真实每block字节尺寸构造NumPy byte views；这不是原生SFA/LI量化引擎构造或runtime验收。State/MiniMax使用缩小尺寸验证地址与padding逻辑，另有Qwen TP2真实槽位大小/16层每group容量测试。
+
+独立oracle检查不同group/层/component的数据、两个源block到两个不同目标block的恢复，以及整块allocation guard bytes不变；存储中padding槽先写入污染值，load必须跳过。这里是fake store离线单测，不新增真实store功能测试要求。
+
+`UCM_HYBRID_DUMP_LAYOUT` 输出新增 `padding`：
+
+- `slot_roles`：每列对应conv/data0/data1或attention/index/index_tail/scale。
+- 每group、每行的 `payload_bytes`、`padding_bytes`、`padding_columns`。
+- 每group的 `alignment_bytes` 与 `stored_block_bytes`，必须满足payload + padding + alignment = stored。
+- 统计单位为一个group key；不代表整个请求的内存或磁盘使用量。
+
+远端下一轮按新commit执行原有Model-check命令，保留layout与命令：Qwen必须4个group、group keys独立、layerwise每组16行（对应64层配置）；GLM mixed必须index/index_tail/scale独立，Shared层对应空槽；MiniMax dense层index空槽。先CPU/simu与NPU各一个代表用例，再扩展TP2及量化布局；不要将离线尺寸fixture当作真实量化PASS。
+
 ## P1：block_pool 与保存源生命周期
 
 本地参考：vllm/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/。

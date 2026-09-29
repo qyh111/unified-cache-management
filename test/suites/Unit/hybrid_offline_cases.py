@@ -158,6 +158,159 @@ class ByteStore:
 
 
 class LayoutTests(unittest.TestCase):
+    def assert_padding_roundtrip(self, spec, views, layerwise):
+        """Independent whole-allocation oracle, including untouched guard bytes."""
+        layout = HybridStoreLayout(spec, views, layerwise=layerwise)
+        tensors = [
+            t
+            for value in views.values()
+            for t in (value if isinstance(value, tuple) else (value,))
+        ]
+        for index, tensor in enumerate(tensors):
+            pattern = (np.arange(tensor.array.size, dtype=np.uint64) + 37 * index) % 251
+            tensor.array[...] = pattern.reshape(tensor.array.shape).astype(
+                tensor.array.dtype
+            )
+        store = ByteStore(layout)
+        transfers = []
+        for gid in layout.routes:
+            keys = (bytes([gid, 1]) * 8, bytes([gid, 2]) * 8)
+            src = plan(layout.kinds[gid], [[1, 2]], keys, group_id=gid)
+            dst = plan(layout.kinds[gid], [[3, 4]], keys, group_id=gid)
+            transfers.append(dst)
+            for row in range(layout.row_count):
+                store.dump(layout.resolve(src, row))
+        expected = []
+        for value in views.values():
+            for tensor in value if isinstance(value, tuple) else (value,):
+                backing = tensor.array
+                while isinstance(backing.base, np.ndarray):
+                    backing = backing.base
+                tensor.array[3:5] = 0xEE
+                reference = backing.copy()
+                # Independent logical tensor indexing, not resolver addresses.
+                target = np.ndarray(
+                    tensor.array.shape,
+                    dtype=tensor.array.dtype,
+                    buffer=reference,
+                    offset=tensor.array.ctypes.data - backing.ctypes.data,
+                    strides=tensor.array.strides,
+                )
+                target[3:5] = tensor.array[1:3]
+                expected.append((backing, reference))
+        # Poison every persisted null slot, so an accidental load of padding
+        # corrupts the destination and is detected by the allocation oracle.
+        for dst in transfers:
+            for row in range(layout.row_count):
+                transfer = layout.resolve(dst, row)
+                for key, ptrs in zip(transfer.keys, transfer.ptrs):
+                    for col, ptr in enumerate(ptrs):
+                        if not ptr:
+                            start = int(layout.ucm_block_offsets[row, col])
+                            count = int(layout.sizes[col])
+                            store.data[key][start : start + count] = (
+                                bytes([0xA5]) * count
+                            )
+                store.load(transfer)
+        for actual, reference in expected:
+            np.testing.assert_array_equal(actual, reference)
+        report = layout.padding_report()
+        for group in report["groups"].values():
+            self.assertEqual(
+                group["payload_bytes"]
+                + group["padding_bytes"]
+                + group["alignment_bytes"],
+                group["stored_block_bytes"],
+            )
+        return layout
+
+    def test_glm_documented_sfa_li_padding_matrix_roundtrip(self):
+        # Exact per-block sizes from GLM52_ASCEND_SHARED_INDEXER_KVCACHE_LAYOUT_DESIGN.
+        # These are offline byte-view fixtures, not an actual quantized engine run.
+        for sfa in (False, True):
+            attention_sizes = [83968] if sfa else [131072, 16384]
+            for mode in ("bf16", "li_c8", "mixed"):
+                for layerwise in (False, True):
+                    with self.subTest(sfa=sfa, mode=mode, layerwise=layerwise):
+                        views = {}
+                        for i in range(3):
+                            views[f"model.layers.{i}.self_attn.attn"] = tuple(
+                                view(n) for n in attention_sizes
+                            )
+                        views["model.layers.0.self_attn.indexer.k_cache"] = (
+                            view(32768) if mode == "bf16" else (view(16384), view(256))
+                        )
+                        if mode == "mixed":
+                            views["model.layers.2.self_attn.indexer.k_cache"] = view(
+                                32768
+                            )
+                        spec, _ = cache_spec([(list(views), FullAttentionSpec())])
+                        layout = self.assert_padding_roundtrip(spec, views, layerwise)
+                        if layerwise:
+                            suffix = {
+                                "bf16": [32768],
+                                "li_c8": [16384, 256],
+                                "mixed": [16384, 16384, 256],
+                            }[mode]
+                            self.assertEqual(
+                                layout.tensor_size_list, attention_sizes + suffix
+                            )
+                            self.assertEqual(
+                                layout.padding_report()["groups"][0]["rows"][1][
+                                    "padding_bytes"
+                                ],
+                                sum(suffix),
+                            )
+                        else:
+                            self.assertEqual(
+                                layout.padding_report()["groups"][0]["padding_bytes"], 0
+                            )
+
+    def test_four_group_state_tuple_and_combined_padding_roundtrip(self):
+        for combined in (False, True):
+            for layerwise in (False, True):
+                with self.subTest(combined=combined, layerwise=layerwise):
+                    views, groups = {}, []
+                    for gid in range(4):
+                        names = [f"model.layers.{gid + i*4}.cache" for i in range(2)]
+                        state_spec = MambaSpec(shapes=((3,), (16,)))
+                        state_spec.dtypes = (NS(itemsize=1), NS(itemsize=1))
+                        groups.append(
+                            (names, FullAttentionSpec() if gid == 0 else state_spec)
+                        )
+                        for name in names:
+                            views[name] = (
+                                (view(32) if combined else (view(16), view(16)))
+                                if gid == 0
+                                else (view(19) if combined else (view(3), view(16)))
+                            )
+                    spec, _ = cache_spec(groups)
+                    layout = self.assert_padding_roundtrip(spec, views, layerwise)
+                    self.assertEqual(
+                        layout.tensor_size_list, [3, 16, 16] * (1 if layerwise else 2)
+                    )
+                    report = layout.padding_report()["groups"]
+                    self.assertEqual(report[0]["padding_bytes"], 6)
+                    for gid in (1, 2, 3):
+                        self.assertEqual(report[gid]["padding_bytes"], 32)
+
+    def test_minimax_dense_sparse_padding_roundtrip(self):
+        for separate in (False, True):
+            for layerwise in (False, True):
+                views = {
+                    f"model.layers.{i}.attn": (
+                        (view(16), view(16)) if separate else view(32)
+                    )
+                    for i in range(3)
+                }
+                views["model.layers.2.index_cache"] = view(8)
+                spec, _ = cache_spec([(list(views), FullAttentionSpec())])
+                layout = self.assert_padding_roundtrip(spec, views, layerwise)
+                self.assertEqual(
+                    layout.padding_report()["groups"][0]["padding_bytes"],
+                    16 if layerwise else 0,
+                )
+
     def test_model_check_with_real_hybrid_layout(self):
         from unittest.mock import patch
 
