@@ -346,21 +346,26 @@ def _validate_qsa_ring_transient(
             f"Qwen4Exp raw-key ring capacity {capacity} must divide the "
             f"scheduler block size {scheduler_block_size}"
         )
-    paired: list[tuple[str, "KVCacheSpec"]] = []
+    paired: dict[str, list["KVCacheSpec"]] = {}
     for _, group_concrete, kinds in classified:
         if KVCacheSpecKind.MAMBA in kinds or not kinds.isdisjoint(_SLIDING_KINDS):
             continue
-        paired.extend(
-            (name, spec)
-            for name, spec in group_concrete
-            if name.endswith(".indexer.compressed_key_cache")
-        )
-    if not paired:
-        raise ValueError(
-            f"Qwen4Exp raw-key ring group {native_id} has no paired "
-            "indexer.compressed_key_cache group holding the committed rows"
-        )
-    for name, spec in paired:
+        for name, spec in group_concrete:
+            if name.endswith(".indexer.compressed_key_cache"):
+                paired.setdefault(name, []).append(spec)
+    for raw_name in names:
+        name = raw_name.removesuffix("raw_key_cache") + "compressed_key_cache"
+        matches = paired.get(name, [])
+        if not matches:
+            raise ValueError(
+                f"Qwen4Exp raw-key ring {raw_name} has no paired "
+                f"compressed cache {name} holding the committed rows"
+            )
+        if len(matches) != 1:
+            raise ValueError(f"Qwen4Exp compressed cache {name} is ambiguous")
+        spec = matches[0]
+        if get_kv_cache_spec_kind(spec) != KVCacheSpecKind.MLA_ATTENTION:
+            raise ValueError(f"Qwen4Exp compressed cache {name} must be MLA")
         ratio = _spec_tokens_per_state(spec)
         if ratio < 1 or capacity % ratio:
             raise ValueError(

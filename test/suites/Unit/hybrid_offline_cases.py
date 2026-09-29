@@ -1400,7 +1400,7 @@ class RingTransientGateTests(unittest.TestCase):
     RING = "m.layers.3.self_attn.indexer.raw_key_cache"
     COMPRESSED = "m.layers.3.self_attn.indexer.compressed_key_cache"
 
-    def _parse(self, ring_name, ring_capacity, ratio):
+    def _parse(self, ring_name, ring_capacity, ratio, *, compressed_spec=None):
         class CircularBufferSpec:
             def __init__(self, block_size):
                 self.block_size = block_size
@@ -1416,7 +1416,11 @@ class RingTransientGateTests(unittest.TestCase):
             layer_names=[self.COMPRESSED],
             kv_cache_spec=NS(
                 block_size=4,
-                kv_cache_specs={self.COMPRESSED: MLAAttentionSpec()},
+                kv_cache_specs={
+                    self.COMPRESSED: (
+                        MLAAttentionSpec() if compressed_spec is None else compressed_spec
+                    )
+                },
             ),
         )
         raw = NS(
@@ -1437,6 +1441,15 @@ class RingTransientGateTests(unittest.TestCase):
         # verified QSA semantics; it must be rejected, not silently skipped.
         with self.assertRaisesRegex(ValueError, "not the verified Qwen4Exp"):
             self._parse("m.layers.1.attn.compressor.state_cache", 4, 4)
+
+    def test_rejects_compressed_cache_from_another_indexer(self):
+        self.COMPRESSED = "m.layers.99.self_attn.indexer.compressed_key_cache"
+        with self.assertRaisesRegex(ValueError, "no paired"):
+            self._parse(self.RING, 4, 4)
+
+    def test_rejects_matching_name_with_non_mla_spec(self):
+        with self.assertRaisesRegex(ValueError, "must be MLA"):
+            self._parse(self.RING, 4, 4, compressed_spec=FullAttentionSpec())
 
     def test_rejects_ring_without_paired_compressed_cache(self):
         class CircularBufferSpec:
