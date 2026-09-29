@@ -85,15 +85,17 @@ class HybridStoreLayout:
         self.layerwise = layerwise
         glm53 = spec.layout_policy == "glm53"
         # Native pages copy the engine-owned page as one segment, so the
-        # single-store schema needs one page size across all persistent
-        # groups (Qwen3.8). Qwen4Exp mixes 3207168B linear-attention state
-        # pages with a 184320B ple page; such models fall back to the
-        # general semantic-slot policy the Ascend path already uses.
-        native_sizes = _native_state_page_sizes(spec)
-        native_pages = (
-            bool(spec.state_groups)
-            and spec.device_type in ("cpu", "cuda")
-            and native_sizes is not None
+        # single-store schema of the general path needs one declared page
+        # size across all persistent groups (Qwen3.8). Qwen4Exp mixes
+        # 3207168B linear-attention state pages with a 184320B ple page;
+        # such models fall back to the general semantic-slot policy the
+        # Ascend path already uses. The GLM5.3 tiled-page policy below keeps
+        # the original state-groups condition: it tiles per layer and never
+        # consults the shared page-size invariant.
+        native_pages = bool(spec.state_groups) and spec.device_type in ("cpu", "cuda")
+        uniform_native_pages = (
+            native_pages
+            and (native_sizes := _native_state_page_sizes(spec)) is not None
             and len(native_sizes) == 1
         )
         if glm53:
@@ -128,7 +130,7 @@ class HybridStoreLayout:
         else:
             self.group_layouts = (
                 build_page_group_layouts(spec, kv_caches)
-                if native_pages
+                if uniform_native_pages
                 else build_group_layouts(spec, kv_caches)
             )
         self.routes = {
