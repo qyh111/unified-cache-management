@@ -3363,8 +3363,14 @@ class UCMConnector(KVConnectorBase_V1, SupportsHMA):
         )
         from ucm.integration.vllm.hma_connector import UCMFAWAConnector
 
+        use_fawa = UCMFAWAConnector.can_handle_kv_cache_config(kv_cache_config)
+        use_hybrid = self.launch_config.get("use_hybrid_connector", False)
+        # Legacy HLA inspects the old shared_by tensor ABI. Do not probe it
+        # for routes that have already selected FAWA or the new Hybrid layout.
         use_hybrid_linear_attention = (
-            UCMHybridLinearAttentionConnector.supports_kv_cache_layout(kv_cache_config)
+            not use_fawa
+            and not use_hybrid
+            and UCMHybridLinearAttentionConnector.supports_kv_cache_layout(kv_cache_config)
         )
         use_hybrid_linear_attention_layerwise = (
             use_hybrid_linear_attention
@@ -3372,9 +3378,9 @@ class UCMConnector(KVConnectorBase_V1, SupportsHMA):
             and self.launch_config.get("hybrid_linear_attention_layerwise", True)
         )
 
-        if UCMFAWAConnector.can_handle_kv_cache_config(kv_cache_config):
+        if use_fawa:
             self.connector = UCMFAWAConnector(vllm_config, role, kv_cache_config)
-        elif self.launch_config.get("use_hybrid_connector", False):
+        elif use_hybrid:
             from ucm.integration.vllm.hybrid_connector import UCMHybridConnector
 
             self.connector = UCMHybridConnector(vllm_config, role, kv_cache_config)

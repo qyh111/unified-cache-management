@@ -52,6 +52,30 @@ class Offsets:
 
 
 class LayoutDiagnosticsTest(unittest.TestCase):
+    def test_new_routes_do_not_probe_legacy_shared_tensor_abi(self):
+        path = ROOT.parent / "ucm/integration/vllm/ucm_connector.py"
+        tree = ast.parse(path.read_text(encoding="utf-8-sig"))
+        assignment = next(
+            n for n in ast.walk(tree)
+            if isinstance(n, ast.Assign)
+            and any(isinstance(t, ast.Name) and t.id == "use_hybrid_linear_attention"
+                    for t in n.targets)
+        )
+        probe_calls = []
+        def probe(config):
+            probe_calls.append(config)
+            return True
+        for fawa, hybrid_selected, expected_calls in (
+            (True, True, 0), (True, False, 0), (False, True, 0), (False, False, 1)
+        ):
+            probe_calls.clear()
+            ns = dict(use_fawa=fawa, use_hybrid=hybrid_selected,
+                      kv_cache_config=object(),
+                      UCMHybridLinearAttentionConnector=NS(supports_kv_cache_layout=probe))
+            exec(compile(ast.Module(body=[assignment], type_ignores=[]), str(path), "exec"), ns)
+            self.assertEqual(len(probe_calls), expected_calls)
+            self.assertEqual(ns["use_hybrid_linear_attention"], bool(expected_calls))
+
     def test_optional_storage_block_size_does_not_stop_model_check(self):
         fn = helper("log_cache_layout")
         messages = []
