@@ -1567,7 +1567,15 @@ def save_source(
                     source_id,
                     None if native_blocks else fixture.kv_cache_config.num_blocks,
                 )
-                source.fill_(layer_index + part + source_id + 1)
+                fill_value = layer_index + part + source_id + 1
+                if not source.dtype.is_floating_point:
+                    # Integer caches (fp8 pages are stored as uint8) cannot
+                    # hold large block ids; wrap the pattern into range.
+                    info = torch.iinfo(source.dtype)
+                    fill_value = info.min + (
+                        fill_value % (info.max - info.min + 1)
+                    )
+                source.fill_(fill_value)
 
     synchronize()
     saved: list[SavedBlock] = []
