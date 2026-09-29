@@ -30,6 +30,7 @@ def helper(name):
     )
     ns = dict(
         Any=object,
+        CacheFixture=object,
         SimpleNamespace=NS,
         is_hybrid_worker=hybrid.is_hybrid_worker,
         HYBRID_ENV=HYBRID_ENV,
@@ -48,6 +49,28 @@ class Offsets:
     def __getitem__(self, pair):
         row, col = pair
         return row * 4096 + (0, 4, 7)[col]
+
+
+class LayoutDiagnosticsTest(unittest.TestCase):
+    def test_optional_storage_block_size_does_not_stop_model_check(self):
+        fn = helper("log_cache_layout")
+        messages = []
+        fn.__globals__.update(
+            log=messages.append,
+            _runtime_tensor_signature=lambda value: ("cpu", "uint8"),
+        )
+        for physical_size in (None, 64):
+            spec = NS(block_size=256, storage_block_size=physical_size)
+            fixture = NS(
+                kv_cache_config=NS(
+                    num_blocks=3,
+                    kv_cache_tensors=[NS(layers=["layer"], block_stride=1024, size=3072)],
+                    kv_cache_groups=[NS(kv_cache_spec=spec, layer_names=["layer"])],
+                ),
+                kv_caches={"layer": object()},
+            )
+            fn(fixture)
+            self.assertIn(f"256, {physical_size},", messages[-1])
 
 
 class Layout:

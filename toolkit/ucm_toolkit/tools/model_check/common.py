@@ -842,13 +842,10 @@ def log_cache_layout(fixture: CacheFixture) -> None:
             signature = (
                 type(layer_spec).__name__,
                 int(getattr(layer_spec, "block_size", 0)),
-                int(
-                    getattr(
-                        layer_spec,
-                        "storage_block_size",
-                        getattr(layer_spec, "block_size", 0),
-                    )
-                ),
+                # 0.30 MLA specs explicitly use None when there is no
+                # separate physical storage block size. Preserve that fact
+                # in diagnostics instead of coercing it to an integer.
+                getattr(layer_spec, "storage_block_size", None),
                 tuple(getattr(layer_spec, "shapes", ()) or ()),
                 raw_signature,
                 _runtime_tensor_signature(fixture.kv_caches[layer_name]),
