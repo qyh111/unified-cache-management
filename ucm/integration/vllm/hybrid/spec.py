@@ -364,14 +364,24 @@ def parse_kv_cache_config(
                 for name, item in concrete
             )
         )
+        # vLLM 0.30 Qwen4Exp keeps one ring block per request for the raw
+        # keys of the token group still being compressed; the spec declares
+        # prefix_cacheable=False, so the ring never joins persistent
+        # routing (same transient treatment as GLM5.3 tail pools).
+        is_ring = concrete and all(
+            type(item).__name__ == "CircularBufferSpec" for _, item in concrete
+        )
         if is_tail:
             if {int(item.block_size) for _, item in concrete} != {4}:
                 raise ValueError("Unsupported GLM5.3 tail pool size")
             transient_ids.add(native_id)
             kinds = frozenset((KVCacheSpecKind.SLIDING_WINDOW,))
+        elif is_ring:
+            transient_ids.add(native_id)
+            kinds = frozenset((KVCacheSpecKind.SLIDING_WINDOW,))
         else:
             kinds = _classify(raw_group, concrete)
-        if not is_tail and not kinds.isdisjoint(_SLIDING_KINDS):
+        if not is_tail and not is_ring and not kinds.isdisjoint(_SLIDING_KINDS):
             raise ValueError(
                 "FA/SWA belongs to UCMFAWAConnector, not UCMHybridConnector"
             )
@@ -415,17 +425,27 @@ def parse_kv_cache_config(
 
     groups: list[UCMKVCacheGroupInfo] = []
     fa_token_blocks: list[int] = []
-    attention_tokens_per_state_by_layer: dict[int, int] = {}
+    # Ratios are keyed by registered layer name: one model layer can expose
+    # several cache roles with different ratios (Qwen4Exp layer 3 has a
+    # ratio-1 full-attention view next to its ratio-4 indexer view).
+    attention_tokens_per_state_by_name: dict[str, int] = {}
     if has_compression and not glm53:
         for _, concrete, kinds in classified:
             if KVCacheSpecKind.MAMBA in kinds or not kinds.isdisjoint(_SLIDING_KINDS):
                 continue
             for name, concrete_spec in concrete:
-                attention_tokens_per_state_by_layer[layer_indices[name]] = (
+                attention_tokens_per_state_by_name[name] = (
                     attention_tokens_per_state.get(
                         layer_indices[name], _spec_tokens_per_state(concrete_spec)
                     )
                 )
+    # Sliding tails subtract their layer's main-attention ratio; subrole
+    # views (indexer/compressor) must not shadow it under the same index.
+    attention_tokens_per_state_by_layer = {
+        layer_indices[name]: ratio
+        for name, ratio in attention_tokens_per_state_by_name.items()
+        if ".indexer." not in name and not name.endswith(".compressor.state_cache")
+    }
     num_blocks = int(getattr(kv_cache_config, "num_blocks", 0))
     for group_id, (raw_group, concrete, kinds) in enumerate(classified):
         representative = (
@@ -463,8 +483,16 @@ def parse_kv_cache_config(
             # states; C128A: 256/128=2; uncompressed specs keep the block).
             logical = int(getattr(spec, "block_size"))
             ratio = _spec_tokens_per_state(spec)
-            if has_compression and not glm53 and kinds.isdisjoint(_SLIDING_KINDS):
-                ratio = attention_tokens_per_state_by_layer[layer_indices[name]]
+            # Only attention layers carry per-layer compression ratios; the
+            # ratio map never contains Mamba layers (Qwen4Exp mixes 36
+            # linear layers with a ratio-4 indexer in one spec).
+            if (
+                has_compression
+                and not glm53
+                and KVCacheSpecKind.MAMBA not in kinds
+                and kinds.isdisjoint(_SLIDING_KINDS)
+            ):
+                ratio = attention_tokens_per_state_by_name[name]
             if glm53:
                 # Scheduler representative specs lose the main/indexer ratio.
                 ratio = 4 if name.endswith(".indexer.k_cache") else 1

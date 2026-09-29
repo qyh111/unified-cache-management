@@ -322,7 +322,22 @@ def _state_tensor_views(
     page_stride = strides[0] * element_size
     payload = row_payload_bytes(shape, strides, element_size)
     page_size = int(getattr(layer.kv_cache_spec, "page_size_bytes", page_stride))
-    if page_stride != page_size or payload > page_stride:
+    if layer.descriptor is not None:
+        # vLLM 0.30 Qwen4Exp interleaves each layer's state page inside one
+        # block-sized stride shared by the whole group: the view's axis-0
+        # stride is the declared block stride and the page sits in the
+        # layer's slot (offset + position * layer_stride).
+        if (
+            page_stride != int(layer.descriptor.block_stride)
+            or payload > page_size
+            or page_size > int(layer.descriptor.layer_stride)
+        ):
+            raise ValueError(
+                "Combined state page disagrees with its descriptor: "
+                f"shape={shape}, strides={strides}, page_size={page_size}, "
+                f"descriptor={layer.descriptor}"
+            )
+    elif page_stride != page_size or payload > page_stride:
         raise ValueError(
             "Combined state backing must be a dense padded page: "
             f"shape={shape}, strides={strides}, page_size={page_size}"

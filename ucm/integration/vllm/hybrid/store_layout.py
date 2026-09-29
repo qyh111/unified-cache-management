@@ -47,6 +47,19 @@ def slot_sizes(rows):
     return np.diff(np.asarray(sorted(boundaries), dtype=np.uint64))
 
 
+def _native_state_page_sizes(spec):
+    """Distinct declared page sizes across persistent layers; None if undeclared."""
+
+    sizes = set()
+    for group in spec.persistent_groups:
+        for layer in group.layers:
+            page = getattr(layer.kv_cache_spec, "page_size_bytes", None)
+            if page is None or int(page) <= 0:
+                return None
+            sizes.add(int(page))
+    return sizes or None
+
+
 @dataclass(frozen=True)
 class Row:
     layer_id: int | None
@@ -71,7 +84,18 @@ class HybridStoreLayout:
         self.spec = spec
         self.layerwise = layerwise
         glm53 = spec.layout_policy == "glm53"
-        native_pages = bool(spec.state_groups) and spec.device_type in ("cpu", "cuda")
+        # Native pages copy the engine-owned page as one segment, so the
+        # single-store schema needs one page size across all persistent
+        # groups (Qwen3.8). Qwen4Exp mixes 3207168B linear-attention state
+        # pages with a 184320B ple page; such models fall back to the
+        # general semantic-slot policy the Ascend path already uses.
+        native_sizes = _native_state_page_sizes(spec)
+        native_pages = (
+            bool(spec.state_groups)
+            and spec.device_type in ("cpu", "cuda")
+            and native_sizes is not None
+            and len(native_sizes) == 1
+        )
         if glm53:
             self.group_layouts = {}
             for group in spec.persistent_groups:

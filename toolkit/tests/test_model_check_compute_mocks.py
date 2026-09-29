@@ -33,3 +33,40 @@ class ComputeMockTests(unittest.TestCase):
         with patch.dict(os.environ, UCM_MODEL_CHECK_GLM53_FP8_MOCK="1"), self.assertRaises(ValueError):
             with glm53_fp8_layout_mock(NS(model_config=NS(hf_text_config=NS(model_type="other")))):
                 pass
+
+
+class QwenNextQsaMockTests(unittest.TestCase):
+    def test_scoped_availability_and_restore(self):
+        original = object()
+        module = NS(is_flash_attn_varlen_func_available=original)
+        config = NS(model_config=NS(hf_text_config=NS(model_type="qwen4_exp_text")))
+        with patch.dict(os.environ, UCM_MODEL_CHECK_QWEN_NEXT_QSA_MOCK="1"), patch(
+            "ucm_toolkit.tools.model_check.compute_mocks.importlib.import_module", return_value=module
+        ):
+            from ucm_toolkit.tools.model_check.compute_mocks import (
+                qwen_next_qsa_layout_mock,
+            )
+
+            with qwen_next_qsa_layout_mock(config):
+                self.assertTrue(module.is_flash_attn_varlen_func_available())
+            self.assertIs(module.is_flash_attn_varlen_func_available, original)
+
+    def test_default_does_not_import_or_patch(self):
+        from ucm_toolkit.tools.model_check.compute_mocks import (
+            qwen_next_qsa_layout_mock,
+        )
+
+        with patch.dict(os.environ, UCM_MODEL_CHECK_QWEN_NEXT_QSA_MOCK="0"), patch(
+            "ucm_toolkit.tools.model_check.compute_mocks.importlib.import_module", side_effect=AssertionError
+        ):
+            with qwen_next_qsa_layout_mock(None):
+                pass
+
+    def test_rejects_other_models(self):
+        from ucm_toolkit.tools.model_check.compute_mocks import (
+            qwen_next_qsa_layout_mock,
+        )
+
+        with patch.dict(os.environ, UCM_MODEL_CHECK_QWEN_NEXT_QSA_MOCK="1"), self.assertRaises(ValueError):
+            with qwen_next_qsa_layout_mock(NS(model_config=NS(hf_text_config=NS(model_type="other")))):
+                pass

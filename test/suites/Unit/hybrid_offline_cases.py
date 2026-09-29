@@ -426,7 +426,10 @@ class LayoutTests(unittest.TestCase):
             )
         b.page_size_bytes = 40
         state_tensor = Tensor(np.zeros((5, 40), dtype=np.uint8))
-        with self.assertRaisesRegex(ValueError, "equal page"):
+        # Unequal declared pages no longer reach the native-page builder:
+        # they route to the general semantic policy (Qwen4Exp mixes state
+        # page sizes), which this minimal fixture cannot satisfy.
+        with self.assertRaisesRegex(ValueError, "State policy"):
             HybridStoreLayout(
                 spec, {fa: attention, state: state_tensor}, layerwise=True
             )
@@ -749,6 +752,46 @@ class LayoutTests(unittest.TestCase):
                     (["model.layers.1.attn"], SlidingWindowSpec()),
                 ]
             )
+
+    def test_qwen4_exp_ring_group_is_transient_not_rejected(self):
+        # vLLM 0.30 Qwen4Exp registers the indexer raw-key ring as
+        # CircularBufferSpec: one block per request, prefix_cacheable=False.
+        # The parser must keep the group out of persistent routing instead
+        # of failing the whole spec.
+        class CircularBufferSpec:
+            block_size = 4
+
+        spec, _ = cache_spec(
+            [
+                (["model.layers.0.linear_attn"], MambaSpec()),
+                (
+                    ["model.layers.3.self_attn.indexer.raw_key_cache"],
+                    CircularBufferSpec(),
+                ),
+                (
+                    ["model.layers.3.self_attn.indexer.compressed_key_cache"],
+                    FullAttentionSpec(),
+                ),
+            ]
+        )
+        rings = [
+            group
+            for group in spec.groups
+            if "raw_key_cache" in group.layers[0].layer_name
+        ]
+        self.assertEqual(len(rings), 1)
+        self.assertTrue(rings[0].transient)
+        self.assertEqual(rings[0].tail_tokens, 0)
+        persistent_names = [
+            layer.layer_name for group in spec.persistent_groups for layer in group.layers
+        ]
+        self.assertNotIn(
+            "model.layers.3.self_attn.indexer.raw_key_cache", persistent_names
+        )
+        self.assertIn(
+            "model.layers.3.self_attn.indexer.compressed_key_cache", persistent_names
+        )
+        self.assertIn("model.layers.0.linear_attn", persistent_names)
 
 
 class NamespaceTests(unittest.TestCase):
@@ -1201,6 +1244,68 @@ class Glm53IntegrationTests(unittest.TestCase):
             [groups[0].group_id for _, groups in spec.dispatch_routes()],
             [0, 2, 3, 4, 5],
         )
+
+
+
+
+class PerRoleCompressionTests(unittest.TestCase):
+    def test_compression_ratios_key_by_layer_name_not_index(self):
+        # Qwen4Exp registers a ratio-4 indexer view next to a ratio-1
+        # full-attention view of the SAME model layer; keying ratios by
+        # layer index would let one role shadow the other, and the Mamba
+        # groups must never consult the attention ratio map at all.
+        class MLAAttentionSpec:  # named to classify as MLA
+            block_size = 4
+            tokens_per_state = 4
+
+        fa = "model.layers.3.self_attn.attn"
+        idx = "model.layers.3.self_attn.indexer.compressed_key_cache"
+        attention_group = NS(
+            layer_names=[idx, fa],
+            kv_cache_spec=NS(
+                block_size=4,
+                kv_cache_specs={idx: MLAAttentionSpec(), fa: FullAttentionSpec()},
+            ),
+        )
+        mamba_group = NS(
+            layer_names=["model.layers.0.linear_attn"], kv_cache_spec=MambaSpec()
+        )
+        raw = NS(
+            num_blocks=5,
+            kv_cache_tensors=(),
+            kv_cache_groups=[mamba_group, attention_group],
+        )
+        spec = parse_kv_cache_config(raw, scheduler_block_size=4, device_type="cpu")
+        by_name = {
+            layer.layer_name: layer
+            for group in spec.groups
+            for layer in group.layers
+        }
+        self.assertEqual(by_name[idx].storage_block_size, 1)
+        self.assertEqual(by_name[fa].storage_block_size, 4)
+        self.assertEqual(by_name["model.layers.0.linear_attn"].storage_block_size, 4)
+
+
+class NativePagePolicyTests(unittest.TestCase):
+    def test_native_state_pages_need_one_declared_size(self):
+        from ucm.integration.vllm.hybrid.store_layout import _native_state_page_sizes
+
+        def layer(name, page):
+            return NS(layer_name=name, kv_cache_spec=NS(page_size_bytes=page))
+
+        def spec(pages):
+            return NS(
+                persistent_groups=[
+                    NS(layers=[layer(f"l{i}", page) for i, page in enumerate(pages)])
+                ]
+            )
+
+        self.assertEqual(_native_state_page_sizes(spec([1835008, 1835008])), {1835008})
+        # Qwen4Exp mixes 3207168B linear pages with a 184320B ple page.
+        self.assertEqual(
+            _native_state_page_sizes(spec([3207168, 184320])), {3207168, 184320}
+        )
+        self.assertIsNone(_native_state_page_sizes(spec([1835008, None])))
 
 
 if __name__ == "__main__":
