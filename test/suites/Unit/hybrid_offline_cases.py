@@ -757,9 +757,15 @@ class LayoutTests(unittest.TestCase):
         # vLLM 0.30 Qwen4Exp registers the indexer raw-key ring as
         # CircularBufferSpec: one block per request, prefix_cacheable=False.
         # The parser must keep the group out of persistent routing instead
-        # of failing the whole spec.
+        # of failing the whole spec, after proving the engine invariants
+        # (raw-key role, paired ratio-4 compressed cache, capacity divides
+        # the scheduler block).
         class CircularBufferSpec:
             block_size = 4
+
+        class MLAAttentionSpec:
+            block_size = 4
+            tokens_per_state = 4
 
         spec, _ = cache_spec(
             [
@@ -770,7 +776,7 @@ class LayoutTests(unittest.TestCase):
                 ),
                 (
                     ["model.layers.3.self_attn.indexer.compressed_key_cache"],
-                    FullAttentionSpec(),
+                    MLAAttentionSpec(),
                 ),
             ]
         )
@@ -1306,6 +1312,157 @@ class NativePagePolicyTests(unittest.TestCase):
             _native_state_page_sizes(spec([3207168, 184320])), {3207168, 184320}
         )
         self.assertIsNone(_native_state_page_sizes(spec([1835008, None])))
+
+
+class NonUniformStatePageTests(unittest.TestCase):
+    """Unequal declared pages must fall back to compile_policy, not fake native pages."""
+
+    def _fixture(self):
+        fa = "model.layers.1.attn"
+        state_a = "model.layers.0.mamba"
+        state_b = "model.layers.2.mamba"
+        fa_spec = FullAttentionSpec()
+        fa_spec.page_size_bytes = 32
+        spec_a = MambaSpec(shapes=((3,), (16,)))
+        spec_a.dtypes = (NS(itemsize=1), NS(itemsize=1))
+        spec_a.page_size_bytes = 26
+        spec_b = MambaSpec(shapes=((2,), (6,)))
+        spec_b.dtypes = (NS(itemsize=1), NS(itemsize=1))
+        spec_b.page_size_bytes = 15
+        spec, _ = cache_spec(
+            [([fa], fa_spec), ([state_a], spec_a), ([state_b], spec_b)]
+        )
+        views = {
+            fa: (view(8), view(8)),
+            state_a: view(19),
+            state_b: view(8),
+        }
+        return spec, views
+
+    def test_unequal_pages_route_to_semantic_slots_and_roundtrip(self):
+        spec, views = self._fixture()
+        for layerwise in (False, True):
+            with self.subTest(layerwise=layerwise):
+                layout = HybridStoreLayout(spec, views, layerwise=layerwise)
+                self.assertEqual(layout.policy, "state")
+        # Slot partition derived from the region segment sizes:
+        # conv {3,2,null} -> [2,1]; data0 {16,6,8} -> [6,2,8]; data1 {8} -> [8].
+        layout = HybridStoreLayout(spec, views, layerwise=True)
+        self.assertEqual(layout.tensor_size_list, [2, 1, 6, 2, 8, 8])
+        report = layout.padding_report()["groups"]
+        self.assertEqual({report[gid]["kind"] for gid in report}, {"FA", "State"})
+        # One row per group (layerwise): FA 16B, state A 19B, state B 8B real
+        # payload against a 27B shard.
+        self.assertEqual(
+            [report[gid]["rows"][0]["payload_bytes"] for gid in sorted(report)],
+            [16, 19, 8],
+        )
+        self.assertEqual(
+            [report[gid]["rows"][0]["padding_bytes"] for gid in sorted(report)],
+            [11, 8, 19],
+        )
+        # Full byte-level address oracle including poisoned null slots.
+        for layerwise in (False, True):
+            with self.subTest(roundtrip=layerwise):
+                self.assert_padding_roundtrip(spec, self._fixture()[1], layerwise)
+
+    def assert_padding_roundtrip(self, spec, views, layerwise):
+        return LayoutTests.assert_padding_roundtrip(self, spec, views, layerwise)
+
+    def test_unequal_pages_with_broken_state_page_are_rejected(self):
+        fa = "model.layers.1.attn"
+        state_a = "model.layers.0.mamba"
+        fa_spec = FullAttentionSpec()
+        fa_spec.page_size_bytes = 32
+
+        # Spec components (3+16=19B) exceed the combined view's 8B payload.
+        spec_a = MambaSpec(shapes=((3,), (16,)))
+        spec_a.dtypes = (NS(itemsize=1), NS(itemsize=1))
+        spec_a.page_size_bytes = 15
+        spec, _ = cache_spec([([fa], fa_spec), ([state_a], spec_a)])
+        views = {fa: (view(8), view(8)), state_a: view(8)}
+        with self.assertRaisesRegex(ValueError, "exceed the page content"):
+            HybridStoreLayout(spec, views, layerwise=True)
+
+        # Declared page size disagrees with the view's block stride.
+        spec_a = MambaSpec(shapes=((2,), (6,)))
+        spec_a.dtypes = (NS(itemsize=1), NS(itemsize=1))
+        spec_a.page_size_bytes = 12
+        spec, _ = cache_spec([([fa], fa_spec), ([state_a], spec_a)])
+        views = {fa: (view(8), view(8)), state_a: view(8)}
+        with self.assertRaisesRegex(ValueError, "dense padded page"):
+            HybridStoreLayout(spec, views, layerwise=True)
+
+
+class RingTransientGateTests(unittest.TestCase):
+    """Only the verified Qwen4Exp QSA ring may be transient; others reject."""
+
+    RING = "m.layers.3.self_attn.indexer.raw_key_cache"
+    COMPRESSED = "m.layers.3.self_attn.indexer.compressed_key_cache"
+
+    def _parse(self, ring_name, ring_capacity, ratio):
+        class CircularBufferSpec:
+            def __init__(self, block_size):
+                self.block_size = block_size
+
+        class MLAAttentionSpec:
+            block_size = 4
+            tokens_per_state = ratio
+
+        ring_group = NS(
+            layer_names=[ring_name], kv_cache_spec=CircularBufferSpec(ring_capacity)
+        )
+        compressed_group = NS(
+            layer_names=[self.COMPRESSED],
+            kv_cache_spec=NS(
+                block_size=4,
+                kv_cache_specs={self.COMPRESSED: MLAAttentionSpec()},
+            ),
+        )
+        raw = NS(
+            num_blocks=5,
+            kv_cache_tensors=(),
+            kv_cache_groups=[ring_group, compressed_group],
+        )
+        return parse_kv_cache_config(raw, scheduler_block_size=4, device_type="cpu")
+
+    def test_verified_pattern_is_transient(self):
+        spec = self._parse(self.RING, 4, 4)
+        ring = [g for g in spec.groups if self.RING in g.layers[0].layer_name][0]
+        self.assertTrue(ring.transient)
+        self.assertEqual(spec.persistent_groups and len(spec.persistent_groups), 1)
+
+    def test_rejects_non_qsa_ring_role(self):
+        # DeepSeek V4.1's compressor ring shares the spec class but not the
+        # verified QSA semantics; it must be rejected, not silently skipped.
+        with self.assertRaisesRegex(ValueError, "not the verified Qwen4Exp"):
+            self._parse("m.layers.1.attn.compressor.state_cache", 4, 4)
+
+    def test_rejects_ring_without_paired_compressed_cache(self):
+        class CircularBufferSpec:
+            block_size = 4
+
+        raw = NS(
+            num_blocks=5,
+            kv_cache_tensors=(),
+            kv_cache_groups=[
+                NS(layer_names=[self.RING], kv_cache_spec=CircularBufferSpec()),
+                NS(
+                    layer_names=["m.layers.0.attn"],
+                    kv_cache_spec=FullAttentionSpec(),
+                ),
+            ],
+        )
+        with self.assertRaisesRegex(ValueError, "no paired"):
+            parse_kv_cache_config(raw, scheduler_block_size=4, device_type="cpu")
+
+    def test_rejects_capacity_not_dividing_scheduler_block(self):
+        with self.assertRaisesRegex(ValueError, "must divide"):
+            self._parse(self.RING, 8, 4)
+
+    def test_rejects_capacity_not_multiple_of_compression_ratio(self):
+        with self.assertRaisesRegex(ValueError, "must be a multiple"):
+            self._parse(self.RING, 4, 3)
 
 
 if __name__ == "__main__":

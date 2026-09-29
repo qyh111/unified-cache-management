@@ -195,7 +195,11 @@ class HybridStoreLayout:
                 gid: [frozenset().union(*names)]
                 for gid, names in names_by_group.items()
             }
-        elif native_pages:
+        elif uniform_native_pages:
+            # Only a uniform declared page size proves the single-store
+            # "page" schema below matches every physical layout; unequal
+            # pages (Qwen4Exp) must go through compile_policy's semantic
+            # slots like the Ascend path.
             self.policy, regions = "native_state_page", ("page",)
             mapped = {
                 gid: [

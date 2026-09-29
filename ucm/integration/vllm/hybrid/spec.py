@@ -300,6 +300,75 @@ def _parse_descriptors(
     return declared_at
 
 
+def _validate_qsa_ring_transient(
+    native_id: int,
+    concrete: tuple[tuple[str, "KVCacheSpec"], ...],
+    classified: Sequence[
+        tuple["KVCacheGroupSpec", tuple[tuple[str, "KVCacheSpec"], ...], frozenset]
+    ],
+    scheduler_block_size: int,
+) -> None:
+    """Prove the Qwen4Exp raw-key ring can be dropped on external restore.
+
+    The engine (vllm/models/qwen4_exp/common/qsa_cache.py) keeps the open
+    group's committed keys plus every speculative row in one per-request
+    ring block, and asserts the ring capacity divides the attention block
+    size. Dropping ring bytes on restore is sound only when all of:
+
+    (a) the layers are the QSA indexer raw-key views;
+    (b) a paired ``indexer.compressed_key_cache`` MLA group holds one row
+        per complete group (the committed prefix state);
+    (c) capacity % compression ratio == 0 and scheduler block % capacity
+        == 0, so every dump boundary closes the open group -- all prefix
+        keys are already committed and the ring only holds post-boundary
+        or unaccepted-draft rows the restored request recomputes.
+
+    Anything else (e.g. the DeepSeek V4.1 compressor ring, whose capacity
+    is a power of two over the speculative depth and need not divide the
+    block) is unproven and rejected rather than silently skipped.
+    """
+
+    names = sorted(name for name, _ in concrete)
+    if not all(name.endswith(".indexer.raw_key_cache") for name in names):
+        raise ValueError(
+            f"CircularBufferSpec group {native_id} is not the verified "
+            f"Qwen4Exp indexer raw-key ring: {names}"
+        )
+    capacities = {int(getattr(spec, "block_size", 0)) for _, spec in concrete}
+    if len(capacities) != 1:
+        raise ValueError(
+            f"Qwen4Exp raw-key ring group {native_id} has mixed capacities "
+            f"{sorted(capacities)}"
+        )
+    capacity = capacities.pop()
+    if capacity <= 0 or scheduler_block_size % capacity:
+        raise ValueError(
+            f"Qwen4Exp raw-key ring capacity {capacity} must divide the "
+            f"scheduler block size {scheduler_block_size}"
+        )
+    paired: list[tuple[str, "KVCacheSpec"]] = []
+    for _, group_concrete, kinds in classified:
+        if KVCacheSpecKind.MAMBA in kinds or not kinds.isdisjoint(_SLIDING_KINDS):
+            continue
+        paired.extend(
+            (name, spec)
+            for name, spec in group_concrete
+            if name.endswith(".indexer.compressed_key_cache")
+        )
+    if not paired:
+        raise ValueError(
+            f"Qwen4Exp raw-key ring group {native_id} has no paired "
+            "indexer.compressed_key_cache group holding the committed rows"
+        )
+    for name, spec in paired:
+        ratio = _spec_tokens_per_state(spec)
+        if ratio < 1 or capacity % ratio:
+            raise ValueError(
+                f"Qwen4Exp raw-key ring capacity {capacity} must be a multiple "
+                f"of the compression ratio of {name} (got {ratio})"
+            )
+
+
 def parse_kv_cache_config(
     kv_cache_config: "KVCacheConfig",
     *,
@@ -348,6 +417,7 @@ def parse_kv_cache_config(
     ] = []
     layer_indices: dict[str, int] = {}
     transient_ids = set()
+    ring_groups: dict[int, tuple[tuple[str, "KVCacheSpec"], ...]] = {}
     for native_id, raw_group in enumerate(raw_groups):
         concrete = _concrete_specs(raw_group)
         layer_indices.update(
@@ -364,10 +434,10 @@ def parse_kv_cache_config(
                 for name, item in concrete
             )
         )
-        # vLLM 0.30 Qwen4Exp keeps one ring block per request for the raw
-        # keys of the token group still being compressed; the spec declares
-        # prefix_cacheable=False, so the ring never joins persistent
-        # routing (same transient treatment as GLM5.3 tail pools).
+        # vLLM 0.30 keeps per-request raw-key rings as CircularBufferSpec.
+        # Transient routing is only proven for the Qwen4Exp QSA ring and is
+        # validated against its engine invariants after the group loop;
+        # other ring users (e.g. the DeepSeek V4.1 compressor) are rejected.
         is_ring = concrete and all(
             type(item).__name__ == "CircularBufferSpec" for _, item in concrete
         )
@@ -377,7 +447,7 @@ def parse_kv_cache_config(
             transient_ids.add(native_id)
             kinds = frozenset((KVCacheSpecKind.SLIDING_WINDOW,))
         elif is_ring:
-            transient_ids.add(native_id)
+            ring_groups[native_id] = concrete
             kinds = frozenset((KVCacheSpecKind.SLIDING_WINDOW,))
         else:
             kinds = _classify(raw_group, concrete)
@@ -406,6 +476,12 @@ def parse_kv_cache_config(
                     f"{scheduler_block_size}, got {sorted(block_sizes)}"
                 )
         classified.append((raw_group, concrete, kinds))
+
+    for native_id, concrete in ring_groups.items():
+        _validate_qsa_ring_transient(
+            native_id, concrete, classified, scheduler_block_size
+        )
+        transient_ids.add(native_id)
 
     device_type = str(device_type).lower()
     if len(raw_groups) != 1 and ucm_cache_block_size is not None:
