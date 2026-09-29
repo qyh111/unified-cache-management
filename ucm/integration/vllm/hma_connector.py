@@ -77,12 +77,17 @@ class KVCacheGroupLayout:
         name, _ = item
         return (extract_layer_index(name), name)
 
-    def _is_combined_kv_4d(
+    def _classify_4d(
         self,
         shape: Sequence[int],
         layer_name: str,
-    ) -> bool:
-        """Classify a 4-D cache without confusing block_size=2 with K/V."""
+    ) -> str:
+        """Classify a 4-D cache without confusing block_size=2 with K/V.
+
+        Returns "combined" for [num_blocks, 2, block_size, ...] K/V pairs,
+        "unified" for [num_blocks, 1, states, bytes] MLA pages, and "plain"
+        for [num_blocks, block_size, num_head, head_dim].
+        """
 
         if self.is_ascend_layout:
             if (
@@ -93,19 +98,28 @@ class KVCacheGroupLayout:
                     f"Ascend KV cache tensor block size mismatch for {layer_name}: "
                     f"shape={tuple(shape)}, expected={self.expected_block_size}."
                 )
-            return False
+            return "plain"
 
-        is_combined_kv = shape[1] == 2
-        token_dim = 2 if is_combined_kv else 1
-        if (
-            self.expected_block_size is not None
-            and shape[token_dim] != self.expected_block_size
+        if shape[1] == 2 and (
+            self.expected_block_size is None
+            or shape[2] == self.expected_block_size
         ):
-            raise ValueError(
-                f"GPU KV cache tensor block size mismatch for {layer_name}: "
-                f"shape={tuple(shape)}, expected={self.expected_block_size}."
-            )
-        return is_combined_kv
+            return "combined"
+        if (
+            shape[1] == 1
+            and self.expected_block_size is not None
+            and self.expected_block_size % shape[2] == 0
+        ):
+            # vLLM 0.30 DeepseekV4 MLA pages are [num_blocks, H=1, states, C]:
+            # H=1 is the unified head-slot axis, and one stored state covers
+            # expected_block_size // shape[2] scheduler tokens (compression).
+            return "unified"
+        if self.expected_block_size is None or shape[1] == self.expected_block_size:
+            return "plain"
+        raise ValueError(
+            f"GPU KV cache tensor block size mismatch for {layer_name}: "
+            f"shape={tuple(shape)}, expected={self.expected_block_size}."
+        )
 
     def _build_layout(self) -> None:
         """Flatten registered KV tensors into store-compatible pointer rows."""
@@ -146,11 +160,18 @@ class KVCacheGroupLayout:
                 handle_tensor(tensor[0], (-3, -2, -1), layer_name)
                 handle_tensor(tensor[1], (-3, -2, -1), layer_name)
             elif tensor.dim() == 4:
-                if self._is_combined_kv_4d(tensor.shape, layer_name):
+                kind = self._classify_4d(tensor.shape, layer_name)
+                if kind == "combined":
                     # GPU kernels may register [num_blocks, 2, block_size, ...];
                     # split the K/V axis before reading the token dimension.
                     handle_tensor(tensor[:, 0], (-2, -1), layer_name)
                     handle_tensor(tensor[:, 1], (-2, -1), layer_name)
+                elif kind == "unified":
+                    # DeepseekV4 MLA registers one latent state per page slot;
+                    # slicing the head axis lets the 3-D row math read the
+                    # per-block state count, which segment math scales against
+                    # the scheduler's token block.
+                    handle_tensor(tensor[:, 0], (-2, -1), layer_name)
                 else:
                     # Ascend registers split KV/state tensors as
                     # [num_blocks, block_size, num_head, head_dim].
