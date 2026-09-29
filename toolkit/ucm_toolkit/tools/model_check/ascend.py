@@ -255,6 +255,12 @@ def patch_groups(fixture: CacheFixture) -> None:
     modifying KVCacheConfig or UCM's real tensor/layout inputs.
     """
 
+    # Multi-group configurations already use Ascend's native coordinator.
+    # Importing the old single-group shim on 0.30 is both unnecessary and
+    # invalid: its manager modules moved, and GLM5.3 owns a KPool manager.
+    if len(fixture.kv_cache_config.kv_cache_groups) != 1:
+        return
+
     try:
         import vllm.v1.core.kv_cache_coordinator as kv_cache_coordinator
         import vllm.v1.core.single_type_kv_cache_manager as single_type_manager

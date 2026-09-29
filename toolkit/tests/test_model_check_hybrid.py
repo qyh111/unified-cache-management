@@ -52,6 +52,14 @@ class Offsets:
 
 
 class LayoutDiagnosticsTest(unittest.TestCase):
+    def test_ascend_multi_group_does_not_import_single_group_shim(self):
+        tree = ast.parse((ROOT / "ucm_toolkit/tools/model_check/ascend.py").read_text())
+        node = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "patch_groups")
+        ns = {"CacheFixture": object}
+        exec(compile(ast.Module(body=[node], type_ignores=[]), "<ascend shim>", "exec"), ns)
+        with patch("builtins.__import__", side_effect=AssertionError("unexpected legacy import")):
+            ns["patch_groups"](NS(kv_cache_config=NS(kv_cache_groups=[object()] * 5)))
+
     def test_new_routes_do_not_probe_legacy_shared_tensor_abi(self):
         path = ROOT.parent / "ucm/integration/vllm/ucm_connector.py"
         tree = ast.parse(path.read_text(encoding="utf-8-sig"))
