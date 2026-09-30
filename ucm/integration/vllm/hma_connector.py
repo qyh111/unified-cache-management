@@ -15,6 +15,7 @@ from vllm.model_executor.models.utils import extract_layer_index
 from vllm.v1.core.sched.output import SchedulerOutput
 
 from ucm.integration.vllm.device import create_device
+from ucm.integration.vllm.dsv41_layout import compile_dsv41_layout
 from ucm.integration.vllm.ucm_connector import (
     UCMDirectConnector,
     UCMLiteConnector,
@@ -61,10 +62,12 @@ class KVCacheGroupLayout:
         *,
         is_ascend_layout: bool = False,
         expected_block_size: Optional[int] = None,
+        expected_layer_rows: Optional[dict[str, int]] = None,
     ) -> None:
         self.kvcaches = dict(sorted(kvcaches.items(), key=self._sort_key))
         self.is_ascend_layout = is_ascend_layout
         self.expected_block_size = expected_block_size
+        self.expected_layer_rows = expected_layer_rows or {}
         self.base_ptrs: np.ndarray
         self.block_strides: np.ndarray
         self.tensor_token_strides: np.ndarray
@@ -90,19 +93,18 @@ class KVCacheGroupLayout:
         """
 
         if self.is_ascend_layout:
-            if (
-                self.expected_block_size is not None
-                and shape[1] != self.expected_block_size
-            ):
+            expected = self.expected_layer_rows.get(
+                layer_name, self.expected_block_size
+            )
+            if expected is not None and shape[1] != expected:
                 raise ValueError(
                     f"Ascend KV cache tensor block size mismatch for {layer_name}: "
-                    f"shape={tuple(shape)}, expected={self.expected_block_size}."
+                    f"shape={tuple(shape)}, expected={expected}."
                 )
             return "plain"
 
         if shape[1] == 2 and (
-            self.expected_block_size is None
-            or shape[2] == self.expected_block_size
+            self.expected_block_size is None or shape[2] == self.expected_block_size
         ):
             return "combined"
         if (
@@ -141,6 +143,21 @@ class KVCacheGroupLayout:
             tensor_size = math.prod([t.shape[i] for i in size_dims]) * t.element_size()
             token_dim = 1
             tensor_block_size = int(t.shape[token_dim])
+            if layer_name in self.expected_layer_rows:
+                dense_stride = t.element_size()
+                for axis in range(t.dim() - 1, 0, -1):
+                    if (
+                        t.shape[axis] > 1
+                        and t.stride(axis) * t.element_size() != dense_stride
+                    ):
+                        raise ValueError(
+                            f"DSV4.1 page content must be dense: {layer_name}"
+                        )
+                    dense_stride *= t.shape[axis]
+                if t.stride(0) * t.element_size() < dense_stride:
+                    raise ValueError(
+                        f"DSV4.1 blocks overlap within one view: {layer_name}"
+                    )
             tensor_token_strides.append(t.stride(token_dim) * t.element_size())
             tensor_sizes_per_token.append(tensor_size // tensor_block_size)
             tensor_block_sizes.append(tensor_block_size)
@@ -299,6 +316,7 @@ class FAWARequestDispatchMeta:
     dump_hash_start: int = 0
     dump_hash_end: int = 0
     dump_vllm_block_ids: tuple[list[int], ...] = field(default_factory=tuple)
+    dump_wa: bool = True
 
 
 @dataclass
@@ -372,6 +390,10 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
         self.requests_meta: dict[str, FAWARequestMeta] = {}
         self.tp_dump_tasks: dict[tuple, list[FAWADumpTask]] = {}
         self.wa_dump_block_wise = self.launch_config.get("wa_dump_block_wise", True)
+        if self.dsv41_layout is not None:
+            # Reclaimed SWA history cannot be reconstructed for every prefix
+            # boundary in a large prefill. Publish only the live final tail.
+            self.wa_dump_block_wise = False
 
         # If the number of external hit blocks is small, it's possible that the load overhead is larger than the compute of a few blocks.
         # In that case, we can skip loading and directly compute the missed blocks, which can be faster.
@@ -492,6 +514,31 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
 
     def _init_group_metas(self) -> None:
         """Classify FA/WA groups and compute their logical segment sizes."""
+
+        model_config = self._vllm_config.model_config
+        hf = getattr(model_config, "hf_text_config", None) or model_config.hf_config
+        self.dsv41_layout = None
+        if getattr(hf, "model_type", None) in ("deepseek_v41", "deepseek_v41_text"):
+            self.is_ascend_layout = self.can_handle_ascend_kv_cache_config(
+                self._kv_cache_config
+            )
+            plan = compile_dsv41_layout(
+                self._kv_cache_config, self._vllm_config, ascend=self.is_ascend_layout
+            )
+            self.dsv41_layout = plan
+            self.hash_block_size = plan.hash_block_size
+            self.max_token_block_size = plan.hash_block_size
+            self.file_size = plan.file_size.copy()
+            for gid, group in plan.groups.items():
+                self.group_metas[gid] = KVCacheGroupMeta(
+                    gid, group.block_size, group.tail_blocks, group.tail_tokens
+                )
+                # Zero-tail WA entries preserve native group IDs in metadata.
+                # The request-private ring is never sliced as a token block.
+                (
+                    self.fa_group_ids if group.kind == "FA" else self.window_group_ids
+                ).append(gid)
+            return
 
         if self.can_handle_ascend_kv_cache_config(self._kv_cache_config):
             self.is_ascend_layout = True
@@ -652,6 +699,8 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
     ) -> tuple[str, Optional[str], dict[str, object]]:
         """Build a namespaced UCM store config for either FA or WA data."""
 
+        if self.dsv41_layout is not None:
+            store_suffix = f"{self.dsv41_layout.namespace}_{store_suffix}"
         if len(self.connector_configs) != 1:
             raise RuntimeError(
                 f"Expected exactly one connector config, "
@@ -747,6 +796,11 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
             config["shard_size"] = padded_size
             config["block_size"] = padded_size
             if self.file_size[label] != padded_size:
+                if self.dsv41_layout is not None:
+                    raise ValueError(
+                        f"DSV4.1 {label} worker/schema size mismatch: "
+                        f"{padded_size} != {self.file_size[label]}"
+                    )
                 logger.info_once(
                     f"GC file size of {label} does not match real file size. "
                     f"Worker: {padded_size}, Scheduler: {self.file_size[label]}"
@@ -787,6 +841,11 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
         )
 
         for group_id, group_spec in enumerate(self._kv_cache_config.kv_cache_groups):
+            declared = None
+            if self.dsv41_layout is not None:
+                declared = self.dsv41_layout.groups[group_id]
+                if declared.kind == "ring":
+                    continue
             group_caches: dict[str, torch.Tensor] = {}
             for layer_name in group_spec.layer_names:
                 if isinstance(kv_caches[layer_name], torch.Tensor):
@@ -797,7 +856,29 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
                 group_caches,
                 is_ascend_layout=self.is_ascend_layout,
                 expected_block_size=group_spec.kv_cache_spec.block_size,
+                expected_layer_rows=(
+                    {name: rows for name, (rows, _) in declared.layers.items()}
+                    if declared is not None
+                    else None
+                ),
             )
+            if declared is not None:
+                actual = {}
+                sizes = layout.segment_tensor_size_list(
+                    declared.block_size, declared.block_size
+                )
+                for view, size in zip(layout.view_meta, sizes):
+                    name = view["name"]
+                    rows, _ = declared.layers[name]
+                    if view["tensor_block_size"] != rows:
+                        raise ValueError(f"DSV4.1 physical row mismatch: {name}")
+                    actual.setdefault(name, []).append(size)
+                if actual != {
+                    name: list(sizes) for name, (_, sizes) in declared.layers.items()
+                }:
+                    raise ValueError(
+                        f"DSV4.1 group {group_id} component payload mismatch"
+                    )
             self.group_layouts[group_id] = layout
 
         self.store = self._create_fa_store(self.group_layouts, store_cores)
@@ -935,7 +1016,16 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
             self._prefetch_hit_key_hotness(fa_hbm_hit_keys, fa_hbm_hit_keys)
             return 0, False
 
-        external_keys = canonical_hashes[wa_hbm_hit_block_num:]
+        if self.dsv41_layout is not None:
+            # The legacy full-hit path subtracts one token for logits. For
+            # C2 that would resume at an odd position without its predecessor
+            # ring row. Query an earlier *stored* even boundary instead; if
+            # no earlier WA snapshot exists, recompute rather than inventing
+            # a snapshot by trimming the final hit.
+            reusable_blocks = (request.num_tokens - 1) // self.hash_block_size
+            external_keys = canonical_hashes[wa_hbm_hit_block_num:reusable_blocks]
+        else:
+            external_keys = canonical_hashes[wa_hbm_hit_block_num:]
         if not external_keys:
             self._prefetch_hit_key_hotness(fa_hbm_hit_keys, fa_hbm_hit_keys)
             return 0, False
@@ -1097,6 +1187,9 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
         dump_end = computed_end_token // self.hash_block_size
         dump_block_keys: list[bytes] = []
         dump_vllm_block_ids: list[list[int]] = []
+        dump_wa = (
+            self.dsv41_layout is None or computed_end_token % self.hash_block_size == 0
+        )
         if dump_end > dump_start:
             dump_block_keys = req_meta.ucm_block_ids[dump_start:dump_end]
             window_boundary_token_idx = (
@@ -1104,16 +1197,29 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
             )
             for group_id, group_block_ids in enumerate(all_group_block_ids):
                 dump_vllm_block_ids.append(
-                    self._slice_group_block_ids(
+                    []
+                    if not dump_wa and group_id in self.window_group_ids
+                    else self._slice_group_block_ids(
                         group_id,
                         group_block_ids,
                         window_boundary_token_idx,
                         fetch_wa_block_wise=self.wa_dump_block_wise,
                     )
                 )
+        if self.dsv41_layout is not None and dump_vllm_block_ids:
+            dump_wa = dump_wa and all(
+                len(dump_vllm_block_ids[gid]) == self.group_metas[gid].tail_blocks
+                and all(block > 0 for block in dump_vllm_block_ids[gid])
+                for gid in self.window_group_ids
+                if self.group_metas[gid].tail_tokens
+            )
+            if not dump_wa:
+                for gid in self.window_group_ids:
+                    dump_vllm_block_ids[gid] = []
         req_meta.token_processed = computed_end_token
 
         return FAWARequestDispatchMeta(
+            dump_wa=dump_wa,
             load_keys=load_block_keys,
             load_hash_start=load_start,
             load_hash_end=load_end,
@@ -1448,6 +1554,8 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
                             fa_dump_vllm_block_ids,
                         )
                     )
+                if not request.dump_wa:
+                    continue
                 if self.wa_dump_block_wise:
                     if tp_dump_keys:
                         wa_dump_blocks_by_request[request_id] = set(tp_dump_keys)
@@ -1500,6 +1608,8 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
                         request.dump_vllm_block_ids,
                     )
                 )
+                if not request.dump_wa:
+                    continue
                 if self.wa_dump_block_wise:
                     wa_dump_blocks_by_request[request_id] = set(request.dump_keys)
                     wa_dump_keys.extend(request.dump_keys)
@@ -1558,6 +1668,11 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
                 self._record_counter("connector_dump_submit_errors_total")
         if fa_dump_keys or wa_dump_keys:
             ucmmetrics.update_stats({"save_bytes_total": save_bytes})
+        if self.dsv41_layout is not None:
+            # SWA/overlay blocks may be reassigned by the next engine step.
+            # Keep source lifetime within this hook without changing store
+            # completion/publication semantics or legacy V4 behavior.
+            self._drain_best_effort_dump_tasks()
 
     def _poll_completed_dump_tasks(self) -> None:
         """Reap completed FAWA dump tasks without waiting for in-flight tasks."""

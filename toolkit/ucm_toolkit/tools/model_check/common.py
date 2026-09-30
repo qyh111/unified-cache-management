@@ -1333,6 +1333,8 @@ def _fawa_segments(
                         FAWASegment(block_id, token_offset, hash_block_size),
                     )
             elif group in wa_groups:
+                if phase == "dump" and not getattr(request_meta, "dump_wa", True):
+                    continue
                 # HMA does not store or load a window group with no tail.
                 # Its dispatch metadata consequently carries an empty block-id
                 # row even though tail_blocks is kept at one as a layout
