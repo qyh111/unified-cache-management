@@ -38,7 +38,11 @@ from typing import Any
 import torch
 
 from .config import load_config, cpu_gqa_block_sizes
-from .compute_mocks import glm53_fp8_layout_mock, qwen_next_qsa_layout_mock
+from .compute_mocks import (
+    dsv41_fp8_layout_mock,
+    glm53_fp8_layout_mock,
+    qwen_next_qsa_layout_mock,
+)
 from .common import (
     CacheFixture,
     UnsupportedEnvironment,
@@ -472,6 +476,7 @@ def make_model(vllm_config: Any) -> tuple[Any, Any]:
         with (
             glm53_fp8_layout_mock(vllm_config),
             qwen_next_qsa_layout_mock(vllm_config),
+            dsv41_fp8_layout_mock(vllm_config),
             current_vllm_config_context(vllm_config),
             no_real_device_move_from_meta_context(_factory_kwargs_redirect_to_meta),
             torch.device("meta"),
