@@ -17,6 +17,7 @@ STORAGE_BACKENDS_ENV = "UCM_MODEL_CHECK_STORAGE_BACKENDS"
 DEVICE_ENV = "UCM_MODEL_CHECK_DEVICE_ID"
 DTYPE_ENV = "UCM_MODEL_CHECK_DTYPE"
 KV_CACHE_DTYPE_ENV = "UCM_MODEL_CHECK_KV_CACHE_DTYPE"
+LOAD_FORMAT_ENV = "UCM_MODEL_CHECK_LOAD_FORMAT"
 CONNECTOR_MODULE_PATH_ENV = "UCM_MODEL_CHECK_CONNECTOR_MODULE_PATH"
 HYBRID_ENV = "UCM_MODEL_CHECK_HYBRID"
 EXCLUSIVE_ENV = "UCM_MODEL_CHECK_CACHE_LOAD_EXCLUSIVE_BUFFER_NUMBER"
@@ -73,6 +74,7 @@ class ModelCheckConfig:
     visible_devices: str
     dtype: str
     kv_cache_dtype: str
+    load_format: str
     connector_module_path: str
     tp: int = 1
     pp: int = 1
@@ -97,6 +99,7 @@ def load_config() -> ModelCheckConfig:
         visible_devices=os.environ.get(DEVICE_ENV, "0"),
         dtype=os.environ.get(DTYPE_ENV, "auto"),
         kv_cache_dtype=os.environ.get(KV_CACHE_DTYPE_ENV, "auto"),
+        load_format=os.environ.get(LOAD_FORMAT_ENV, "auto"),
         connector_module_path=os.environ.get(
             CONNECTOR_MODULE_PATH_ENV, LEGACY_CONNECTOR_MODULE
         ),

@@ -78,6 +78,7 @@ storage_backends = config.storage_backends
 visible_devices = config.visible_devices
 dtype = config.dtype
 kv_cache_dtype = config.kv_cache_dtype
+load_format = config.load_format
 connector_module_path = config.connector_module_path
 trust_remote_code = True
 request_token_salt = int(
@@ -125,6 +126,7 @@ def make_config() -> Any:
         use_layerwise,
         "cuda",
         connector_module_path,
+        load_format,
     )
 
 

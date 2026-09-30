@@ -69,6 +69,7 @@ class ModelCheckToolkitTest(unittest.TestCase):
             "UCM_MODEL_CHECK_DEVICE_ID": "5",
             "UCM_MODEL_CHECK_DTYPE": "float16",
             "UCM_MODEL_CHECK_KV_CACHE_DTYPE": "auto",
+            "UCM_MODEL_CHECK_LOAD_FORMAT": "dummy",
             "UCM_MODEL_CHECK_CONNECTOR_MODULE_PATH": (
                 "ucm.integration.vllm.v2.ucm_connector"
             ),
@@ -86,10 +87,20 @@ class ModelCheckToolkitTest(unittest.TestCase):
         self.assertEqual(config.visible_devices, "5")
         self.assertEqual(config.dtype, "float16")
         self.assertEqual(config.kv_cache_dtype, "auto")
+        self.assertEqual(config.load_format, "dummy")
         self.assertEqual(
             config.connector_module_path,
             "ucm.integration.vllm.v2.ucm_connector",
         )
+
+    def test_load_format_defaults_to_auto(self):
+        with patch.dict(
+            os.environ,
+            {"UCM_MODEL_CHECK_MODEL": "org/model"},
+            clear=True,
+        ):
+            config = load_config()
+        self.assertEqual(config.load_format, "auto")
 
     def test_cuda_runs_as_child_module(self):
         tool = ModelCheckTool()

@@ -69,6 +69,7 @@ store_pipeline = config.store_pipeline
 storage_backends = config.storage_backends
 dtype = config.dtype
 kv_cache_dtype = config.kv_cache_dtype
+load_format = config.load_format
 connector_module_path = config.connector_module_path
 trust_remote_code = True
 request_token_salt = int(
@@ -123,6 +124,7 @@ def make_config() -> Any:
         use_layerwise,
         "cpu",
         connector_module_path,
+        load_format,
     )
     # CPU 平台对 MLA 模型强制禁用 chunked prefill（vllm/platforms/cpu.py），
     # prefix caching 需与 UCM 的部署形态一致（UCM 接管前缀查找，本地 HBM

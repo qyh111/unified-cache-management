@@ -145,6 +145,7 @@ def make_config(
     use_layerwise: bool,
     device: str,
     connector_module_path: str = "ucm.integration.vllm.ucm_connector",
+    load_format: str = "auto",
 ) -> Any:
     """Create the requested vLLM parallel configuration for the synthetic request."""
 
@@ -200,6 +201,7 @@ def make_config(
             "disable_hybrid_kv_cache_manager": False,
             "kv_transfer_config": kv_transfer_config,
             "device": device,
+            "load_format": load_format,
             "additional_config": copy.deepcopy(additional_config),
         },
     )
