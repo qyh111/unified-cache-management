@@ -1,0 +1,68 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1120" height="718" viewBox="0 0 1120 718" role="img" aria-label="不同 stride 的 BHNC view 与 MemorySegment">
+<title>不同 stride 的 BHNC view 与 MemorySegment</title>
+<defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 Z" fill="#64748b"/></marker></defs><style>text{font-family:Inter,"PingFang SC","Microsoft YaHei",Arial,sans-serif;fill:#172033} .small{font-size:13px} .mono{font-family:"SFMono-Regular",Consolas,monospace;font-size:13px}</style>
+<rect width="1120" height="718" rx="14" fill="#fff"/>
+<text x="28" y="32" font-size="21" text-anchor="start" font-weight="600" style="fill:#172033">04 · 同为 [Q,2,4,1] view，物理顺序不同</text>
+<text x="28" y="57" font-size="14" text-anchor="start" font-weight="normal" style="fill:#64748b">示例每元素1字节；逻辑 token 范围 n1..n2。B 是逻辑块数，Q 可为 B×kernel rows。</text>
+<text x="35" y="111" font-size="18" text-anchor="start" font-weight="600" style="fill:#172033">NHC：token 内所有 heads 连续</text>
+<rect x="35" y="135" width="122" height="48" rx="3" fill="#ecfdf5" stroke="#94a3b8"/>
+<text x="96.0" y="164" font-size="14" text-anchor="middle" font-weight="normal" style="fill:#172033">n0h0</text>
+<rect x="160" y="135" width="122" height="48" rx="3" fill="#ecfdf5" stroke="#94a3b8"/>
+<text x="221.0" y="164" font-size="14" text-anchor="middle" font-weight="normal" style="fill:#172033">n0h1</text>
+<rect x="285" y="135" width="122" height="48" rx="3" fill="#bfdbfe" stroke="#94a3b8"/>
+<text x="346.0" y="164" font-size="14" text-anchor="middle" font-weight="normal" style="fill:#172033">n1h0</text>
+<rect x="410" y="135" width="122" height="48" rx="3" fill="#bfdbfe" stroke="#94a3b8"/>
+<text x="471.0" y="164" font-size="14" text-anchor="middle" font-weight="normal" style="fill:#172033">n1h1</text>
+<rect x="535" y="135" width="122" height="48" rx="3" fill="#bfdbfe" stroke="#94a3b8"/>
+<text x="596.0" y="164" font-size="14" text-anchor="middle" font-weight="normal" style="fill:#172033">n2h0</text>
+<rect x="660" y="135" width="122" height="48" rx="3" fill="#bfdbfe" stroke="#94a3b8"/>
+<text x="721.0" y="164" font-size="14" text-anchor="middle" font-weight="normal" style="fill:#172033">n2h1</text>
+<rect x="785" y="135" width="122" height="48" rx="3" fill="#ecfdf5" stroke="#94a3b8"/>
+<text x="846.0" y="164" font-size="14" text-anchor="middle" font-weight="normal" style="fill:#172033">n3h0</text>
+<rect x="910" y="135" width="122" height="48" rx="3" fill="#ecfdf5" stroke="#94a3b8"/>
+<text x="971.0" y="164" font-size="14" text-anchor="middle" font-weight="normal" style="fill:#172033">n3h1</text>
+<rect x="35" y="201" width="996" height="42" rx="4" fill="#f8fafc" stroke="#059669"/>
+<text x="51" y="228" font-size="16" text-anchor="start" font-weight="normal" style="fill:#172033">完整 block：1 segment；部分 token n1..n2 也为一段连续 IO。</text>
+<text x="35" y="293" font-size="18" text-anchor="start" font-weight="600" style="fill:#172033">compact HNC：完整 block 内 heads 连续</text>
+<rect x="35" y="317" width="122" height="48" rx="3" fill="#ecfdf5" stroke="#94a3b8"/>
+<text x="96.0" y="346" font-size="14" text-anchor="middle" font-weight="normal" style="fill:#172033">h0n0</text>
+<rect x="160" y="317" width="122" height="48" rx="3" fill="#bfdbfe" stroke="#94a3b8"/>
+<text x="221.0" y="346" font-size="14" text-anchor="middle" font-weight="normal" style="fill:#172033">h0n1</text>
+<rect x="285" y="317" width="122" height="48" rx="3" fill="#bfdbfe" stroke="#94a3b8"/>
+<text x="346.0" y="346" font-size="14" text-anchor="middle" font-weight="normal" style="fill:#172033">h0n2</text>
+<rect x="410" y="317" width="122" height="48" rx="3" fill="#ecfdf5" stroke="#94a3b8"/>
+<text x="471.0" y="346" font-size="14" text-anchor="middle" font-weight="normal" style="fill:#172033">h0n3</text>
+<rect x="535" y="317" width="122" height="48" rx="3" fill="#ecfdf5" stroke="#94a3b8"/>
+<text x="596.0" y="346" font-size="14" text-anchor="middle" font-weight="normal" style="fill:#172033">h1n0</text>
+<rect x="660" y="317" width="122" height="48" rx="3" fill="#bfdbfe" stroke="#94a3b8"/>
+<text x="721.0" y="346" font-size="14" text-anchor="middle" font-weight="normal" style="fill:#172033">h1n1</text>
+<rect x="785" y="317" width="122" height="48" rx="3" fill="#bfdbfe" stroke="#94a3b8"/>
+<text x="846.0" y="346" font-size="14" text-anchor="middle" font-weight="normal" style="fill:#172033">h1n2</text>
+<rect x="910" y="317" width="122" height="48" rx="3" fill="#ecfdf5" stroke="#94a3b8"/>
+<text x="971.0" y="346" font-size="14" text-anchor="middle" font-weight="normal" style="fill:#172033">h1n3</text>
+<rect x="35" y="383" width="996" height="42" rx="4" fill="#f8fafc" stroke="#ea580c"/>
+<text x="51" y="410" font-size="16" text-anchor="start" font-weight="normal" style="fill:#172033">完整 block：1 segment；n1..n2 分散在两个 head，当前 H&gt;1 时拒绝部分 token。</text>
+<text x="35" y="475" font-size="18" text-anchor="start" font-weight="600" style="fill:#172033">separated heads：同一 block 的 heads 中间夹有别的内容</text>
+<rect x="35" y="501" width="107" height="48" rx="3" fill="#ecfdf5" stroke="#94a3b8"/>
+<text x="88.5" y="530" font-size="14" text-anchor="middle" font-weight="normal" style="fill:#172033">h0n0</text>
+<rect x="145" y="501" width="107" height="48" rx="3" fill="#ecfdf5" stroke="#94a3b8"/>
+<text x="198.5" y="530" font-size="14" text-anchor="middle" font-weight="normal" style="fill:#172033">h0n1</text>
+<rect x="255" y="501" width="107" height="48" rx="3" fill="#ecfdf5" stroke="#94a3b8"/>
+<text x="308.5" y="530" font-size="14" text-anchor="middle" font-weight="normal" style="fill:#172033">h0n2</text>
+<rect x="365" y="501" width="107" height="48" rx="3" fill="#ecfdf5" stroke="#94a3b8"/>
+<text x="418.5" y="530" font-size="14" text-anchor="middle" font-weight="normal" style="fill:#172033">h0n3</text>
+<rect x="480" y="501" width="125" height="48" rx="3" fill="#f1f5f9" stroke="#94a3b8"/>
+<text x="542" y="530" font-size="14" text-anchor="middle" font-weight="normal" style="fill:#64748b">其他块/层</text>
+<rect x="620" y="501" width="107" height="48" rx="3" fill="#ecfdf5" stroke="#94a3b8"/>
+<text x="673.5" y="530" font-size="14" text-anchor="middle" font-weight="normal" style="fill:#172033">h1n0</text>
+<rect x="730" y="501" width="107" height="48" rx="3" fill="#ecfdf5" stroke="#94a3b8"/>
+<text x="783.5" y="530" font-size="14" text-anchor="middle" font-weight="normal" style="fill:#172033">h1n1</text>
+<rect x="840" y="501" width="107" height="48" rx="3" fill="#ecfdf5" stroke="#94a3b8"/>
+<text x="893.5" y="530" font-size="14" text-anchor="middle" font-weight="normal" style="fill:#172033">h1n2</text>
+<rect x="950" y="501" width="107" height="48" rx="3" fill="#ecfdf5" stroke="#94a3b8"/>
+<text x="1003.5" y="530" font-size="14" text-anchor="middle" font-weight="normal" style="fill:#172033">h1n3</text>
+<text x="35" y="582" font-size="16" text-anchor="start" font-weight="normal" style="fill:#059669">segment 0：h0 的本块数据</text>
+<text x="620" y="582" font-size="16" text-anchor="start" font-weight="normal" style="fill:#059669">segment 1：h1 的本块数据</text>
+<text x="35" y="624" font-size="16" text-anchor="start" font-weight="normal" style="fill:#172033">先按 row/head 拆段，再按地址排序并合并连续段；当前只支持整块。</text>
+<text x="35" y="679" font-size="15" text-anchor="start" font-weight="normal" style="fill:#64748b">group.supports_partial_tokens = all(component.supports_partial_tokens)，选择层不会放宽。</text>
+</svg>

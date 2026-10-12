@@ -1,0 +1,108 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1240" height="1400" viewBox="0 0 1240 1400" role="img" aria-label="Layout 对象关系类图">
+<title>Layout 对象关系类图</title>
+<defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 Z" fill="#64748b"/></marker></defs><style>text{font-family:Inter,"PingFang SC","Microsoft YaHei",Arial,sans-serif;fill:#172033} .small{font-size:13px} .mono{font-family:"SFMono-Regular",Consolas,monospace;font-size:13px}</style>
+<rect width="1240" height="1400" rx="14" fill="#fff"/>
+<text x="28" y="32" font-size="21" text-anchor="start" font-weight="600" style="fill:#172033">02 · 类图：引用关系与构建依赖</text>
+<text x="28" y="57" font-size="14" text-anchor="start" font-weight="normal" style="fill:#64748b">箭头：持有者 → 被引用对象；虚线：构建依赖。0..* 不代表不同 HBM allocation。</text>
+<rect x="445" y="85" width="350" height="190" rx="10" fill="#f5f3ff" stroke="#7c3aed"/>
+<text x="461" y="114" font-size="17" text-anchor="start" font-weight="600" style="fill:#7c3aed">UCMKVCacheLayout</text>
+<line x1="445" y1="129" x2="795" y2="129" stroke="#7c3aed" opacity=".25"/>
+<text x="461" y="152" font-size="14" text-anchor="start" font-weight="normal" style="fill:#172033">spec</text>
+<text x="461" y="174" font-size="14" text-anchor="start" font-weight="normal" style="fill:#172033">group_layouts / store_layouts</text>
+<text x="461" y="196" font-size="14" text-anchor="start" font-weight="normal" style="fill:#172033">layer_id_by_name</text>
+<text x="461" y="218" font-size="14" text-anchor="start" font-weight="normal" style="fill:#172033">layer_names_by_id</text>
+<rect x="30" y="85" width="350" height="190" rx="10" fill="#eff6ff" stroke="#2563eb"/>
+<text x="46" y="114" font-size="17" text-anchor="start" font-weight="600" style="fill:#2563eb">UCMKVCacheSpec</text>
+<line x1="30" y1="129" x2="380" y2="129" stroke="#2563eb" opacity=".25"/>
+<text x="46" y="152" font-size="14" text-anchor="start" font-weight="normal" style="fill:#172033">groups</text>
+<text x="46" y="174" font-size="14" text-anchor="start" font-weight="normal" style="fill:#172033">scheduler_block_size</text>
+<text x="46" y="196" font-size="14" text-anchor="start" font-weight="normal" style="fill:#172033">ucm_cache_block_size / device_type</text>
+<rect x="30" y="355" width="350" height="190" rx="10" fill="#eff6ff" stroke="#2563eb"/>
+<text x="46" y="384" font-size="17" text-anchor="start" font-weight="600" style="fill:#2563eb">UCMKVCacheGroupInfo</text>
+<line x1="30" y1="399" x2="380" y2="399" stroke="#2563eb" opacity=".25"/>
+<text x="46" y="422" font-size="14" text-anchor="start" font-weight="normal" style="fill:#172033">group_id / kinds / is_persistent</text>
+<text x="46" y="444" font-size="14" text-anchor="start" font-weight="normal" style="fill:#172033">token_block_size / tail_tokens</text>
+<text x="46" y="466" font-size="14" text-anchor="start" font-weight="normal" style="fill:#172033">tail_blocks / is_eagle_group</text>
+<rect x="445" y="355" width="350" height="190" rx="10" fill="#ecfdf5" stroke="#059669"/>
+<text x="461" y="384" font-size="17" text-anchor="start" font-weight="600" style="fill:#059669">KVCacheGroupLayout</text>
+<line x1="445" y1="399" x2="795" y2="399" stroke="#059669" opacity=".25"/>
+<text x="461" y="422" font-size="14" text-anchor="start" font-weight="normal" style="fill:#172033">layers / layer_views</text>
+<text x="461" y="444" font-size="14" text-anchor="start" font-weight="normal" style="fill:#172033">base_ptrs / strides / payloads</text>
+<text x="461" y="466" font-size="14" text-anchor="start" font-weight="normal" style="fill:#172033">partial 能力 / block_first</text>
+<text x="461" y="488" font-size="14" text-anchor="start" font-weight="normal" style="fill:#172033">compile_access / segment_mask</text>
+<rect x="860" y="355" width="350" height="190" rx="10" fill="#fff7ed" stroke="#ea580c"/>
+<text x="876" y="384" font-size="17" text-anchor="start" font-weight="600" style="fill:#ea580c">GroupStoreLayout</text>
+<line x1="860" y1="399" x2="1210" y2="399" stroke="#ea580c" opacity=".25"/>
+<text x="876" y="422" font-size="14" text-anchor="start" font-weight="normal" style="fill:#172033">access / ucm_block_offsets</text>
+<text x="876" y="444" font-size="14" text-anchor="start" font-weight="normal" style="fill:#172033">store_bytes / merge_whole_blocks</text>
+<text x="876" y="466" font-size="14" text-anchor="start" font-weight="normal" style="fill:#172033">build / resolve_matrices</text>
+<rect x="30" y="625" width="350" height="190" rx="10" fill="#ecfdf5" stroke="#059669"/>
+<text x="46" y="654" font-size="17" text-anchor="start" font-weight="600" style="fill:#059669">UCMLayerSpec</text>
+<line x1="30" y1="669" x2="380" y2="669" stroke="#059669" opacity=".25"/>
+<text x="46" y="692" font-size="14" text-anchor="start" font-weight="normal" style="fill:#172033">owner name / layer_index / native spec</text>
+<text x="46" y="714" font-size="14" text-anchor="start" font-weight="normal" style="fill:#172033">storage_block_size / num_blocks</text>
+<text x="46" y="736" font-size="14" text-anchor="start" font-weight="normal" style="fill:#172033">descriptor / attention_view_order</text>
+<rect x="445" y="625" width="350" height="190" rx="10" fill="#ecfdf5" stroke="#059669"/>
+<text x="461" y="654" font-size="17" text-anchor="start" font-weight="600" style="fill:#059669">LayerView</text>
+<line x1="445" y1="669" x2="795" y2="669" stroke="#059669" opacity=".25"/>
+<text x="461" y="692" font-size="14" text-anchor="start" font-weight="normal" style="fill:#172033">layer_name / layer_id</text>
+<text x="461" y="714" font-size="14" text-anchor="start" font-weight="normal" style="fill:#172033">components</text>
+<text x="461" y="736" font-size="14" text-anchor="start" font-weight="normal" style="fill:#172033">segments（展开查询）</text>
+<rect x="860" y="625" width="350" height="190" rx="10" fill="#ecfdf5" stroke="#059669"/>
+<text x="876" y="654" font-size="17" text-anchor="start" font-weight="600" style="fill:#059669">BlockAccess</text>
+<line x1="860" y1="669" x2="1210" y2="669" stroke="#059669" opacity=".25"/>
+<text x="876" y="692" font-size="14" text-anchor="start" font-weight="normal" style="fill:#172033">layout（引用 GroupLayout）</text>
+<text x="876" y="714" font-size="14" text-anchor="start" font-weight="normal" style="fill:#172033">block_byte_offsets [P,V]</text>
+<text x="876" y="736" font-size="14" text-anchor="start" font-weight="normal" style="fill:#172033">segment_bytes [P,V]</text>
+<text x="876" y="758" font-size="14" text-anchor="start" font-weight="normal" style="fill:#172033">resolve_ptrs → [K×P,M]</text>
+<rect x="30" y="895" width="350" height="190" rx="10" fill="#ecfdf5" stroke="#059669"/>
+<text x="46" y="924" font-size="17" text-anchor="start" font-weight="600" style="fill:#059669">TensorDescriptor</text>
+<line x1="30" y1="939" x2="380" y2="939" stroke="#059669" opacity=".25"/>
+<text x="46" y="962" font-size="14" text-anchor="start" font-weight="normal" style="fill:#172033">layers / offset</text>
+<text x="46" y="984" font-size="14" text-anchor="start" font-weight="normal" style="fill:#172033">layer_stride / block_stride</text>
+<text x="46" y="1006" font-size="14" text-anchor="start" font-weight="normal" style="fill:#172033">单位：bytes</text>
+<rect x="445" y="895" width="350" height="190" rx="10" fill="#ecfdf5" stroke="#059669"/>
+<text x="461" y="924" font-size="17" text-anchor="start" font-weight="600" style="fill:#059669">ComponentView</text>
+<line x1="445" y1="939" x2="795" y2="939" stroke="#059669" opacity=".25"/>
+<text x="461" y="962" font-size="14" text-anchor="start" font-weight="normal" style="fill:#172033">shape / strides（元素）</text>
+<text x="461" y="984" font-size="14" text-anchor="start" font-weight="normal" style="fill:#172033">segments / partial 能力</text>
+<text x="461" y="1006" font-size="14" text-anchor="start" font-weight="normal" style="fill:#172033">不分配或复制 KV storage</text>
+<rect x="860" y="895" width="350" height="190" rx="10" fill="#ecfdf5" stroke="#059669"/>
+<text x="876" y="924" font-size="17" text-anchor="start" font-weight="600" style="fill:#059669">BlockFirstView</text>
+<line x1="860" y1="939" x2="1210" y2="939" stroke="#059669" opacity=".25"/>
+<text x="876" y="962" font-size="14" text-anchor="start" font-weight="normal" style="fill:#172033">base_ptr / block_stride</text>
+<text x="876" y="984" font-size="14" text-anchor="start" font-weight="normal" style="fill:#172033">block_size_bytes</text>
+<text x="876" y="1006" font-size="14" text-anchor="start" font-weight="normal" style="fill:#172033">本组连续 span，包含 page padding</text>
+<rect x="445" y="1165" width="350" height="190" rx="10" fill="#ecfdf5" stroke="#059669"/>
+<text x="461" y="1194" font-size="17" text-anchor="start" font-weight="600" style="fill:#059669">MemorySegment</text>
+<line x1="445" y1="1209" x2="795" y2="1209" stroke="#059669" opacity=".25"/>
+<text x="461" y="1232" font-size="14" text-anchor="start" font-weight="normal" style="fill:#172033">base_ptr / block_stride_bytes</text>
+<text x="461" y="1254" font-size="14" text-anchor="start" font-weight="normal" style="fill:#172033">states_per_block / bytes_per_state</text>
+<text x="461" y="1276" font-size="14" text-anchor="start" font-weight="normal" style="fill:#172033">payload_bytes</text>
+<polyline points="445,170 380,170" fill="none" stroke="#64748b" stroke-width="1.7" marker-end="url(#arrow)"/>
+<text x="412" y="160" font-size="13" text-anchor="middle" font-weight="normal" style="fill:#475569">spec</text>
+<polyline points="205,275 205,355" fill="none" stroke="#64748b" stroke-width="1.7" marker-end="url(#arrow)"/>
+<text x="265" y="323" font-size="13" text-anchor="middle" font-weight="normal" style="fill:#475569">groups 1..*</text>
+<polyline points="620,275 620,355" fill="none" stroke="#64748b" stroke-width="1.7" marker-end="url(#arrow)"/>
+<text x="709" y="322" font-size="13" text-anchor="middle" font-weight="normal" style="fill:#475569">group_layouts 0..*</text>
+<polyline points="795,170 1035,170 1035,355" fill="none" stroke="#64748b" stroke-width="1.7" marker-end="url(#arrow)"/>
+<text x="1025" y="155" font-size="13" text-anchor="middle" font-weight="normal" style="fill:#475569">store_layouts 0..*</text>
+<polyline points="445,466 390,466 390,593 205,593 205,625" fill="none" stroke="#64748b" stroke-width="1.7" marker-end="url(#arrow)"/>
+<text x="310" y="580" font-size="13" text-anchor="middle" font-weight="normal" style="fill:#475569">layers 1..*</text>
+<polyline points="620,545 620,625" fill="none" stroke="#64748b" stroke-width="1.7" marker-end="url(#arrow)"/>
+<text x="688" y="594" font-size="13" text-anchor="middle" font-weight="normal" style="fill:#475569">views 1..*</text>
+<polyline points="1035,545 1035,625" fill="none" stroke="#64748b" stroke-width="1.7" marker-end="url(#arrow)"/>
+<text x="1070" y="594" font-size="13" text-anchor="middle" font-weight="normal" style="fill:#475569">access</text>
+<polyline points="205,815 205,895" fill="none" stroke="#64748b" stroke-width="1.7" marker-end="url(#arrow)"/>
+<text x="286" y="863" font-size="13" text-anchor="middle" font-weight="normal" style="fill:#475569">descriptor 0..1</text>
+<polyline points="620,815 620,895" fill="none" stroke="#64748b" stroke-width="1.7" marker-end="url(#arrow)"/>
+<text x="704" y="863" font-size="13" text-anchor="middle" font-weight="normal" style="fill:#475569">components 0..*</text>
+<polyline points="620,1085 620,1165" fill="none" stroke="#64748b" stroke-width="1.7" marker-end="url(#arrow)"/>
+<text x="698" y="1133" font-size="13" text-anchor="middle" font-weight="normal" style="fill:#475569">segments 1..*</text>
+<polyline points="795,430 820,430 820,305 1228,305 1228,990 1210,990" fill="none" stroke="#64748b" stroke-width="1.7" marker-end="url(#arrow)"/>
+<text x="1100" y="295" font-size="13" text-anchor="middle" font-weight="normal" style="fill:#475569">block_first 0..1</text>
+<polyline points="860,723 815,723 815,568 742,568 742,545" fill="none" stroke="#64748b" stroke-width="1.7" marker-end="url(#arrow)"/>
+<text x="808" y="705" font-size="13" transform="rotate(-90 808 705)" style="fill:#475569">layout 引用</text>
+<polyline points="795,487 836,487 836,594 915,594 915,625" fill="none" stroke="#64748b" stroke-width="1.7" marker-end="url(#arrow)" stroke-dasharray="6 4"/>
+<text x="914" y="584" font-size="13" text-anchor="middle" font-weight="normal" style="fill:#475569">compile_access</text>
+</svg>

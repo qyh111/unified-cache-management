@@ -1,0 +1,34 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1080" height="615" viewBox="0 0 1080 615" role="img" aria-label="State 字节页和通用寻址">
+<title>State 字节页和通用寻址</title>
+<defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 Z" fill="#64748b"/></marker></defs><style>text{font-family:Inter,"PingFang SC","Microsoft YaHei",Arial,sans-serif;fill:#172033} .small{font-size:13px} .mono{font-family:"SFMono-Regular",Consolas,monospace;font-size:13px}</style>
+<rect width="1080" height="615" rx="14" fill="#fff"/>
+<text x="28" y="32" font-size="21" text-anchor="start" font-weight="600" style="fill:#172033">08 · State 与 Attention 共用地址公式</text>
+<text x="28" y="57" font-size="14" text-anchor="start" font-weight="normal" style="fill:#64748b">布局解析负责内容/步长；恢复目标 A/B、原生 copy 与等待时机由模块外部处理。</text>
+<rect x="35" y="99" width="465" height="126" rx="10" fill="#ecfdf5" stroke="#059669"/>
+<text x="51" y="128" font-size="17" text-anchor="start" font-weight="600" style="fill:#059669">CUDA State</text>
+<line x1="35" y1="143" x2="500" y2="143" stroke="#059669" opacity=".25"/>
+<text x="51" y="166" font-size="14" text-anchor="start" font-weight="normal" style="fill:#172033">已注册 [B,1,1,content_bytes] int8 view</text>
+<text x="51" y="188" font-size="14" text-anchor="start" font-weight="normal" style="fill:#172033">states_per_block=1</text>
+<text x="51" y="210" font-size="14" text-anchor="start" font-weight="normal" style="fill:#172033">保留实际 data_ptr/block stride</text>
+<rect x="580" y="99" width="465" height="126" rx="10" fill="#ecfdf5" stroke="#059669"/>
+<text x="596" y="128" font-size="17" text-anchor="start" font-weight="600" style="fill:#059669">Ascend State</text>
+<line x1="580" y1="143" x2="1045" y2="143" stroke="#059669" opacity=".25"/>
+<text x="596" y="166" font-size="14" text-anchor="start" font-weight="normal" style="fill:#172033">typed components → _as_byte_page</text>
+<text x="596" y="188" font-size="14" text-anchor="start" font-weight="normal" style="fill:#172033">[Q,1,1,每 row 有效字节]</text>
+<text x="596" y="210" font-size="14" text-anchor="start" font-weight="normal" style="fill:#172033">dtype view + as_strided；不复制缓存</text>
+<rect x="210" y="293" width="660" height="125" rx="10" fill="#fff7ed" stroke="#ea580c"/>
+<text x="226" y="322" font-size="17" text-anchor="start" font-weight="600" style="fill:#ea580c">MemorySegment → BlockAccess</text>
+<line x1="210" y1="337" x2="870" y2="337" stroke="#ea580c" opacity=".25"/>
+<text x="226" y="360" font-size="14" text-anchor="start" font-weight="normal" style="fill:#172033">ptr = base + block_id × block_stride + byte_offset</text>
+<text x="226" y="382" font-size="14" text-anchor="start" font-weight="normal" style="fill:#172033">一个完整快照：t×1/T 只有完整边界可整除</text>
+<text x="226" y="404" font-size="14" text-anchor="start" font-weight="normal" style="fill:#172033">整组 Block First 时允许保存已有 page padding</text>
+<polyline points="267,225 267,259 400,259 400,293" fill="none" stroke="#64748b" stroke-width="1.7" marker-end="url(#arrow)"/>
+<polyline points="812,225 812,259 680,259 680,293" fill="none" stroke="#64748b" stroke-width="1.7" marker-end="url(#arrow)"/>
+<rect x="35" y="485" width="1010" height="94" rx="10" fill="#f1f5f9" stroke="#64748b"/>
+<text x="51" y="514" font-size="17" text-anchor="start" font-weight="600" style="fill:#64748b">Layout 外部：生命周期</text>
+<line x1="35" y1="529" x2="1045" y2="529" stroke="#64748b" opacity=".25"/>
+<text x="51" y="552" font-size="14" text-anchor="start" font-weight="normal" style="fill:#172033">CUDA 填 A+B；Ascend 先填边界 A 再原生 A→B；保存使用精确 boundary_state_offloads</text>
+<text x="51" y="574" font-size="14" text-anchor="start" font-weight="normal" style="fill:#172033">当前 State 在 forward 前等完。State layerwise 加载/计算流水仍待实现。</text>
+<polyline points="540,418 540,485" fill="none" stroke="#64748b" stroke-width="1.7" marker-end="url(#arrow)"/>
+<text x="614" y="458" font-size="13" text-anchor="middle" font-weight="normal" style="fill:#475569">布局供查询</text>
+</svg>

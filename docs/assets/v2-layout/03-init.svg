@@ -1,0 +1,56 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1060" height="795" viewBox="0 0 1060 795" role="img" aria-label="Layout 初始化流程">
+<title>Layout 初始化流程</title>
+<defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 Z" fill="#64748b"/></marker></defs><style>text{font-family:Inter,"PingFang SC","Microsoft YaHei",Arial,sans-serif;fill:#172033} .small{font-size:13px} .mono{font-family:"SFMono-Regular",Consolas,monospace;font-size:13px}</style>
+<rect width="1060" height="795" rx="14" fill="#fff"/>
+<text x="28" y="32" font-size="21" text-anchor="start" font-weight="600" style="fill:#172033">03 · 构建顺序</text>
+<text x="28" y="57" font-size="14" text-anchor="start" font-weight="normal" style="fill:#64748b">阶段一：逻辑策略；阶段二：worker 绑定；阶段三：外存模板。运行时不重新解析 view。</text>
+<rect x="40" y="95" width="430" height="105" rx="10" fill="#eff6ff" stroke="#2563eb"/>
+<text x="56" y="124" font-size="17" text-anchor="start" font-weight="600" style="fill:#2563eb">parse_kv_cache_config</text>
+<line x1="40" y1="139" x2="470" y2="139" stroke="#2563eb" opacity=".25"/>
+<text x="56" y="162" font-size="14" text-anchor="start" font-weight="normal" style="fill:#172033">原生 prefix_cacheable_group_ids / kind / tail</text>
+<text x="56" y="184" font-size="14" text-anchor="start" font-weight="normal" style="fill:#172033">选择 UCM token 粒度 → 固定 tail_blocks</text>
+<rect x="590" y="95" width="430" height="105" rx="10" fill="#eff6ff" stroke="#2563eb"/>
+<text x="606" y="124" font-size="17" text-anchor="start" font-weight="600" style="fill:#2563eb">UCMKVCacheSpec</text>
+<line x1="590" y1="139" x2="1020" y2="139" stroke="#2563eb" opacity=".25"/>
+<text x="606" y="162" font-size="14" text-anchor="start" font-weight="normal" style="fill:#172033">scheduler 与 worker 共用策略入口</text>
+<text x="606" y="184" font-size="14" text-anchor="start" font-weight="normal" style="fill:#172033">不含 device ptr 或物理 allocation 大小</text>
+<polyline points="470,147 590,147" fill="none" stroke="#64748b" stroke-width="1.7" marker-end="url(#arrow)"/>
+<text x="530" y="136" font-size="13" text-anchor="middle" font-weight="normal" style="fill:#475569">返回</text>
+<rect x="40" y="255" width="430" height="115" rx="10" fill="#f5f3ff" stroke="#7c3aed"/>
+<text x="56" y="284" font-size="17" text-anchor="start" font-weight="600" style="fill:#7c3aed">register_kv_caches → aggregate</text>
+<line x1="40" y1="299" x2="470" y2="299" stroke="#7c3aed" opacity=".25"/>
+<text x="56" y="322" font-size="14" text-anchor="start" font-weight="normal" style="fill:#172033">输入：worker KVCacheConfig + kv_caches</text>
+<text x="56" y="344" font-size="14" text-anchor="start" font-weight="normal" style="fill:#172033">UCMKVCacheLayout(..., use_layerwise)</text>
+<rect x="590" y="255" width="430" height="115" rx="10" fill="#ecfdf5" stroke="#059669"/>
+<text x="606" y="284" font-size="17" text-anchor="start" font-weight="600" style="fill:#059669">build_group_layouts</text>
+<line x1="590" y1="299" x2="1020" y2="299" stroke="#059669" opacity=".25"/>
+<text x="606" y="322" font-size="14" text-anchor="start" font-weight="normal" style="fill:#172033">descriptor 索引、逐层 native spec</text>
+<text x="606" y="344" font-size="14" text-anchor="start" font-weight="normal" style="fill:#172033">storage_block_size / axis order / BF 候选</text>
+<polyline points="40,310 20,310 20,229 805,229 805,200" fill="none" stroke="#64748b" stroke-width="1.7" marker-end="url(#arrow)" stroke-dasharray="6 4"/>
+<text x="650" y="222" font-size="13" text-anchor="middle" font-weight="normal" style="fill:#475569">读取策略</text>
+<polyline points="470,310 590,310" fill="none" stroke="#64748b" stroke-width="1.7" marker-end="url(#arrow)"/>
+<text x="530" y="299" font-size="13" text-anchor="middle" font-weight="normal" style="fill:#475569">绑定</text>
+<rect x="590" y="425" width="430" height="125" rx="10" fill="#ecfdf5" stroke="#059669"/>
+<text x="606" y="454" font-size="17" text-anchor="start" font-weight="600" style="fill:#059669">KVCacheGroupLayout → build_layer_view</text>
+<line x1="590" y1="469" x2="1020" y2="469" stroke="#059669" opacity=".25"/>
+<text x="606" y="492" font-size="14" text-anchor="start" font-weight="normal" style="fill:#172033">BNHC→BHNC；State 字节页；K/V unbind</text>
+<text x="606" y="514" font-size="14" text-anchor="start" font-weight="normal" style="fill:#172033">真实 shape/stride → Component/Segment</text>
+<text x="606" y="536" font-size="14" text-anchor="start" font-weight="normal" style="fill:#172033">展平寻址列；group partial 能力；BF span</text>
+<polyline points="805,370 805,425" fill="none" stroke="#64748b" stroke-width="1.7" marker-end="url(#arrow)"/>
+<rect x="40" y="425" width="430" height="125" rx="10" fill="#fff7ed" stroke="#ea580c"/>
+<text x="56" y="454" font-size="17" text-anchor="start" font-weight="600" style="fill:#ea580c">GroupStoreLayout.build</text>
+<line x1="40" y1="469" x2="470" y2="469" stroke="#ea580c" opacity=".25"/>
+<text x="56" y="492" font-size="14" text-anchor="start" font-weight="normal" style="fill:#172033">编译 BlockAccess 的固定范围</text>
+<text x="56" y="514" font-size="14" text-anchor="start" font-weight="normal" style="fill:#172033">通用 payload 模板 或 padded BF bulk</text>
+<text x="56" y="536" font-size="14" text-anchor="start" font-weight="normal" style="fill:#172033">生成 offsets/sizes/store_bytes</text>
+<polyline points="590,485 470,485" fill="none" stroke="#64748b" stroke-width="1.7" marker-end="url(#arrow)"/>
+<text x="531" y="474" font-size="13" text-anchor="middle" font-weight="normal" style="fill:#475569">HBM几何</text>
+<rect x="40" y="615" width="980" height="105" rx="10" fill="#f5f3ff" stroke="#7c3aed"/>
+<text x="56" y="644" font-size="17" text-anchor="start" font-weight="600" style="fill:#7c3aed">UCMKVCacheLayout 完成</text>
+<line x1="40" y1="659" x2="1020" y2="659" stroke="#7c3aed" opacity=".25"/>
+<text x="56" y="682" font-size="14" text-anchor="start" font-weight="normal" style="fill:#172033">spec + group_layouts + store_layouts；建立 owner / 模型层号索引</text>
+<text x="56" y="704" font-size="14" text-anchor="start" font-weight="normal" style="fill:#172033">外部再创建 UCMTransferBuilder(layout)，Layout 本身不遍历 plan</text>
+<polyline points="255,550 255,615" fill="none" stroke="#64748b" stroke-width="1.7" marker-end="url(#arrow)"/>
+<polyline points="805,550 805,615" fill="none" stroke="#64748b" stroke-width="1.7" marker-end="url(#arrow)"/>
+<text x="42" y="766" font-size="15" text-anchor="start" font-weight="normal" style="fill:#64748b">原生禁用存取项与本地空 group 保留 native ID，不创建 HBM/store layout。</text>
+</svg>

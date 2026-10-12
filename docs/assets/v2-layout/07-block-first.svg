@@ -1,0 +1,47 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1120" height="720" viewBox="0 0 1120 720" role="img" aria-label="Block First bulk 与紧凑 layerwise 的存储差异">
+<title>Block First bulk 与紧凑 layerwise 的存储差异</title>
+<defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 Z" fill="#64748b"/></marker></defs><style>text{font-family:Inter,"PingFang SC","Microsoft YaHei",Arial,sans-serif;fill:#172033} .small{font-size:13px} .mono{font-family:"SFMono-Regular",Consolas,monospace;font-size:13px}</style>
+<rect width="1120" height="720" rx="14" fill="#fff"/>
+<text x="28" y="32" font-size="21" text-anchor="start" font-weight="600" style="fill:#172033">07 · Block First：bulk 与 layerwise 使用不同外存模板</text>
+<text x="28" y="57" font-size="14" text-anchor="start" font-weight="normal" style="fill:#64748b">例子：L0有效32B/page48B；L1有效16B/page32B；本组span80B；全局stride96B。</text>
+<text x="35" y="109" font-size="18" text-anchor="start" font-weight="600" style="fill:#172033">HBM 一块：</text>
+<rect x="35" y="134" width="318" height="62" rx="3" fill="#bfdbfe" stroke="#94a3b8"/>
+<text x="195" y="169" font-size="15" text-anchor="middle" font-weight="normal" style="fill:#172033">L0 32B</text>
+<rect x="355" y="134" width="158" height="62" rx="3" fill="#e2e8f0" stroke="#94a3b8"/>
+<text x="435" y="169" font-size="15" text-anchor="middle" font-weight="normal" style="fill:#172033">pad16</text>
+<rect x="515" y="134" width="158" height="62" rx="3" fill="#a7f3d0" stroke="#94a3b8"/>
+<text x="595" y="169" font-size="15" text-anchor="middle" font-weight="normal" style="fill:#172033">L1 16B</text>
+<rect x="675" y="134" width="158" height="62" rx="3" fill="#e2e8f0" stroke="#94a3b8"/>
+<text x="755" y="169" font-size="15" text-anchor="middle" font-weight="normal" style="fill:#172033">pad16</text>
+<rect x="835" y="134" width="158" height="62" rx="3" fill="#f1f5f9" stroke="#94a3b8"/>
+<text x="915" y="169" font-size="15" text-anchor="middle" font-weight="normal" style="fill:#172033">组外16</text>
+<text x="35" y="220" font-size="14" text-anchor="start" font-weight="normal" style="fill:#172033">0</text>
+<text x="355" y="220" font-size="14" text-anchor="start" font-weight="normal" style="fill:#172033">32</text>
+<text x="515" y="220" font-size="14" text-anchor="start" font-weight="normal" style="fill:#172033">48</text>
+<text x="675" y="220" font-size="14" text-anchor="start" font-weight="normal" style="fill:#172033">64</text>
+<text x="835" y="220" font-size="14" text-anchor="start" font-weight="normal" style="fill:#172033">80</text>
+<text x="995" y="220" font-size="14" text-anchor="start" font-weight="normal" style="fill:#172033">96</text>
+<rect x="35" y="270" width="485" height="190" rx="10" fill="#fff7ed" stroke="#ea580c"/>
+<text x="51" y="299" font-size="17" text-anchor="start" font-weight="600" style="fill:#ea580c">bulk：use_layerwise=False</text>
+<line x1="35" y1="314" x2="520" y2="314" stroke="#ea580c" opacity=".25"/>
+<text x="51" y="337" font-size="14" text-anchor="start" font-weight="normal" style="fill:#172033">有 BlockFirstView 且访问完整块</text>
+<text x="51" y="359" font-size="14" text-anchor="start" font-weight="normal" style="fill:#172033">外存 offset0，复制本组80B</text>
+<text x="51" y="381" font-size="14" text-anchor="start" font-weight="normal" style="fill:#172033">包含两处 page padding</text>
+<text x="51" y="403" font-size="14" text-anchor="start" font-weight="normal" style="fill:#172033">组外16B不存；每块1段 IO</text>
+<rect x="590" y="270" width="485" height="190" rx="10" fill="#eff6ff" stroke="#2563eb"/>
+<text x="606" y="299" font-size="17" text-anchor="start" font-weight="600" style="fill:#2563eb">layerwise：use_layerwise=True</text>
+<line x1="590" y1="314" x2="1075" y2="314" stroke="#2563eb" opacity=".25"/>
+<text x="606" y="337" font-size="14" text-anchor="start" font-weight="normal" style="fill:#172033">始终使用通用有效 payload 模板</text>
+<text x="606" y="359" font-size="14" text-anchor="start" font-weight="normal" style="fill:#172033">L0：offset0，size32</text>
+<text x="606" y="381" font-size="14" text-anchor="start" font-weight="normal" style="fill:#172033">L1：offset32，size16</text>
+<text x="606" y="403" font-size="14" text-anchor="start" font-weight="normal" style="fill:#172033">一块总外存48B；不保留page间隙</text>
+<polyline points="275,196 275,270" fill="none" stroke="#64748b" stroke-width="1.7" marker-end="url(#arrow)"/>
+<polyline points="750,196 830,245 830,270" fill="none" stroke="#64748b" stroke-width="1.7" marker-end="url(#arrow)"/>
+<rect x="35" y="517" width="1040" height="136" rx="10" fill="#f5f3ff" stroke="#7c3aed"/>
+<text x="51" y="546" font-size="17" text-anchor="start" font-weight="600" style="fill:#7c3aed">mask 与存储格式是两个不同概念</text>
+<line x1="35" y1="561" x2="1075" y2="561" stroke="#7c3aed" opacity=".25"/>
+<text x="51" y="584" font-size="14" text-anchor="start" font-weight="normal" style="fill:#172033">配置 bulk 后临时只选 L1：它仍写 bulk 模板的 offset48。</text>
+<text x="51" y="606" font-size="14" text-anchor="start" font-weight="normal" style="fill:#172033">配置 layerwise 后选 L1：它写紧凑模板的 offset32。</text>
+<text x="51" y="628" font-size="14" text-anchor="start" font-weight="normal" style="fill:#172033">use_layerwise 在初始化时决定格式；segment_mask 只选择本次访问列。</text>
+<text x="35" y="688" font-size="15" text-anchor="start" font-weight="normal" style="fill:#64748b">State 也可用 padded bulk；NPU 不建立整组 BlockFirstView。r7 与 layerwise 后缀隔离格式。</text>
+</svg>

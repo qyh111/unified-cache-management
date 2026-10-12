@@ -1,0 +1,45 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1080" height="705" viewBox="0 0 1080 705" role="img" aria-label="BlockAccess 模板和广播寻址">
+<title>BlockAccess 模板和广播寻址</title>
+<defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 Z" fill="#64748b"/></marker></defs><style>text{font-family:Inter,"PingFang SC","Microsoft YaHei",Arial,sans-serif;fill:#172033} .small{font-size:13px} .mono{font-family:"SFMono-Regular",Consolas,monospace;font-size:13px}</style>
+<rect width="1080" height="705" rx="14" fill="#fff"/>
+<text x="28" y="32" font-size="21" text-anchor="start" font-weight="600" style="fill:#172033">05 · 固定模板 + block IDs → 物理 ptrs</text>
+<text x="28" y="57" font-size="14" text-anchor="start" font-weight="normal" style="fill:#64748b">例子：T=8，tail12，2层；base=[1000,2000]，stride=[32,16]，P=2，K=2。</text>
+<rect x="35" y="96" width="435" height="145" rx="10" fill="#eff6ff" stroke="#2563eb"/>
+<text x="51" y="125" font-size="17" text-anchor="start" font-weight="600" style="fill:#2563eb">初始化时编译 [P,V]</text>
+<line x1="35" y1="140" x2="470" y2="140" stroke="#2563eb" opacity=".25"/>
+<text x="51" y="163" font-size="14" text-anchor="start" font-weight="normal" style="fill:#172033">starts=[4,0]   counts=[4,8]</text>
+<text x="51" y="185" font-size="14" text-anchor="start" font-weight="normal" style="fill:#172033">byte offsets=[[16,8],[0,0]]</text>
+<text x="51" y="207" font-size="14" text-anchor="start" font-weight="normal" style="fill:#172033">sizes=[[16,8],[32,16]]</text>
+<rect x="610" y="96" width="435" height="145" rx="10" fill="#f1f5f9" stroke="#64748b"/>
+<text x="626" y="125" font-size="17" text-anchor="start" font-weight="600" style="fill:#64748b">运行时输入 [K×P]</text>
+<line x1="610" y1="140" x2="1045" y2="140" stroke="#64748b" opacity=".25"/>
+<text x="626" y="163" font-size="14" text-anchor="start" font-weight="normal" style="fill:#172033">blocks=[3,4,8,9]</text>
+<text x="626" y="185" font-size="14" text-anchor="start" font-weight="normal" style="fill:#172033">key0: b3,b4     key1: b8,b9</text>
+<text x="626" y="207" font-size="14" text-anchor="start" font-weight="normal" style="fill:#172033">按 chunk 顺序排列</text>
+<polyline points="252,241 252,289 540,289" fill="none" stroke="#64748b" stroke-width="1.7" marker-end="url(#arrow)"/>
+<text x="350" y="279" font-size="13" text-anchor="middle" font-weight="normal" style="fill:#475569">模板</text>
+<polyline points="827,241 827,289 540,289" fill="none" stroke="#64748b" stroke-width="1.7" marker-end="url(#arrow)"/>
+<text x="722" y="279" font-size="13" text-anchor="middle" font-weight="normal" style="fill:#475569">实际块号</text>
+<rect x="170" y="322" width="740" height="126" rx="10" fill="#ecfdf5" stroke="#059669"/>
+<text x="186" y="351" font-size="17" text-anchor="start" font-weight="600" style="fill:#059669">广播到 [K,P,M]</text>
+<line x1="170" y1="366" x2="910" y2="366" stroke="#059669" opacity=".25"/>
+<text x="186" y="389" font-size="14" text-anchor="start" font-weight="normal" style="fill:#172033">base[1,1,M] + blocks[K,P,1] × stride[1,1,M]</text>
+<text x="186" y="411" font-size="14" text-anchor="start" font-weight="normal" style="fill:#172033">+ fixed_offsets[1,P,M] → ptrs[K,P,M]</text>
+<text x="186" y="433" font-size="14" text-anchor="start" font-weight="normal" style="fill:#172033">可选动态 offset 再换成 bytes；最后 reshape [K×P,M]</text>
+<polyline points="540,289 540,322" fill="none" stroke="#64748b" stroke-width="1.7" marker-end="url(#arrow)"/>
+<rect x="35" y="510" width="485" height="137" rx="10" fill="#ecfdf5" stroke="#059669"/>
+<text x="51" y="539" font-size="17" text-anchor="start" font-weight="600" style="fill:#059669">key0：两块 × 两列</text>
+<line x1="35" y1="554" x2="520" y2="554" stroke="#059669" opacity=".25"/>
+<text x="51" y="577" font-size="14" text-anchor="start" font-weight="normal" style="fill:#172033">b3: [1112,2056]   （只取后4token）</text>
+<text x="51" y="599" font-size="14" text-anchor="start" font-weight="normal" style="fill:#172033">b4: [1128,2064]   （完整8token）</text>
+<text x="51" y="621" font-size="14" text-anchor="start" font-weight="normal" style="fill:#172033">1000+3×32+16 = 1112</text>
+<rect x="560" y="510" width="485" height="137" rx="10" fill="#ecfdf5" stroke="#059669"/>
+<text x="576" y="539" font-size="17" text-anchor="start" font-weight="600" style="fill:#059669">key1：两块 × 两列</text>
+<line x1="560" y1="554" x2="1045" y2="554" stroke="#059669" opacity=".25"/>
+<text x="576" y="577" font-size="14" text-anchor="start" font-weight="normal" style="fill:#172033">b8: [1272,2136]   （只取后4token）</text>
+<text x="576" y="599" font-size="14" text-anchor="start" font-weight="normal" style="fill:#172033">b9: [1288,2144]   （完整8token）</text>
+<text x="576" y="621" font-size="14" text-anchor="start" font-weight="normal" style="fill:#172033">2000+9×16 = 2144</text>
+<polyline points="325,448 325,510" fill="none" stroke="#64748b" stroke-width="1.7" marker-end="url(#arrow)"/>
+<polyline points="755,448 755,510" fill="none" stroke="#64748b" stroke-width="1.7" marker-end="url(#arrow)"/>
+<text x="35" y="683" font-size="15" text-anchor="start" font-weight="normal" style="fill:#64748b">reshape 表达块与模板的重复关系；不移动 HBM KV bytes。</text>
+</svg>
