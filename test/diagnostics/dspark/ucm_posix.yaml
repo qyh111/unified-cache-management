@@ -1,0 +1,13 @@
+ucm_connectors:
+  - ucm_connector_name: "UcmPipelineStore"
+    ucm_connector_config:
+      store_pipeline: "Cache|Posix"
+      storage_backends: "/home/qyh/dspark-0731-debug-20261116/store-posix"
+      posix_io_engine: "psync"
+      posix_data_trans_concurrency: 128
+      io_direct: false
+enable_event_sync: true
+enable_metrics: false
+wa_dump_block_wise: true
+persist_token_threshold: 0
+load_tokens_threshold: 0

@@ -1,0 +1,223 @@
+diff --git a/vllm_ascend/models/deepseek_v4_dspark.py b/vllm_ascend/models/deepseek_v4_dspark.py
+index 82b134ebd..9c5694cfa 100644
+--- a/vllm_ascend/models/deepseek_v4_dspark.py
++++ b/vllm_ascend/models/deepseek_v4_dspark.py
+@@ -33,6 +33,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
+ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+ from vllm.model_executor.models.utils import PPMissingLayer, maybe_prefix
+ 
++from vllm_ascend.diagnostics import tensor_stats
+ from vllm_ascend.models.deepseek_v4 import (
+     DeepseekV2DecoderLayer,
+     DeepseekV2MixtureOfExperts,
+@@ -165,7 +166,9 @@ class DeepseekV4DSparkModel(nn.Module):
+         return [layer.self_attn.dsa_attn.swa_cache_layer.prefix for layer in self.layers.values()]
+ 
+     def combine_hidden_states(self, aux_hidden_states: torch.Tensor) -> torch.Tensor:
+-        return self.main_norm(self.main_proj(aux_hidden_states))
++        combined = self.main_norm(self.main_proj(aux_hidden_states))
++        tensor_stats("draft.combined_hidden_states", combined)
++        return combined
+ 
+     def _project_shared_kv(
+         self,
+@@ -216,6 +219,7 @@ class DeepseekV4DSparkModel(nn.Module):
+                 return
+             attn = layer.self_attn
+             shared_kv = self._project_shared_kv(context_states, context_positions, attn)
++            tensor_stats(f"draft.context_kv.layer={self.mtp_start_layer_idx + layer_idx}", shared_kv)
+             self._store_standard_swa_kv(shared_kv, layer_context_slot_mapping, attn)
+ 
+     def forward(
+diff --git a/vllm_ascend/sample/rejection_sampler.py b/vllm_ascend/sample/rejection_sampler.py
+index b3424b033..604304432 100644
+--- a/vllm_ascend/sample/rejection_sampler.py
++++ b/vllm_ascend/sample/rejection_sampler.py
+@@ -22,6 +22,7 @@ from vllm.v1.sample.sampler import Sampler
+ from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
+ 
+ from vllm_ascend.ascend_config import get_ascend_config
++from vllm_ascend.diagnostics import tensor_stats, token_ids
+ from vllm_ascend.ops.triton.reject_sample import (
+     cal_grid_and_block_size,
+     expand_triton,
+@@ -536,6 +537,9 @@ def rejection_sample(
+         else:
+             target_argmax = target_logits.argmax(dim=-1).view(-1)
+ 
++        tensor_stats("sampler.target_logits", target_logits)
++        token_ids("sampler.target_argmax", target_argmax)
++        token_ids("sampler.draft_token_ids", draft_token_ids)
+         if HAS_TRITON:
+             rejection_greedy_sample_with_triton(
+                 output_token_ids,
+diff --git a/vllm_ascend/spec_decode/llm_base_proposer.py b/vllm_ascend/spec_decode/llm_base_proposer.py
+index 39c5f65a1..c8df9f160 100644
+--- a/vllm_ascend/spec_decode/llm_base_proposer.py
++++ b/vllm_ascend/spec_decode/llm_base_proposer.py
+@@ -47,6 +47,7 @@ from vllm_ascend.attention.attention_v1 import AscendAttentionState
+ from vllm_ascend.attention.utils import AscendCommonAttentionMetadata
+ from vllm_ascend.compilation.acl_graph import ACLGraphWrapper, update_full_graph_params
+ from vllm_ascend.device.device_op import DeviceOperator
++from vllm_ascend.diagnostics import tensor_stats, token_ids
+ from vllm_ascend.distributed.parallel_state import get_lmhead_tp_group
+ from vllm_ascend.models.deepseek_v4_dspark import DSparkDeepseekV4ForCausalLM
+ from vllm_ascend.models.llama_eagle3_vwn import Eagle3VwnLlamaForCausalLM
+@@ -1135,6 +1136,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
+                 # We changed `flash_comm_v1_enabled` to avoid `markov_emb` from being split.
+                 with _disable_flash_comm_v1_context():
+                     raw_logits = self.model.compute_logits(sample_hidden_states)
++                    tensor_stats("draft.raw_logits", raw_logits)
+                     logits = raw_logits.view(-1, self.num_speculative_tokens, raw_logits.shape[-1])
+                     num_blk = logits.shape[0]
+                     draft_token_ids = self._dspark_draft_buffer[:num_blk]
+@@ -1159,6 +1161,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
+         # Early exit if there is only one draft token to be generated.
+         if self.num_speculative_tokens == 1 or self.parallel_drafting:
+             if self.method == "dspark":
++                token_ids("draft.token_ids", draft_token_ids[:, 1:])
+                 return draft_token_ids[:, 1:]
+             else:
+                 # [batch_size, 1]
+diff --git a/vllm_ascend/worker/model_runner_v1.py b/vllm_ascend/worker/model_runner_v1.py
+index 9b94c5fb4..0a1a1c60b 100644
+--- a/vllm_ascend/worker/model_runner_v1.py
++++ b/vllm_ascend/worker/model_runner_v1.py
+@@ -142,6 +142,7 @@ from vllm_ascend.spec_decode.medusa_proposer import AscendMedusaProposer
+ from vllm_ascend.spec_decode.ngram_proposer import AscendNgramProposer
+ from vllm_ascend.spec_decode.ngram_proposer_npu import AscendNgramProposerNPU
+ from vllm_ascend.spec_decode.step3p5 import AscendStep3p5MTPProposer
++from vllm_ascend.diagnostics import tensor_stats
+ from vllm_ascend.spec_decode.suffix_proposer import AscendSuffixDecodingProposer
+ from vllm_ascend.spec_decode.utils import (
+     correct_optimistic_seq_lens_cpu,
+@@ -1604,6 +1605,7 @@ class NPUModelRunner(GPUModelRunner):
+                 else:
+                     target_hidden_states = hidden_states[token_indices]
+             assert self.drafter is not None
++            tensor_stats("target.draft_input_hidden_states", target_hidden_states)
+             draft_token_ids = self.drafter._propose(
+                 target_token_ids=target_token_ids,
+                 target_positions=target_positions,
+diff --git a/vllm_ascend/diagnostics.py b/vllm_ascend/diagnostics.py
+new file mode 100644
+index 000000000..085c073af
+--- /dev/null
++++ b/vllm_ascend/diagnostics.py
+@@ -0,0 +1,116 @@
++"""Opt-in DSpark/UCM numerical diagnostics.
++
++Set VLLM_ASCEND_DSPARK_DIAG=1 to enable. All helpers are best-effort and
++intentionally synchronize NPU work when enabled.
++"""
++
++from __future__ import annotations
++
++import logging
++import os
++from collections import defaultdict
++from collections.abc import Sequence
++
++import torch
++
++logger = logging.getLogger("vllm_ascend.diagnostics")
++_ENABLED = os.getenv("VLLM_ASCEND_DSPARK_DIAG", "0").lower() in ("1", "true", "yes")
++_EVERY = max(int(os.getenv("VLLM_ASCEND_DSPARK_DIAG_EVERY", "1")), 1)
++_MAX_LAYERS = int(os.getenv("VLLM_ASCEND_DSPARK_DIAG_MAX_LAYERS", "0"))
++_MAX_BLOCKS = max(int(os.getenv("VLLM_ASCEND_DSPARK_DIAG_MAX_BLOCKS", "1")), 1)
++_ID_LIMIT = max(int(os.getenv("VLLM_ASCEND_DSPARK_DIAG_ID_LIMIT", "16")), 1)
++_counts: dict[str, int] = defaultdict(int)
++
++
++def _selected(name: str) -> bool:
++    if not _ENABLED:
++        return False
++    _counts[name] += 1
++    return _counts[name] % _EVERY == 1
++
++
++def tensor_stats(name: str, tensor: torch.Tensor | None) -> None:
++    if tensor is None or not isinstance(tensor, torch.Tensor) or not _selected(name):
++        return
++    try:
++        value = tensor.detach()
++        shape = tuple(value.shape)
++        dtype = value.dtype
++        if value.is_floating_point() or value.is_complex():
++            nan_count = int(torch.isnan(value).sum().item())
++            posinf_count = int((value == float("inf")).sum().item())
++            neginf_count = int((value == float("-inf")).sum().item())
++            finite = value[torch.isfinite(value)]
++        else:
++            nan_count = posinf_count = neginf_count = 0
++            finite = value
++        if finite.numel() > 0:
++            minimum = float(finite.min().item())
++            maximum = float(finite.max().item())
++        else:
++            minimum = maximum = float("nan")
++        logger.warning(
++            "[DSPARK_DIAG] %s shape=%s dtype=%s device=%s nan=%d +inf=%d -inf=%d min=%r max=%r",
++            name,
++            shape,
++            dtype,
++            value.device,
++            nan_count,
++            posinf_count,
++            neginf_count,
++            minimum,
++            maximum,
++        )
++    except Exception as error:
++        logger.exception("[DSPARK_DIAG] %s failed: %s", name, error)
++
++
++def token_ids(name: str, tensor: torch.Tensor | None) -> None:
++    if tensor is None or not isinstance(tensor, torch.Tensor) or not _selected(name):
++        return
++    try:
++        flat = tensor.detach().flatten()
++        ids = flat[:_ID_LIMIT].cpu().tolist()
++        logger.warning(
++            "[DSPARK_DIAG] %s shape=%s dtype=%s ids=%s",
++            name,
++            tuple(tensor.shape),
++            tensor.dtype,
++            ids,
++        )
++    except Exception as error:
++        logger.exception("[DSPARK_DIAG] %s failed: %s", name, error)
++
++
++def cache_views(
++    name: str,
++    kvcaches: dict[str, torch.Tensor | Sequence[torch.Tensor]],
++    block_ids: Sequence[int],
++) -> None:
++    if not _ENABLED or not kvcaches or not block_ids:
++        return
++    layer_names = sorted(kvcaches)
++    if _MAX_LAYERS > 0:
++        layer_names = layer_names[:_MAX_LAYERS]
++    for layer_name in layer_names:
++        kv_layer = kvcaches[layer_name]
++        components = [kv_layer] if isinstance(kv_layer, torch.Tensor) else list(kv_layer)
++        for raw_block_id in list(block_ids)[:_MAX_BLOCKS]:
++            block_id = int(raw_block_id)
++            for component_index, component in enumerate(components):
++                try:
++                    block = component[block_id]
++                except Exception as error:
++                    logger.warning(
++                        "[DSPARK_DIAG] %s layer=%s block=%d component=%d invalid: %s",
++                        name,
++                        layer_name,
++                        block_id,
++                        component_index,
++                        error,
++                    )
++                    continue
++                tensor_stats(
++                    f"{name}.layer={layer_name}.block={block_id}.component={component_index}",
++                    block,
++                )

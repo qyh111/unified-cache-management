@@ -1,0 +1,50 @@
+diff --git a/ucm/integration/vllm/hma_connector.py b/ucm/integration/vllm/hma_connector.py
+index 79636331..88cb5dc0 100644
+--- a/ucm/integration/vllm/hma_connector.py
++++ b/ucm/integration/vllm/hma_connector.py
+@@ -17,6 +17,13 @@ from vllm.model_executor.models.utils import extract_layer_index
+ from vllm.v1.core.sched.output import SchedulerOutput
+ 
+ from ucm.integration.vllm.device import create_device
++
++try:
++    from vllm_ascend.diagnostics import cache_views as _diag_cache_views
++except ImportError:
++    def _diag_cache_views(*args, **kwargs):
++        return None
++
+ from ucm.integration.vllm.ucm_connector import (
+     UCMDirectConnector,
+     _use_ucm_connector_cpu_affinity,
+@@ -1323,6 +1330,15 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
+                 self._handle_load_err(request_id)
+ 
+         self._wait_all_load_task(tasks)
++        for request_id, request in metadata.request_meta.items():
++            if not request.load_keys:
++                continue
++            for group_id, group_layout in self.group_layouts.items():
++                _diag_cache_views(
++                    f"ucm.load.request={request_id}.group={group_id}",
++                    group_layout.kvcaches,
++                    request.load_vllm_block_ids[group_id],
++                )
+ 
+     @fawa_latency_metric(
+         "fawa_worker_wait_wait_all_load_task_ms",
+@@ -1344,6 +1360,15 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
+         if self.wa_store is None:
+             raise RuntimeError("WA store is not initialized.")
+ 
++        for request_id, request in metadata.request_meta.items():
++            if not request.dump_keys:
++                continue
++            for group_id, group_layout in self.group_layouts.items():
++                _diag_cache_views(
++                    f"ucm.dump.request={request_id}.group={group_id}",
++                    group_layout.kvcaches,
++                    request.dump_vllm_block_ids[group_id],
++                )
+         self._poll_completed_dump_tasks()
+ 
+         fa_dump_keys: list[bytes] = []
