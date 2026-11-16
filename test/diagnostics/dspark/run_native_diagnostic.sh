@@ -9,7 +9,7 @@ export TASK_QUEUE_ENABLE=1
 export HCCL_OP_EXPANSION_MODE=AIV
 export VLLM_COMPUTE_NANS_IN_LOGITS=1
 export VLLM_LOGGING_LEVEL=INFO
-export VLLM_ASCEND_DSPARK_DIAG=1
+export VLLM_ASCEND_DSPARK_DIAG=${VLLM_ASCEND_DSPARK_DIAG:-0}
 export VLLM_ASCEND_DSPARK_DIAG_EVERY=${VLLM_ASCEND_DSPARK_DIAG_EVERY:-1}
 export VLLM_ASCEND_DSPARK_DIAG_MAX_LAYERS=${VLLM_ASCEND_DSPARK_DIAG_MAX_LAYERS:-0}
 export VLLM_ASCEND_DSPARK_DIAG_MAX_BLOCKS=${VLLM_ASCEND_DSPARK_DIAG_MAX_BLOCKS:-1}
@@ -19,6 +19,8 @@ export TRANSFORMERS_OFFLINE=1
 MODEL=${MODEL:-/data/model/DeepSeek-V4-Flash-0731-w8a8}
 PORT=${PORT:-18080}
 GPU_MEM=${GPU_MEM:-0.70}
+MAX_MODEL_LEN=${MAX_MODEL_LEN:-8192}
+MAX_NUM_SEQS=${MAX_NUM_SEQS:-4}
 LOG_FILE=${LOG_FILE:-/home/qyh/dspark-0731-debug-20261116/logs/native-diagnostic.log}
 mkdir -p "$(dirname "${LOG_FILE}")"
 exec > >(tee -a "${LOG_FILE}") 2>&1
@@ -26,11 +28,11 @@ exec > >(tee -a "${LOG_FILE}") 2>&1
 exec vllm serve "${MODEL}" \
     --host 0.0.0.0 \
     --port "${PORT}" \
-    --max-model-len 8192 \
+    --max-model-len "${MAX_MODEL_LEN}" \
     --max-num-batched-tokens 8192 \
     --served-model-name dsv4 \
     --gpu-memory-utilization "${GPU_MEM}" \
-    --max-num-seqs 4 \
+    --max-num-seqs "${MAX_NUM_SEQS}" \
     --data-parallel-size 1 \
     --tensor-parallel-size 8 \
     --enable-expert-parallel \

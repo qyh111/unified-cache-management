@@ -59,7 +59,7 @@ docker exec <container> bash /home/qyh/dspark-0731-debug-20261116/diagnostics/bu
 ### A. 无 UCM 基线
 
 ```bash
-./diagnostics/run_native_diagnostic.sh
+VLLM_ASCEND_DSPARK_DIAG=1 ./diagnostics/run_native_diagnostic.sh
 # 服务 ready 后：
 python3 diagnostics/request_probe.py \
   --url http://127.0.0.1:18080 \
@@ -67,7 +67,7 @@ python3 diagnostics/request_probe.py \
   --label cold
 ```
 
-`GPU_MEM` 默认 `0.70`，仅为短请求诊断预留；若机器空闲且要复现生产配置，可设 `GPU_MEM=0.9`。`MODEL`、`PORT` 也可覆盖。
+`GPU_MEM` 默认 `0.70`，仅为短请求诊断预留；`MAX_MODEL_LEN` 默认 8192、`MAX_NUM_SEQS` 默认 4。若机器空闲且要复现生产配置，可设 `GPU_MEM=0.9 MAX_MODEL_LEN=800000 MAX_NUM_SEQS=32 PORT=8000`。诊断默认关闭，只有显式 `VLLM_ASCEND_DSPARK_DIAG=1` 才启用。`MODEL`、`PORT` 也可覆盖。
 
 先看冷请求是否已异常。**全新空存储的首次请求没有外部 KV 可加载，不能归因 Posix。**
 
@@ -78,7 +78,7 @@ python3 diagnostics/request_probe.py \
 `/home/qyh/dspark-0731-debug-20261116/store-posix`
 
 ```bash
-./diagnostics/run_ucm_diagnostic.sh diagnostics/ucm_posix.yaml
+VLLM_ASCEND_DSPARK_DIAG=1 ./diagnostics/run_ucm_diagnostic.sh diagnostics/ucm_posix.yaml
 python3 diagnostics/request_probe.py \
   --url http://127.0.0.1:18080 \
   --out evidence/ucm \
