@@ -66,8 +66,10 @@ def make_engine(args, store_root: Path):
 
     model_config = json.loads((args.model / "config.json").read_text())
     architectures = model_config.get("architectures", ())
-    needs_tokenizer = any(
-        name.startswith(("DeepseekV41", "Glm5Next", "Qwen3_5", "Qwen4Exp"))
+    needs_tokenizer = bool(model_config.get("vision_config")) or any(
+        name.startswith(
+            ("DeepseekV41", "Glm5Next", "MiniMaxM3", "Qwen3_5", "Qwen4Exp")
+        )
         for name in architectures
     )
     world_size = args.tp * args.pcp * args.pp
@@ -167,9 +169,14 @@ def make_model(engine):
         architectures = engine.model_config.architectures or ()
         if any(name.startswith("DeepseekV41") for name in architectures):
             if engine.device_config.device_type == "npu":
-                from vllm_ascend.models.deepseek_v41 import (
-                    ParallelEngramEmbedding as EngramEmbedding,
-                )
+                try:
+                    from vllm_ascend.models.deepseek_v41.engram.embedding import (
+                        AscendParallelEngramEmbedding as EngramEmbedding,
+                    )
+                except ImportError:
+                    from vllm_ascend.models.deepseek_v41 import (
+                        ParallelEngramEmbedding as EngramEmbedding,
+                    )
             else:
                 from vllm.models.deepseek_v41.common import engram
 

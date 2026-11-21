@@ -19,6 +19,10 @@ from tempfile import TemporaryDirectory
 from uuid import uuid4
 
 
+class _ExpectedRejectNotTriggeredError(AssertionError):
+    """Raised when --expect-reject succeeded unexpectedly; never self-matched."""
+
+
 def token_count(value: str) -> int:
     if value.lower().endswith("k"):
         return int(value[:-1]) * 1024
@@ -380,7 +384,7 @@ def run(args, cleanup, scratch_dir: str, kv_device):
         barrier()
 
         if args.expect_reject:
-            raise AssertionError(
+            raise _ExpectedRejectNotTriggeredError(
                 f"Expected startup rejection matching {args.expect_reject!r}, "
                 "but connector initialization succeeded"
             )
@@ -626,6 +630,8 @@ def main(argv: list[str] | None = None) -> None:
     try:
         with TemporaryDirectory() as scratch, ExitStack() as cleanup:
             summary = run(args, cleanup, scratch, kv_device)
+    except _ExpectedRejectNotTriggeredError:
+        raise
     except Exception as exc:
         if args.expect_reject and re.search(args.expect_reject, str(exc)):
             if int(os.environ.get("RANK", "0")) == 0:
