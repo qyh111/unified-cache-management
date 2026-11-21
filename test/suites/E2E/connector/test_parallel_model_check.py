@@ -112,6 +112,9 @@ PARALLEL_CASES = [
     ("qwen27b-tp2-pcp2", "qwen3.8-27b", 2, 1, 2, 1, ["--block-size", "128"]),
     ("qwen-fn-tp4-pcp2", "qwen3.8-flash-next", 4, 1, 2, 1, ["--block-size", "1536"]),
     ("kimi-k3-tp4-pcp2", "kimi-k3", 4, 1, 2, 1, ["--block-size", "128"]),
+    ("minimax-m3-tp2", "minimax-m3", 2, 1, 1, 1, ["--block-size", "128"]),
+    ("minimax-m3-pp2-tp2", "minimax-m3", 2, 2, 1, 1, ["--block-size", "128"]),
+    ("minimax-m3-dcp2-tp2", "minimax-m3", 2, 1, 1, 2, ["--block-size", "128"]),
 ]
 
 # Startup-rejection cases verifying unsupported v1 parallel configs fail fast

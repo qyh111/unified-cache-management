@@ -27,7 +27,22 @@ connectors without circularly depending on UCM's internal layout logic.
      every engine-native expected slice (`prefix_cacheable_group_ids`, `block_tables`,
      and native `kv_caches` views) byte-for-byte.
 
-## Examples (Ascend A2 server)
+## Examples (Ascend A2/A3 server)
+
+### 1. Provision official A2/A3 ModelScope quantized metadata (no weights)
+
+```bash
+python test/suites/E2E/connector/model_check/fetch_models.py \
+  --out /home/qyh/ucm-a2-quant-models
+```
+
+This fetches only lightweight metadata (`config.json`, `quant_model_description.json`,
+tokenizer/processor configs, and custom `*.py` modeling files) for the official
+`Eco-Tech/*` A2/A3 checkpoints documented in `vllm-ascend/docs/source/tutorials/models/`,
+and writes `<out>/manifest.json`. `test_parallel_model_check.py` automatically adds
+`--quantization ascend` whenever `quant_model_description.json` is present.
+
+### 2. Run checks
 
 ```bash
 export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}"
@@ -39,20 +54,13 @@ python test/suites/E2E/connector/model_check/run.py \
   --platform ascend-sim --ascend-soc A2 \
   --quantization ascend --kv-cache-dtype int8 --indexer-kv-dtype int8 \
   --trust-remote-code \
-  --model /path/to/GLM-5.3 \
+  --model /home/qyh/ucm-a2-quant-models/ascend/glm-5.3 \
   --tp 2 --pp 2 --pcp 2 --dcp 2 \
   --block-size 128 --cp-kv-cache-interleave-size 128 \
   --tokens 4096 --max-num-batched-tokens 2048
 
-# Switch to v2 with the exact same command:
-python test/suites/E2E/connector/model_check/run.py \
-  --connector v2 \
-  --platform ascend-sim --ascend-soc A2 \
-  --model /path/to/GLM-5.3 \
-  --tp 2 --pp 1 --pcp 2 --dcp 2 --tokens 4096 --max-num-batched-tokens 2048
-
-# Run pytest parallel matrix against provisioned UCM_V2_MODEL_ROOT
-export UCM_V2_MODEL_ROOT=/home/qyh/ucm-v2-model-check-models-standalone-20261107
+# Run pytest parallel matrix against the provisioned A2/A3 ModelScope root
+export UCM_V2_MODEL_ROOT=/home/qyh/ucm-a2-quant-models
 export UCM_MODEL_CHECK_PLATFORM=ascend
 export UCM_MODEL_CHECK_CONNECTOR=v1
 python -m pytest -c test/pytest.ini --confcutdir=test/suites/E2E/connector -o addopts= -vs \
