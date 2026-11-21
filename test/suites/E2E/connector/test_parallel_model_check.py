@@ -157,7 +157,8 @@ PARALLEL_CASES = [
 # Startup-rejection cases verifying unsupported v1 parallel configs fail fast
 # inside UCM connectors instead of silently corrupting external KV cache.
 # Only includes topologies that the engine itself permits (engine-banned combos
-# such as DeepSeek-V4.1 PP/DCP or Qwen4Exp CP are excluded).
+# such as DeepSeek-V4.1 PP/DCP, Qwen4Exp CP, GLM-Next KPool DCP, and SWA DCP
+# are excluded).
 # (case_id, model_id, tp, pp, pcp, dcp, extra_args, error_regex)
 V1_REJECT_CASES = [
     (
@@ -171,16 +172,6 @@ V1_REJECT_CASES = [
         "Pipeline parallelism is not supported",
     ),
     (
-        "hla-dcp2-reject",
-        "glm-5.3-flash",
-        8,
-        1,
-        1,
-        2,
-        ["--cp-kv-cache-interleave-size", "auto"],
-        "Decode context parallelism is not supported",
-    ),
-    (
         "fawa-v4-pp2-reject",
         "deepseek-v4-flash",
         2,
@@ -189,16 +180,6 @@ V1_REJECT_CASES = [
         1,
         [],
         "PP=DCP=1|Pipeline parallelism",
-    ),
-    (
-        "fawa-v4-dcp2-reject",
-        "deepseek-v4-flash",
-        2,
-        1,
-        1,
-        2,
-        ["--cp-kv-cache-interleave-size", "auto"],
-        "PP=DCP=1|Decode context parallelism",
     ),
 ]
 
@@ -317,9 +298,9 @@ def test_v1_unsupported_parallel_rejection(
         "--dcp",
         str(dcp),
         "--tokens",
-        "8192",
+        "1024",
         "--max-num-batched-tokens",
-        "2048",
+        "512",
         *extra_args,
         "--expect-reject",
         error_regex,

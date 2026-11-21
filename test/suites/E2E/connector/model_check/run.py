@@ -341,6 +341,7 @@ def _run_request_to_prefill_end(
     final_tables = None
     last_computed = 0
     load_checked = False
+    step_ends: list[int] = []
 
     for _ in range(max(64, target_tokens // 16 + 16)):
         output, _ = _step_all_ranks(
@@ -355,6 +356,10 @@ def _run_request_to_prefill_end(
                 external_hit = int(req.prefill_stats.num_external_cached_tokens)
                 first_step = False
             last_computed = int(req.num_computed_tokens)
+            if last_computed > 0 and (
+                not step_ends or last_computed != step_ends[-1]
+            ):
+                step_ends.append(last_computed)
             # Fire load-complete callback once external load has finished (not
             # still WAITING_FOR_REMOTE_KVS) and before subsequent prefill steps
             # can move running Mamba/state slots.
@@ -380,8 +385,26 @@ def _run_request_to_prefill_end(
     else:
         raise AssertionError("Request did not complete prefill within step budget")
 
-    info = broadcast((final_tables, local_hit, external_hit, last_computed, steps))
+    info = broadcast(
+        (final_tables, local_hit, external_hit, last_computed, steps, step_ends)
+    )
     return info
+
+
+def _register_connector_staging_buffers(buffers, worker) -> None:
+    """Register live connector-owned staging buffers (e.g. HLA PLE pack buffer)."""
+    inner = getattr(worker, "connector", worker)
+    layout = getattr(inner, "kv_cache_layout", None)
+    if layout is None or not hasattr(layout, "_ple_stage"):
+        return
+
+    def _ple_stage_ranges() -> list[tuple[int, int]]:
+        stage = getattr(layout, "_ple_stage", None)
+        if stage is None or not stage.numel():
+            return []
+        return [(int(stage.data_ptr()), int(stage.numel() * stage.element_size()))]
+
+    buffers.register_dynamic_provider(_ple_stage_ranges)
 
 
 def run(args, cleanup, scratch_dir: str, kv_device):
@@ -404,13 +427,35 @@ def run(args, cleanup, scratch_dir: str, kv_device):
     audit_dir = Path(shared_audit)
 
     engine = make_engine(args, store_root)
-    worker_config, sched_config, block_size, hash_size, views = allocate(
+    schedule_resolver = None
+    if args.auto_align_chunks > 0 and not args.expect_reject:
+
+        def schedule_resolver(planned_alignment: int, max_model_len: int):
+            return resolve_schedule_plan(
+                requested_tokens=args.tokens,
+                requested_batch=args.max_num_batched_tokens,
+                hit_alignment=planned_alignment,
+                prefix_percent=args.prefix_percent,
+                auto_align_chunks=args.auto_align_chunks,
+                max_model_len=max_model_len,
+            )
+
+    (
+        worker_config,
+        sched_config,
+        block_size,
+        hash_size,
+        views,
+        preplanned_schedule,
+    ) = allocate(
         engine,
         args.kv_mib,
         scratch_dir,
         cleanup,
         kv_device=kv_device,
         auto_dcp_interleave=(args.cp_kv_cache_interleave_size == "auto"),
+        schedule_resolver=schedule_resolver,
+        chunk_size=args.chunk_size,
     )
 
     # Share rank 0's scratch paths across all torchrun workers.
@@ -449,6 +494,7 @@ def run(args, cleanup, scratch_dir: str, kv_device):
         if args.connector == "v2" and kv_device.type == "cpu":
             worker.connector_worker._device = None
         worker.register_kv_caches(views)
+        _register_connector_staging_buffers(buffers, worker)
 
         handshakes = collect_handshakes(worker, coords, args)
         if is_root:
@@ -488,25 +534,45 @@ def run(args, cleanup, scratch_dir: str, kv_device):
             int(getattr(sched_config, "cache_hit_alignment_tokens", 1) or 1),
             int(connector_block),
         )
-        effective_tokens, effective_batch, prefix_len, expected_hit = (
-            resolve_schedule_plan(
-                requested_tokens=args.tokens,
-                requested_batch=args.max_num_batched_tokens,
-                hit_alignment=hit_alignment,
-                prefix_percent=args.prefix_percent,
-                auto_align_chunks=args.auto_align_chunks,
-                max_model_len=int(engine.model_config.max_model_len),
+        if preplanned_schedule is not None:
+            (
+                effective_tokens,
+                effective_batch,
+                prefix_len,
+                expected_hit,
+                planned_alignment,
+            ) = preplanned_schedule
+            if hit_alignment != planned_alignment:
+                raise AssertionError(
+                    f"Connector block size {connector_block} increased runtime "
+                    f"hit_alignment from pre-planned {planned_alignment} to "
+                    f"{hit_alignment}; pass --chunk-size {connector_block} or "
+                    "explicit --tokens / --max-num-batched-tokens"
+                )
+        else:
+            effective_tokens, effective_batch, prefix_len, expected_hit = (
+                resolve_schedule_plan(
+                    requested_tokens=args.tokens,
+                    requested_batch=args.max_num_batched_tokens,
+                    hit_alignment=hit_alignment,
+                    prefix_percent=args.prefix_percent,
+                    auto_align_chunks=0,
+                    max_model_len=int(engine.model_config.max_model_len),
+                )
             )
-        )
         if is_root:
-            if effective_batch != int(scheduler.max_num_scheduled_tokens):
-                scheduler.scheduler_config.max_num_batched_tokens = effective_batch
-                scheduler.max_num_scheduled_tokens = effective_batch
+            if int(scheduler.max_num_scheduled_tokens) != effective_batch:
+                raise AssertionError(
+                    f"Scheduler budget mismatch: max_num_scheduled_tokens="
+                    f"{scheduler.max_num_scheduled_tokens}, expected={effective_batch}"
+                )
             print(
                 f"[rank 0] Resolved schedule: tokens={effective_tokens}, "
                 f"batch={effective_batch}, prefix={prefix_len}, "
                 f"expected_hit={expected_hit}, hit_alignment={hit_alignment}, "
-                f"connector_block={connector_block}",
+                f"connector_block={connector_block}, "
+                f"num_blocks={worker_config.num_blocks}, "
+                f"max_model_len={engine.model_config.max_model_len}",
                 flush=True,
             )
 
@@ -520,21 +586,32 @@ def run(args, cleanup, scratch_dir: str, kv_device):
             if is_root
             else None
         )
-        tables_a, local_a, ext_a, _, steps_a = _run_request_to_prefill_end(
-            engine,
-            scheduler,
-            aggregator,
-            worker,
-            views,
-            req_a,
-            is_root=is_root,
-            target_tokens=effective_tokens,
+        tables_a, local_a, ext_a, _, steps_a, step_ends_a = (
+            _run_request_to_prefill_end(
+                engine,
+                scheduler,
+                aggregator,
+                worker,
+                views,
+                req_a,
+                is_root=is_root,
+                target_tokens=effective_tokens,
+            )
         )
         if local_a != 0 or ext_a != 0:
             raise AssertionError(
                 f"Cold request unexpectedly hit cache: local={local_a}, external={ext_a}"
             )
-        if effective_tokens > effective_batch and steps_a < 2:
+        if args.auto_align_chunks > 0:
+            expected_step_ends = [
+                effective_batch * idx for idx in range(1, args.auto_align_chunks + 1)
+            ]
+            if step_ends_a != expected_step_ends:
+                raise AssertionError(
+                    f"Cold prefill step boundaries drifted from auto-aligned chunks: "
+                    f"expected={expected_step_ends}, actual={step_ends_a}"
+                )
+        elif effective_tokens > effective_batch and steps_a < 2:
             raise AssertionError(
                 f"Expected multi-step chunked prefill for tokens={effective_tokens}, "
                 f"budget={effective_batch}, got steps_cold={steps_a}"
@@ -574,7 +651,7 @@ def run(args, cleanup, scratch_dir: str, kv_device):
             if is_root
             else None
         )
-        _, local_neg, ext_neg, _, _ = _run_request_to_prefill_end(
+        _, local_neg, ext_neg, _, _, _ = _run_request_to_prefill_end(
             engine,
             scheduler,
             aggregator,
@@ -613,6 +690,10 @@ def run(args, cleanup, scratch_dir: str, kv_device):
 
         verify_result = {"slices": 0, "bytes": 0, "checked": False}
 
+        compress_ratios = getattr(
+            engine.model_config.hf_text_config, "compress_ratios", None
+        )
+
         def check_after_load(load_tables, local_hit_now, ext_hit_now, step_end_now):
             if local_hit_now != 0:
                 raise AssertionError(
@@ -631,6 +712,7 @@ def run(args, cleanup, scratch_dir: str, kv_device):
                 device_type=engine.device_config.device_type,
                 world_rank=coords.world_rank,
                 poison_byte=0xA5,
+                compress_ratios=compress_ratios,
             )
             verify_result["slices"] = slices_count
             verify_result["bytes"] = bytes_count
@@ -641,7 +723,7 @@ def run(args, cleanup, scratch_dir: str, kv_device):
             if is_root
             else None
         )
-        _, local_hot, ext_hot, _, steps_hot = _run_request_to_prefill_end(
+        _, local_hot, ext_hot, _, steps_hot, _ = _run_request_to_prefill_end(
             engine,
             scheduler,
             aggregator,
