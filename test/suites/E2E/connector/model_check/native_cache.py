@@ -214,6 +214,18 @@ def make_model(engine):
                 )
             )
 
+        if engine.device_config.device_type == "npu":
+            from vllm_ascend.distributed import parallel_state as ascend_ps
+
+            if ascend_ps._MC2 is not None:
+                # ModelSlim W8A8/W4A8 MoE reads get_mc2_group().device_group to
+                # query HCCL comm names and falls back on AttributeError. Host
+                # Gloo groups have no NPU backend, so expose None during meta
+                # model construction only and restore immediately afterward.
+                model_patches.enter_context(
+                    patch.object(ascend_ps._MC2, "device_group", None)
+                )
+
         model = initialize_model(engine)
         if engine.speculative_config is not None:
             if engine.device_config.device_type == "npu":
@@ -314,6 +326,20 @@ def allocate(engine, kv_mib, scratch_dir, cleanup, *, kv_device):
             backend="gloo",
         )
         cleanup.callback(destroy_model_parallel)
+        if is_ascend:
+            from vllm_ascend.distributed.parallel_state import (
+                destroy_ascend_model_parallel,
+                init_ascend_model_parallel,
+            )
+
+            engram_cfg = getattr(engine, "engram_config", None)
+            if (
+                hasattr(parallel_state, "get_engram_dp_group")
+                and parallel_state.get_engram_dp_group() is not None
+            ):
+                engram_cfg = None
+            init_ascend_model_parallel(parallel, engram_cfg)
+            cleanup.callback(destroy_ascend_model_parallel)
 
     register_all_kvcache_specs(engine)
     model = make_model(engine)
