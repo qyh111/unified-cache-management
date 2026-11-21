@@ -131,7 +131,14 @@ def parse_args(argv: list[str] | None = None):
     return args
 
 
-def _execute_worker_step(engine, worker, metadata, total_tokens: int, views: dict):
+def _execute_worker_step(
+    engine,
+    worker,
+    metadata,
+    total_tokens: int,
+    views: dict,
+    finished_req_ids: set[str],
+):
     """Run the exact vLLM KVConnectorBase_V1 worker callback sequence for one step."""
     from vllm.forward_context import get_forward_context, set_forward_context
     from vllm.v1.outputs import KVConnectorOutput
@@ -145,17 +152,18 @@ def _execute_worker_step(engine, worker, metadata, total_tokens: int, views: dic
                 worker.save_kv_layer(layer_name, view, None)
             worker.wait_for_save()
 
-    transfers = worker.get_transfer_results(set())
+    transfers = worker.get_transfer_results(set(finished_req_ids))
     worker_meta = worker.build_connector_worker_meta()
     invalid_blocks = set(worker.get_block_ids_with_load_errors() or ())
+    failed_recving = set(getattr(transfers, "failed_recving", ()) or ())
     if metadata is not None:
         worker.clear_connector_metadata()
 
     return KVConnectorOutput(
         finished_sending=set(transfers.finished_sending or ()) or None,
         finished_recving=set(transfers.finished_recving or ()) or None,
-        failed_recving=set(getattr(transfers, "failed_recving", ()) or ()) or None,
-        invalid_block_ids=invalid_blocks or None,
+        failed_recving=failed_recving,
+        invalid_block_ids=invalid_blocks,
         kv_connector_worker_meta=worker_meta,
     )
 
@@ -177,7 +185,9 @@ def _step_all_ranks(engine, scheduler, aggregator, worker, views, *, is_root: bo
         )
     metadata, total_tokens, num_scheduled, finished_req_ids = broadcast(step_payload)
 
-    local_kv_out = _execute_worker_step(engine, worker, metadata, total_tokens, views)
+    local_kv_out = _execute_worker_step(
+        engine, worker, metadata, total_tokens, views, finished_req_ids
+    )
     all_kv_outs = gather(local_kv_out)
 
     if is_root:
@@ -399,6 +409,11 @@ def run(args, cleanup, scratch_dir: str, kv_device):
             raise AssertionError(
                 f"Cold request unexpectedly hit cache: local={local_a}, external={ext_a}"
             )
+        if args.tokens > args.max_num_batched_tokens and steps_a < 2:
+            raise AssertionError(
+                f"Expected multi-step chunked prefill for tokens={args.tokens}, "
+                f"budget={args.max_num_batched_tokens}, got steps_cold={steps_a}"
+            )
         # Snapshot ONLY the blocks allocated to prompt_a right after cold prefill.
         cold_snapshots = snapshot_cold_blocks(
             worker_config,
@@ -456,7 +471,23 @@ def run(args, cleanup, scratch_dir: str, kv_device):
         barrier()
 
         # ---- Phase 3: Poison KV + Hot reload + Engine-native byte check ----
-        prefix_len = max(block_size, args.tokens * args.prefix_percent // 100)
+        from math import lcm
+
+        connector_block = broadcast(
+            int(scheduler.connector.get_block_size() or block_size) if is_root else 1
+        )
+        hit_alignment = lcm(
+            int(block_size),
+            int(getattr(sched_config, "cache_hit_alignment_tokens", 1) or 1),
+            int(connector_block),
+        )
+        prefix_len = max(hit_alignment, args.tokens * args.prefix_percent // 100)
+        expected_hit = (min(prefix_len, args.tokens - 1) // hit_alignment) * hit_alignment
+        if expected_hit <= 0:
+            raise ValueError(
+                f"Prompt tokens={args.tokens} too short for hit_alignment={hit_alignment}; "
+                "increase --tokens"
+            )
         prompt_hot = prompt_a[:prefix_len] + [
             (idx * 31 + 11) % vocab_size for idx in range(args.tokens - prefix_len)
         ]
@@ -517,9 +548,11 @@ def run(args, cleanup, scratch_dir: str, kv_device):
                 f"Hot reload unexpectedly hit local HBM ({local_hot} tokens) "
                 "instead of external store"
             )
-        if ext_hot <= 0:
+        if ext_hot != expected_hit:
             raise AssertionError(
-                f"Hot reload achieved zero external hit tokens (prefix_len={prefix_len})"
+                f"Hot reload hit mismatch: expected_hit={expected_hit}, "
+                f"actual_external_hit={ext_hot} "
+                f"(prefix_len={prefix_len}, hit_alignment={hit_alignment})"
             )
         if not verify_result["checked"]:
             raise AssertionError(

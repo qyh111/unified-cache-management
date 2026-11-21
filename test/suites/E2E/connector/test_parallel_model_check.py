@@ -110,6 +110,8 @@ PARALLEL_CASES = [
     ("dsv41-flash-tp2-pcp2", "deepseek-v4.1-flash", 2, 1, 2, 1, ["--block-size", "128"]),
     ("glm53-flash-tp2-pcp2", "glm-5.3-flash", 2, 1, 2, 1, ["--block-size", "128"]),
     ("qwen27b-tp2-pcp2", "qwen3.8-27b", 2, 1, 2, 1, ["--block-size", "128"]),
+    ("qwen-fn-tp4-pcp2", "qwen3.8-flash-next", 4, 1, 2, 1, ["--block-size", "1536"]),
+    ("kimi-k3-tp4-pcp2", "kimi-k3", 4, 1, 2, 1, ["--block-size", "128"]),
 ]
 
 # Startup-rejection cases verifying unsupported v1 parallel configs fail fast
@@ -172,15 +174,30 @@ V1_REJECT_CASES = [
 ]
 
 
-def _model_defaults(platform: str, model_id: str) -> list[str]:
+def _model_defaults(platform: str, model_id: str, model_dir: Path) -> list[str]:
+    """Derive platform/checkpoint flags without clashing with checkpoint quant config."""
     if platform == "ascend":
-        defaults = ["--quantization", "ascend", "--trust-remote-code"]
+        defaults = ["--trust-remote-code"]
+        # Only pass --quantization ascend when the provisioned directory is an
+        # Ascend ModelSlim checkpoint (carries quant_model_description.json).
+        if (model_dir / "quant_model_description.json").is_file():
+            defaults.extend(["--quantization", "ascend"])
         if model_id in ("glm-5.3", "glm-5.3-flash"):
-            defaults += ["--kv-cache-dtype", "int8", "--indexer-kv-dtype", "int8"]
+            defaults.extend(["--kv-cache-dtype", "int8", "--indexer-kv-dtype", "int8"])
         return defaults
+
     defaults = ["--trust-remote-code"]
-    if model_id in ("deepseek-v4-flash", "deepseek-v4.1-flash"):
-        defaults += ["--kv-cache-dtype", "fp8"]
+    if model_id in (
+        "deepseek-v4-flash",
+        "deepseek-v4.1-flash",
+        "kimi-k3",
+        "qwen3.8-flash-next",
+    ):
+        defaults.extend(["--kv-cache-dtype", "fp8"])
+    if model_id == "qwen3.8-flash-next":
+        defaults.extend(["--indexer-kv-dtype", "fp8"])
+    if model_id == "kimi-k3":
+        defaults.extend(["--mamba-ssm-cache-dtype", "bfloat16"])
     return defaults
 
 
@@ -217,7 +234,7 @@ def test_parallel_roundtrip_matrix(
         "--connector",
         connector,
         *platform_flags(platform),
-        *_model_defaults(platform, model_id),
+        *_model_defaults(platform, model_id, model_dir),
         "--model",
         str(model_dir),
         "--tp",
@@ -257,7 +274,7 @@ def test_v1_unsupported_parallel_rejection(
         "--connector",
         "v1",
         *platform_flags(platform),
-        *_model_defaults(platform, model_id),
+        *_model_defaults(platform, model_id, model_dir),
         "--model",
         str(model_dir),
         "--tp",

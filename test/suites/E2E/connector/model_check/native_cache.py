@@ -23,6 +23,7 @@ def build_kv_transfer_config(args, store_root: Path):
             extra = {
                 "use_layerwise": args.use_layerwise,
                 "enable_event_sync": False,
+                "load_tokens_threshold": 0,
                 "ucm_connectors": [
                     {
                         "ucm_connector_name": "UcmMockPosixStore",
