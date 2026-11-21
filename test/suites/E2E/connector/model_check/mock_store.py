@@ -347,7 +347,6 @@ class MockSchedulerClientV2:
         self._namespace_dir = backing.root / "v2_shared"
         self._namespace_dir.mkdir(parents=True, exist_ok=True)
         self._next_token = 1
-        self._put_tokens: dict[int, tuple[bytes, ...]] = {}
 
     def on_new_request(self, request_id: str) -> None:
         return None
@@ -371,31 +370,35 @@ class MockSchedulerClientV2:
                 return index, False
         return -1, False
 
-    def _make_token(self):
+    def _make_token(self, keys: tuple[bytes, ...]):
         from ucm.integration.vllm.v2.store_client import AddressedToken
 
         token_id = self._next_token
         self._next_token += 1
-        return AddressedToken(token_id=token_id, addresses=())
+        return AddressedToken(
+            keys=tuple(keys),
+            payload=token_id.to_bytes(8, "little"),
+        )
 
     def prepare_get(self, request_id: str, keys: tuple[bytes, ...]):
-        return self._make_token()
+        return self._make_token(keys)
 
     def complete_get(self, request_id: str, token: Any) -> None:
         return None
 
     def prepare_put(self, request_id: str, keys: tuple[bytes, ...]):
-        token = self._make_token()
-        self._put_tokens[token.token_id] = tuple(keys)
-        return token
+        return self._make_token(keys)
 
-    def complete_put(self, request_id: str, token: Any) -> None:
-        keys = self._put_tokens.pop(token.token_id, ())
-        for key in keys:
+    def complete_put(
+        self, request_id: str, token: Any, success: bool = True
+    ) -> None:
+        if not success:
+            return
+        for key in getattr(token, "keys", ()):
             self._backing.commit_v2_key(self._namespace_dir, key)
 
     def prepare_prefetch(self, request_id: str, keys: tuple[bytes, ...]):
-        return None
+        return self._make_token(keys)
 
     def complete_prefetch(self, request_id: str, success: bool) -> None:
         return None
@@ -424,20 +427,41 @@ class MockWorkerClientV2:
         self._buffers = buffers
         self._namespace_dir = backing.root / "v2_shared"
         self._namespace_dir.mkdir(parents=True, exist_ok=True)
-        self._next_job = 1
+        self._next_sub_job = 2
 
-    def _make_task(self, success: bool, error: Exception | None = None):
+    def _make_task(
+        self,
+        job: Any,
+        *,
+        is_layerwise: bool = False,
+        prerequisite_handle: int = 0,
+        success: bool = True,
+        error: Exception | None = None,
+    ):
         from ucm.integration.vllm.v2.store_client import TransferTask
 
-        job_id = self._next_job
-        self._next_job += 1
-        task = TransferTask(io_job_id=job_id)
-        task.success = success
+        sub_job_id = None
+        if is_layerwise:
+            sub_job_id = self._next_sub_job
+            self._next_sub_job += 2
+        task = TransferTask(
+            job_id=int(getattr(job, "job_id", 1)),
+            sub_job_id=sub_job_id,
+            prerequisite_handle=int(prerequisite_handle),
+            success=success,
+        )
         task._mock_error = error
         return task
 
-    def submit_put(self, job: Any, batches: tuple) -> Any:
-        for batch in batches:
+    def submit_put(
+        self,
+        job: Any,
+        transfer_batches: tuple,
+        *,
+        is_layerwise: bool = False,
+        prerequisite_handle: int = 0,
+    ) -> Any:
+        for batch in transfer_batches:
             for key, offsets, ptrs, sizes in zip(
                 batch.ucm_keys,
                 batch.store_offsets,
@@ -453,12 +477,24 @@ class MockWorkerClientV2:
                     self._backing.write_v2_span(
                         self._namespace_dir, key, offset_i, payload
                     )
-        return self._make_task(True)
+        return self._make_task(
+            job,
+            is_layerwise=is_layerwise,
+            prerequisite_handle=prerequisite_handle,
+            success=True,
+        )
 
-    def submit_get(self, job: Any, batches: tuple) -> Any:
+    def submit_get(
+        self,
+        job: Any,
+        transfer_batches: tuple,
+        *,
+        is_layerwise: bool = False,
+        prerequisite_handle: int = 0,
+    ) -> Any:
         from ucm.integration.vllm.v2.store_client import StoreIOError
 
-        for batch in batches:
+        for batch in transfer_batches:
             for key, offsets, ptrs, sizes in zip(
                 batch.ucm_keys,
                 batch.store_offsets,
@@ -474,21 +510,29 @@ class MockWorkerClientV2:
                     )
                     if payload is None:
                         return self._make_task(
-                            False,
-                            StoreIOError(
+                            job,
+                            is_layerwise=is_layerwise,
+                            prerequisite_handle=prerequisite_handle,
+                            success=False,
+                            error=StoreIOError(
                                 f"Missing v2 span [{offset_i}, {offset_i + size_i}) "
                                 f"for key {key.hex()}"
                             ),
                         )
                     self._buffers.assert_valid(ptr_i, size_i, f"v2 get {key.hex()[:8]}")
                     ctypes.memmove(ptr_i, payload, size_i)
-        return self._make_task(True)
+        return self._make_task(
+            job,
+            is_layerwise=is_layerwise,
+            prerequisite_handle=prerequisite_handle,
+            success=True,
+        )
 
     def submit_prefetch(self, job: Any) -> Any:
-        return self._make_task(True)
+        return self._make_task(job, success=True)
 
     def submit_offload(self, job: Any) -> Any:
-        return self._make_task(True)
+        return self._make_task(job, success=True)
 
     def poll_finished(self) -> None:
         return None
