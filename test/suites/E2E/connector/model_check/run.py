@@ -29,6 +29,73 @@ def token_count(value: str) -> int:
     return int(value)
 
 
+def interleave_size_arg(value: str) -> int | str:
+    if value.lower() == "auto":
+        return "auto"
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError(
+            "cp-kv-cache-interleave-size must be a positive integer or 'auto'"
+        )
+    return parsed
+
+
+def resolve_schedule_plan(
+    *,
+    requested_tokens: int,
+    requested_batch: int,
+    hit_alignment: int,
+    prefix_percent: int,
+    auto_align_chunks: int,
+    max_model_len: int,
+) -> tuple[int, int, int, int]:
+    """Resolve (effective_tokens, effective_batch, prefix_len, expected_hit).
+
+    When auto_align_chunks > 0, size the prompt to an exact multiple of
+    (auto_align_chunks * hit_alignment) and set the per-step batch budget to
+    one chunk so cold prefill lands on exact hit_alignment boundaries and
+    writes a real Mamba/KDA State checkpoint at prefix_len.
+    """
+    if auto_align_chunks > 0:
+        unit = auto_align_chunks * hit_alignment
+        if requested_tokens >= unit:
+            effective_tokens = (requested_tokens // unit) * unit
+        else:
+            effective_tokens = unit
+        if effective_tokens + 1 > max_model_len:
+            raise ValueError(
+                f"Auto-aligned prompt effective_tokens={effective_tokens} exceeds "
+                f"max_model_len={max_model_len} "
+                f"(hit_alignment={hit_alignment}, auto_align_chunks={auto_align_chunks}); "
+                "increase --tokens or reduce --auto-align-chunks"
+            )
+        effective_batch = effective_tokens // auto_align_chunks
+        hit_chunks = max(
+            1,
+            min(
+                auto_align_chunks - 1,
+                round(auto_align_chunks * prefix_percent / 100),
+            ),
+        )
+        prefix_len = hit_chunks * effective_batch
+        expected_hit = prefix_len
+        return effective_tokens, effective_batch, prefix_len, expected_hit
+
+    effective_tokens = requested_tokens
+    effective_batch = requested_batch
+    prefix_len = max(hit_alignment, effective_tokens * prefix_percent // 100)
+    expected_hit = (
+        min(prefix_len, effective_tokens - 1) // hit_alignment
+    ) * hit_alignment
+    if expected_hit <= 0:
+        raise ValueError(
+            f"Prompt tokens={effective_tokens} too short for "
+            f"hit_alignment={hit_alignment}; increase --tokens or pass "
+            "--auto-align-chunks 4"
+        )
+    return effective_tokens, effective_batch, prefix_len, expected_hit
+
+
 def parse_args(argv: list[str] | None = None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -75,6 +142,16 @@ def parse_args(argv: list[str] | None = None):
         metavar="1..99",
         help="shared prefix percentage for hot-load verification (default: 75)",
     )
+    parser.add_argument(
+        "--auto-align-chunks",
+        type=int,
+        default=0,
+        metavar="N",
+        help=(
+            "when >= 2, auto-size prompt tokens and per-step batch budget to N "
+            "aligned chunks of the real runtime hit_alignment (0 disables)"
+        ),
+    )
     parser.add_argument("--block-size", type=int, help="native vLLM block size")
     parser.add_argument("--kv-mib", type=int, help="per-rank KV pool budget in MiB")
     parser.add_argument("--tp", type=int, default=1, help="tensor parallel size")
@@ -87,9 +164,9 @@ def parse_args(argv: list[str] | None = None):
     )
     parser.add_argument(
         "--cp-kv-cache-interleave-size",
-        type=int,
+        type=interleave_size_arg,
         default=None,
-        help="optional vLLM cp_kv_cache_interleave_size override",
+        help="optional vLLM cp_kv_cache_interleave_size override (positive int or 'auto')",
     )
     parser.add_argument(
         "--use-layerwise",
@@ -124,6 +201,8 @@ def parse_args(argv: list[str] | None = None):
         parser.error("--model must point to a local model directory with config.json")
     if not 1 <= args.prefix_percent <= 99:
         parser.error("--prefix-percent must be in [1, 99]")
+    if args.auto_align_chunks != 0 and args.auto_align_chunks < 2:
+        parser.error("--auto-align-chunks must be 0 (disabled) or >= 2")
     if args.platform == "cuda-sim" and not args.cuda_capability:
         parser.error("cuda-sim requires --cuda-capability, e.g. 9.0")
     if args.platform == "ascend-sim" and not args.ascend_soc:
@@ -326,7 +405,12 @@ def run(args, cleanup, scratch_dir: str, kv_device):
 
     engine = make_engine(args, store_root)
     worker_config, sched_config, block_size, hash_size, views = allocate(
-        engine, args.kv_mib, scratch_dir, cleanup, kv_device=kv_device
+        engine,
+        args.kv_mib,
+        scratch_dir,
+        cleanup,
+        kv_device=kv_device,
+        auto_dcp_interleave=(args.cp_kv_cache_interleave_size == "auto"),
     )
 
     # Share rank 0's scratch paths across all torchrun workers.
@@ -389,10 +473,47 @@ def run(args, cleanup, scratch_dir: str, kv_device):
                 "but connector initialization succeeded"
             )
 
+        from math import lcm
+
+        if args.connector == "v2":
+            connector_block = int(worker.connector_worker.layout.spec.chunk_size)
+        else:
+            connector_block = broadcast(
+                int(scheduler.connector.get_block_size() or block_size)
+                if is_root
+                else 1
+            )
+        hit_alignment = lcm(
+            int(block_size),
+            int(getattr(sched_config, "cache_hit_alignment_tokens", 1) or 1),
+            int(connector_block),
+        )
+        effective_tokens, effective_batch, prefix_len, expected_hit = (
+            resolve_schedule_plan(
+                requested_tokens=args.tokens,
+                requested_batch=args.max_num_batched_tokens,
+                hit_alignment=hit_alignment,
+                prefix_percent=args.prefix_percent,
+                auto_align_chunks=args.auto_align_chunks,
+                max_model_len=int(engine.model_config.max_model_len),
+            )
+        )
+        if is_root:
+            if effective_batch != int(scheduler.max_num_scheduled_tokens):
+                scheduler.scheduler_config.max_num_batched_tokens = effective_batch
+                scheduler.max_num_scheduled_tokens = effective_batch
+            print(
+                f"[rank 0] Resolved schedule: tokens={effective_tokens}, "
+                f"batch={effective_batch}, prefix={prefix_len}, "
+                f"expected_hit={expected_hit}, hit_alignment={hit_alignment}, "
+                f"connector_block={connector_block}",
+                flush=True,
+            )
+
         # ---- Phase 1: Cold prefill + Dump ----------------------------------
         fill_native_kv(views, worker_config, coords)
         vocab_size = max(1024, int(engine.model_config.get_vocab_size()))
-        prompt_a = [(idx * 17 + 3) % vocab_size for idx in range(args.tokens)]
+        prompt_a = [(idx * 17 + 3) % vocab_size for idx in range(effective_tokens)]
 
         req_a = (
             _make_request(f"cold-{uuid4().hex[:8]}", prompt_a, hash_size, engine)
@@ -407,16 +528,16 @@ def run(args, cleanup, scratch_dir: str, kv_device):
             views,
             req_a,
             is_root=is_root,
-            target_tokens=args.tokens,
+            target_tokens=effective_tokens,
         )
         if local_a != 0 or ext_a != 0:
             raise AssertionError(
                 f"Cold request unexpectedly hit cache: local={local_a}, external={ext_a}"
             )
-        if args.tokens > args.max_num_batched_tokens and steps_a < 2:
+        if effective_tokens > effective_batch and steps_a < 2:
             raise AssertionError(
-                f"Expected multi-step chunked prefill for tokens={args.tokens}, "
-                f"budget={args.max_num_batched_tokens}, got steps_cold={steps_a}"
+                f"Expected multi-step chunked prefill for tokens={effective_tokens}, "
+                f"budget={effective_batch}, got steps_cold={steps_a}"
             )
         # Snapshot ONLY the blocks allocated to prompt_a right after cold prefill.
         cold_snapshots = snapshot_cold_blocks(
@@ -461,7 +582,7 @@ def run(args, cleanup, scratch_dir: str, kv_device):
             views,
             req_neg,
             is_root=is_root,
-            target_tokens=args.tokens,
+            target_tokens=effective_tokens,
         )
         if ext_neg != 0 or local_neg != 0:
             raise AssertionError(
@@ -475,30 +596,9 @@ def run(args, cleanup, scratch_dir: str, kv_device):
         barrier()
 
         # ---- Phase 3: Poison KV + Hot reload + Engine-native byte check ----
-        from math import lcm
-
-        if args.connector == "v2":
-            connector_block = int(worker.connector_worker.layout.spec.chunk_size)
-        else:
-            connector_block = broadcast(
-                int(scheduler.connector.get_block_size() or block_size)
-                if is_root
-                else 1
-            )
-        hit_alignment = lcm(
-            int(block_size),
-            int(getattr(sched_config, "cache_hit_alignment_tokens", 1) or 1),
-            int(connector_block),
-        )
-        prefix_len = max(hit_alignment, args.tokens * args.prefix_percent // 100)
-        expected_hit = (min(prefix_len, args.tokens - 1) // hit_alignment) * hit_alignment
-        if expected_hit <= 0:
-            raise ValueError(
-                f"Prompt tokens={args.tokens} too short for hit_alignment={hit_alignment}; "
-                "increase --tokens"
-            )
         prompt_hot = prompt_a[:prefix_len] + [
-            (idx * 31 + 11) % vocab_size for idx in range(args.tokens - prefix_len)
+            (idx * 31 + 11) % vocab_size
+            for idx in range(effective_tokens - prefix_len)
         ]
 
         if is_root:
@@ -549,7 +649,7 @@ def run(args, cleanup, scratch_dir: str, kv_device):
             views,
             req_hot,
             is_root=is_root,
-            target_tokens=args.tokens,
+            target_tokens=effective_tokens,
             on_load_step_complete=check_after_load,
         )
         if local_hot != 0:
@@ -576,6 +676,9 @@ def run(args, cleanup, scratch_dir: str, kv_device):
         barrier()
 
         return {
+            "tokens": effective_tokens,
+            "batch_tokens": effective_batch,
+            "hit_alignment": hit_alignment,
             "steps_cold": steps_a,
             "steps_hot": steps_hot,
             "external_hit_tokens": ext_hot,
@@ -649,7 +752,9 @@ def main(argv: list[str] | None = None) -> None:
     print(
         f"PASS: connector={args.connector}, "
         f"TP={args.tp} PP={args.pp} PCP={args.pcp} DCP={args.dcp}, "
-        f"layerwise={args.use_layerwise}, hit={summary['external_hit_tokens']}/{args.tokens}, "
+        f"layerwise={args.use_layerwise}, "
+        f"hit={summary['external_hit_tokens']}/{summary['tokens']} "
+        f"(batch={summary['batch_tokens']}, align={summary['hit_alignment']}), "
         f"verified_slices={summary['verified_slices']}, "
         f"verified_bytes={summary['verified_bytes']}, audit={summary['audit']}",
         flush=True,
