@@ -26,12 +26,17 @@ class BufferRegistry:
 
     def __init__(self) -> None:
         self._ranges: list[tuple[int, int]] = []
+        self._dynamic_providers: list[Any] = []
 
     def register(self, base_ptr: int, num_bytes: int) -> None:
         if base_ptr <= 0 or num_bytes <= 0:
             return
         self._ranges.append((int(base_ptr), int(base_ptr) + int(num_bytes)))
         self._ranges.sort()
+
+    def register_dynamic_provider(self, provider) -> None:
+        """Register a callback returning live (base_ptr, num_bytes) staging buffers."""
+        self._dynamic_providers.append(provider)
 
     def assert_valid(self, ptr: int, num_bytes: int, context: str) -> None:
         if ptr == 0 or num_bytes == 0:
@@ -40,6 +45,10 @@ class BufferRegistry:
         for lo, hi in self._ranges:
             if lo <= ptr and end <= hi:
                 return
+        for provider in self._dynamic_providers:
+            for base_ptr, size in provider():
+                if base_ptr > 0 and size > 0 and base_ptr <= ptr and end <= base_ptr + size:
+                    return
         raise AssertionError(
             f"Out-of-bounds KV pointer during {context}: "
             f"ptr={ptr:#x}, bytes={num_bytes}, registered={len(self._ranges)} buffers"

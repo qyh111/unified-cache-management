@@ -3,7 +3,9 @@
 
 from __future__ import annotations
 
+import importlib.util
 import json
+import math
 import os
 from contextlib import ExitStack
 from copy import deepcopy
@@ -155,7 +157,7 @@ def install_ascend_worker(engine) -> None:
     init_ascend_config(engine)
 
 
-def make_model(engine):
+def make_model(engine, *, allow_kpool_host_stub: bool = False):
     import torch
     from vllm.model_executor.model_loader.utils import initialize_model
     from vllm.utils.torch_utils import set_default_torch_dtype
@@ -192,11 +194,16 @@ def make_model(engine):
         architectures = engine.model_config.architectures or ()
         if any(name.startswith("DeepseekV41") for name in architectures):
             if engine.device_config.device_type == "npu":
-                try:
+                if (
+                    importlib.util.find_spec(
+                        "vllm_ascend.models.deepseek_v41.engram.embedding"
+                    )
+                    is not None
+                ):
                     from vllm_ascend.models.deepseek_v41.engram.embedding import (
                         AscendParallelEngramEmbedding as EngramEmbedding,
                     )
-                except ImportError:
+                else:
                     from vllm_ascend.models.deepseek_v41 import (
                         ParallelEngramEmbedding as EngramEmbedding,
                     )
@@ -256,6 +263,32 @@ def make_model(engine):
                     patch.object(ascend_ps._MC2, "device_group", None)
                 )
 
+            if (
+                allow_kpool_host_stub
+                and any(name.startswith("Glm5Next") for name in architectures)
+                and importlib.util.find_spec("cann_ops_transformer") is None
+            ):
+                from vllm_ascend.attention.indexer_kpool import (
+                    Glm5NextKPoolIndexerBackend,
+                )
+
+                # Meta model construction never runs forward; skip forward-only
+                # cann_ops_transformer op handle lookup when the operator wheel
+                # is absent in a CPU-only ascend-sim container.
+                if int(os.environ.get("RANK", "0")) == 0:
+                    print(
+                        "[rank 0] Note: stubbing Glm5NextKPoolIndexerBackend._init_cann_ops "
+                        "for host meta build (cann_ops_transformer absent)",
+                        flush=True,
+                    )
+                model_patches.enter_context(
+                    patch.object(
+                        Glm5NextKPoolIndexerBackend,
+                        "_init_cann_ops",
+                        lambda self: None,
+                    )
+                )
+
         model = initialize_model(engine)
         if engine.speculative_config is not None:
             if engine.device_config.device_type == "npu":
@@ -285,6 +318,8 @@ def allocate(
     *,
     kv_device,
     auto_dcp_interleave: bool = False,
+    schedule_resolver=None,
+    chunk_size: int | None = None,
 ):
     from parallel import gather
     from vllm.config import set_current_vllm_config
@@ -380,7 +415,7 @@ def allocate(
             cleanup.callback(destroy_ascend_model_parallel)
 
     register_all_kvcache_specs(engine)
-    model = make_model(engine)
+    model = make_model(engine, allow_kpool_host_stub=(kv_device.type == "cpu"))
     specs = model_runner.get_kv_cache_spec(engine)
     if not specs:
         raise ValueError(f"{type(model).__name__} registered no KV cache specs")
@@ -392,55 +427,99 @@ def allocate(
         engine, gather([layout.name for layout in supported]), specs.values()
     )
 
-    if kv_mib is None:
-        groups = kv_cache_utils.get_kv_cache_groups(engine, dict(specs))
-        # Reserve enough blocks for two requests (cold write + hot reload).
-        per_req = kv_cache_utils._max_memory_usage_bytes_from_groups(engine, groups)
-        one_block = kv_cache_utils._pool_bytes_per_block(engine, groups)
-        kv_bytes = per_req * 2 + one_block * 4
-    else:
-        kv_bytes = kv_mib << 20
+    def _plan_kv_configs():
+        if kv_mib is None:
+            groups = kv_cache_utils.get_kv_cache_groups(engine, dict(specs))
+            # Reserve enough blocks for two requests (cold write + hot reload).
+            per_req = kv_cache_utils._max_memory_usage_bytes_from_groups(engine, groups)
+            one_block = kv_cache_utils._pool_bytes_per_block(engine, groups)
+            kv_bytes = per_req * 2 + one_block * 4
+        else:
+            kv_bytes = kv_mib << 20
 
-    all_inputs = gather((specs, kv_bytes))
-    all_specs, budgets = zip(*all_inputs)
-    configs = kv_cache_utils.get_kv_cache_configs(
-        engine, list(all_specs), list(budgets)
-    )
-    for cfg in configs:
-        cfg.kv_cache_layout = packing.name
-    worker_config = configs[rank]
-    scheduler_config = kv_cache_utils.generate_scheduler_kv_cache_config(configs)
+        all_inputs = gather((specs, kv_bytes))
+        all_specs, budgets = zip(*all_inputs)
+        configs = kv_cache_utils.get_kv_cache_configs(
+            engine, list(all_specs), list(budgets)
+        )
+        for cfg in configs:
+            cfg.kv_cache_layout = packing.name
+        w_cfg = configs[rank]
+        s_cfg = kv_cache_utils.generate_scheduler_kv_cache_config(configs)
 
-    engine.cache_config.num_gpu_blocks = scheduler_config.num_blocks
-    active_groups = (
-        scheduler_config.prefix_cacheable_groups or scheduler_config.kv_cache_groups
-    )
-    engine.cache_config.block_size = min(
-        group.kv_cache_spec.block_size for group in active_groups
-    )
-    kv_cache_utils.update_kv_cache_capacity(engine, scheduler_config)
-    engine.adjust_dcp_kv_cache_interleave_size(worker_config)
-    if (
-        auto_dcp_interleave
-        and engine.parallel_config.decode_context_parallel_size > 1
-    ):
-        final_block_size = int(engine.cache_config.block_size)
-        interleave = int(engine.parallel_config.cp_kv_cache_interleave_size)
-        if interleave > final_block_size or final_block_size % interleave != 0:
-            engine.parallel_config.cp_kv_cache_interleave_size = final_block_size
-    engine.validate_block_size()
+        engine.cache_config.num_gpu_blocks = s_cfg.num_blocks
+        active_groups = (
+            s_cfg.prefix_cacheable_groups or s_cfg.kv_cache_groups
+        )
+        engine.cache_config.block_size = min(
+            group.kv_cache_spec.block_size for group in active_groups
+        )
+        kv_cache_utils.update_kv_cache_capacity(engine, s_cfg)
+        engine.adjust_dcp_kv_cache_interleave_size(w_cfg)
+        if (
+            auto_dcp_interleave
+            and engine.parallel_config.decode_context_parallel_size > 1
+        ):
+            final_block_size = int(engine.cache_config.block_size)
+            interleave = int(engine.parallel_config.cp_kv_cache_interleave_size)
+            if interleave > final_block_size or final_block_size % interleave != 0:
+                engine.parallel_config.cp_kv_cache_interleave_size = final_block_size
+        engine.validate_block_size()
 
-    block_size, hash_size = kv_cache_utils.resolve_kv_cache_block_sizes(
-        scheduler_config, engine
+        b_size, h_size = kv_cache_utils.resolve_kv_cache_block_sizes(s_cfg, engine)
+        align = kv_cache_utils.resolve_cache_hit_alignment_tokens(
+            s_cfg, engine, b_size, h_size
+        )
+        engine.cache_config.hash_block_size = h_size
+        engine.cache_config.cache_hit_alignment_tokens = align
+        for cfg in (w_cfg, s_cfg):
+            cfg.hash_block_size = h_size
+            cfg.cache_hit_alignment_tokens = align
+        return w_cfg, s_cfg, b_size, h_size, align
+
+    worker_config, scheduler_config, block_size, hash_size, alignment = (
+        _plan_kv_configs()
     )
-    alignment = kv_cache_utils.resolve_cache_hit_alignment_tokens(
-        scheduler_config, engine, block_size, hash_size
-    )
-    engine.cache_config.hash_block_size = hash_size
-    engine.cache_config.cache_hit_alignment_tokens = alignment
-    for cfg in (worker_config, scheduler_config):
-        cfg.hash_block_size = hash_size
-        cfg.cache_hit_alignment_tokens = alignment
+    resolved_plan = None
+    if schedule_resolver is not None:
+        planned_alignment = math.lcm(
+            int(block_size), int(alignment or 1), int(chunk_size or 1)
+        )
+        effective_tokens, effective_batch, prefix_len, expected_hit = schedule_resolver(
+            planned_alignment, int(engine.model_config.max_model_len)
+        )
+        resolved_plan = (
+            effective_tokens,
+            effective_batch,
+            prefix_len,
+            expected_hit,
+            planned_alignment,
+        )
+        final_max_len = effective_tokens + 16
+        if (
+            final_max_len != int(engine.model_config.max_model_len)
+            or effective_batch != int(engine.scheduler_config.max_num_batched_tokens)
+        ):
+            # Re-plan KV capacity tightly to the final schedule BEFORE allocating
+            # CPU tensors or constructing Worker/Connector/Scheduler so all
+            # derived configs (max_in_flight_tokens, KVCacheManager, num_blocks)
+            # match the actual run without post-hoc mutation.
+            engine.model_config.max_model_len = final_max_len
+            engine.scheduler_config.max_num_batched_tokens = effective_batch
+            if getattr(engine.scheduler_config, "max_num_scheduled_tokens", None) is not None:
+                engine.scheduler_config.max_num_scheduled_tokens = effective_batch
+            engine.cache_config.num_gpu_blocks = None
+            worker_config, scheduler_config, block_size, hash_size, alignment = (
+                _plan_kv_configs()
+            )
+            rechecked_alignment = math.lcm(
+                int(block_size), int(alignment or 1), int(chunk_size or 1)
+            )
+            if rechecked_alignment != planned_alignment:
+                raise AssertionError(
+                    f"Alignment changed after tightening max_model_len: "
+                    f"before={planned_alignment}, after={rechecked_alignment}"
+                )
 
     layers = engine.compilation_config.static_forward_context
     physical = deepcopy(worker_config)
@@ -484,7 +563,9 @@ def allocate(
     print(
         f"[rank {rank}] {type(model).__name__}: layout={packing.name}, "
         f"blocks={worker_config.num_blocks}, views={len(views)}, "
-        f"block_size={block_size}, hash_size={hash_size}, alignment={alignment}",
+        f"block_size={block_size}, hash_size={hash_size}, alignment={alignment}, "
+        f"max_model_len={engine.model_config.max_model_len}, "
+        f"max_num_batched_tokens={engine.scheduler_config.max_num_batched_tokens}",
         flush=True,
     )
-    return worker_config, scheduler_config, block_size, hash_size, views
+    return worker_config, scheduler_config, block_size, hash_size, views, resolved_plan

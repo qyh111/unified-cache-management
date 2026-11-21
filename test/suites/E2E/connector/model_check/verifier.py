@@ -9,6 +9,7 @@ layout or topology helpers.
 from __future__ import annotations
 
 import json
+import re
 from collections import defaultdict
 from pathlib import Path
 from typing import Any
@@ -16,6 +17,62 @@ from typing import Any
 import numpy as np
 
 from mock_store import BufferRegistry
+
+
+def _unwrap_layer_spec(spec, layer_name: str | None = None):
+    """Unwrap UniformTypeKVCacheSpecs to the concrete per-layer KVCacheSpec."""
+    nested = getattr(spec, "kv_cache_specs", None)
+    if isinstance(nested, dict) and nested:
+        if layer_name is not None and layer_name in nested:
+            return nested[layer_name]
+        return next(iter(nested.values()))
+    return spec
+
+
+def _extract_layer_index(layer_name: str) -> int | None:
+    match = re.search(r"\.layers\.(\d+)\.", layer_name)
+    return int(match.group(1)) if match else None
+
+
+def _effective_sliding_window(
+    layer_names: list[str],
+    sliding_window: int,
+    compress_ratios: list[int] | tuple[int, ...] | None,
+) -> int:
+    """Return the persisted sliding-window tail in tokens for a window group.
+
+    For DeepSeek-V4 compressor state caches, a restore boundary closes each
+    compression group so only (sliding_window - compress_ratio) overlap tokens
+    remain live (0 when compress_ratio == sliding_window).
+    """
+    if (
+        not compress_ratios
+        or not layer_names
+        or not all(name.endswith(".compressor.state_cache") for name in layer_names)
+    ):
+        return sliding_window
+    tails = set()
+    for name in layer_names:
+        layer_idx = _extract_layer_index(name)
+        if layer_idx is None or not 0 <= layer_idx < len(compress_ratios):
+            return sliding_window
+        tails.add(max(0, sliding_window - max(1, int(compress_ratios[layer_idx]))))
+    if len(tails) == 1:
+        return tails.pop()
+    return sliding_window
+
+
+def _safe_tokens_per_state(spec) -> int:
+    """Read concrete tokens_per_state/compress_ratio without hitting abstract stubs."""
+    concrete = _unwrap_layer_spec(spec)
+    for attr in ("tokens_per_state", "compress_ratio"):
+        try:
+            value = getattr(concrete, attr, None)
+        except NotImplementedError:
+            continue
+        if value is not None and int(value) > 0:
+            return int(value)
+    return 1
 
 
 def view_components(view) -> tuple:
@@ -62,11 +119,7 @@ def _native_layer_content_key(
     spec = None
     for group in worker_config.kv_cache_groups:
         if layer_name in group.layer_names:
-            raw_spec = group.kv_cache_spec
-            if isinstance(raw_spec, UniformTypeKVCacheSpecs):
-                spec = raw_spec.kv_cache_specs.get(layer_name, raw_spec)
-            else:
-                spec = raw_spec
+            spec = _unwrap_layer_spec(group.kv_cache_spec, layer_name)
             break
 
     is_state = isinstance(spec, MambaSpec)
@@ -99,53 +152,84 @@ def _native_layer_content_key(
 
 
 def fill_native_kv(views: dict[str, Any], worker_config, coords) -> None:
-    """Fill every native KV layer with deterministic content-scoped bytes."""
+    """Fill every native KV layer with deterministic content-scoped bytes.
+
+    Fill non-prefix-cacheable (transient) layers before prefix-cacheable layers
+    so shared physical KV pools (e.g. DeepSeek-V4.1 long_kv_cache aliased with
+    transient compressor.state_cache) always end up with the prefix-cacheable
+    layer's replica-consistent bytes.
+    """
     import hashlib
     import torch
 
     num_blocks = int(worker_config.num_blocks)
-    filled_ptrs: set[tuple[int, int]] = set()
-    for layer_name in sorted(views):
-        for part_idx, tensor in enumerate(view_components(views[layer_name])):
-            if not tensor.numel():
-                continue
-            key_tuple = _native_layer_content_key(
-                worker_config,
-                layer_name,
-                coords,
-                num_blocks=num_blocks,
-                leading_dim=int(tensor.size(0)),
-            )
-            storage = tensor.untyped_storage()
-            byte_offset = int(tensor.storage_offset()) * int(tensor.element_size())
-            # Fill each contiguous tensor region once so replica ranks get identical
-            # bytes while distinct PP/TP/DCP shards get distinct bytes.
-            span_key = (int(storage.data_ptr()) + byte_offset, int(tensor.numel()))
-            if span_key in filled_ptrs:
-                continue
-            filled_ptrs.add(span_key)
+    cacheable_ids = getattr(worker_config, "prefix_cacheable_group_ids", None)
+    if cacheable_ids is None:
+        cacheable_ids = tuple(
+            gid
+            for gid, group in enumerate(worker_config.kv_cache_groups)
+            if group.kv_cache_spec.prefix_cacheable
+        )
+    cacheable_layers = {
+        name
+        for gid in cacheable_ids
+        for name in worker_config.kv_cache_groups[gid].layer_names
+    }
+    ordered_passes = (
+        sorted(name for name in views if name not in cacheable_layers),
+        sorted(name for name in views if name in cacheable_layers),
+    )
 
-            seed_material = f"{key_tuple}:{part_idx}".encode("utf-8")
-            seed = int.from_bytes(hashlib.sha256(seed_material).digest()[:8], "little")
-            rng = np.random.default_rng(seed)
-
-            # Fill in slices along axis 0 so temporary memory stays tiny even for
-            # multi-gigabyte KV pools.
-            step = max(1, min(64, int(tensor.size(0))))
-            row_elems = int(tensor[0].numel()) if tensor.ndim > 1 else 1
-            elem_bytes = int(tensor.element_size())
-            for start in range(0, int(tensor.size(0)), step):
-                stop = min(int(tensor.size(0)), start + step)
-                chunk_view = tensor.narrow(0, start, stop - start)
-                chunk_bytes = (stop - start) * row_elems * elem_bytes
-                data = rng.integers(1, 255, size=chunk_bytes, dtype=np.uint8)
-                data[data == 0xA5] = 0x5A
-                src = (
-                    torch.from_numpy(data)
-                    .view(tensor.dtype)
-                    .reshape(chunk_view.shape)
+    for layer_pass in ordered_passes:
+        filled_ptrs: set[tuple[int, int, int, tuple[int, ...]]] = set()
+        for layer_name in layer_pass:
+            for part_idx, tensor in enumerate(view_components(views[layer_name])):
+                if not tensor.numel():
+                    continue
+                key_tuple = _native_layer_content_key(
+                    worker_config,
+                    layer_name,
+                    coords,
+                    num_blocks=num_blocks,
+                    leading_dim=int(tensor.size(0)),
                 )
-                chunk_view.copy_(src.to(tensor.device))
+                storage = tensor.untyped_storage()
+                elem_bytes = int(tensor.element_size())
+                byte_offset = int(tensor.storage_offset()) * elem_bytes
+                # Include element_size and stride so distinct aliased views
+                # (e.g. FP32 vs BF16 with the same numel) never collide.
+                span_key = (
+                    int(storage.data_ptr()) + byte_offset,
+                    int(tensor.numel()),
+                    elem_bytes,
+                    tuple(int(s) for s in tensor.stride()),
+                )
+                if span_key in filled_ptrs:
+                    continue
+                filled_ptrs.add(span_key)
+
+                seed_material = f"{key_tuple}:{part_idx}".encode("utf-8")
+                seed = int.from_bytes(
+                    hashlib.sha256(seed_material).digest()[:8], "little"
+                )
+                rng = np.random.default_rng(seed)
+
+                # Fill in slices along axis 0 so temporary memory stays tiny
+                # even for multi-gigabyte KV pools.
+                step = max(1, min(64, int(tensor.size(0))))
+                row_elems = int(tensor[0].numel()) if tensor.ndim > 1 else 1
+                for start in range(0, int(tensor.size(0)), step):
+                    stop = min(int(tensor.size(0)), start + step)
+                    chunk_view = tensor.narrow(0, start, stop - start)
+                    chunk_bytes = (stop - start) * row_elems * elem_bytes
+                    data = rng.integers(1, 255, size=chunk_bytes, dtype=np.uint8)
+                    data[data == 0xA5] = 0x5A
+                    src = (
+                        torch.from_numpy(data)
+                        .view(tensor.dtype)
+                        .reshape(chunk_view.shape)
+                    )
+                    chunk_view.copy_(src.to(tensor.device))
 
 
 def poison_native_kv(views: dict[str, Any], poison_byte: int = 0xA5) -> None:
@@ -338,6 +422,7 @@ def verify_cold_vs_hot(
     device_type: str,
     world_rank: int,
     poison_byte: int = 0xA5,
+    compress_ratios: list[int] | tuple[int, ...] | None = None,
 ) -> tuple[int, int]:
     """Compare every engine-native restored hot slice against its cold snapshot."""
     from vllm.v1.kv_cache_interface import (
@@ -400,12 +485,15 @@ def verify_cold_vs_hot(
                             seen_hot.add(hot_blk)
                             pairs.append((cold_ckpt_blk, hot_blk, None, None, role_name))
         elif sliding_window is not None:
-            win_start = max(0, hit_tokens - sliding_window)
+            effective_window = _effective_sliding_window(
+                group.layer_names, sliding_window, compress_ratios
+            )
+            if effective_window <= 0:
+                continue
+            win_start = max(0, hit_tokens - effective_window)
             first_idx = win_start // logical_span
             last_idx = (hit_tokens - 1) // logical_span
-            ratio = getattr(spec, "tokens_per_state", None) or getattr(
-                spec, "compress_ratio", 1
-            )
+            ratio = _safe_tokens_per_state(spec)
             for idx in range(first_idx, last_idx + 1):
                 c_blk = cold_table[idx]
                 h_blk = hot_table[idx]
