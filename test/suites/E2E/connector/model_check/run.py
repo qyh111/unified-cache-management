@@ -473,9 +473,14 @@ def run(args, cleanup, scratch_dir: str, kv_device):
         # ---- Phase 3: Poison KV + Hot reload + Engine-native byte check ----
         from math import lcm
 
-        connector_block = broadcast(
-            int(scheduler.connector.get_block_size() or block_size) if is_root else 1
-        )
+        if args.connector == "v2":
+            connector_block = int(worker.connector_worker.layout.spec.chunk_size)
+        else:
+            connector_block = broadcast(
+                int(scheduler.connector.get_block_size() or block_size)
+                if is_root
+                else 1
+            )
         hit_alignment = lcm(
             int(block_size),
             int(getattr(sched_config, "cache_hit_alignment_tokens", 1) or 1),

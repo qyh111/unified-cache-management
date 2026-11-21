@@ -315,6 +315,16 @@ def _slice_single_page(
     return page.narrow(token_axis, token_start, token_end - token_start)
 
 
+def _tensor_raw_bytes(tensor) -> bytes:
+    """Extract bit-exact raw bytes for any dtype (including BF16 and FP8)."""
+    import torch
+
+    flat = tensor.detach().cpu().contiguous().reshape(-1)
+    if flat.numel() == 0:
+        return b""
+    return flat.view(torch.uint8).numpy().tobytes()
+
+
 def verify_cold_vs_hot(
     worker_config,
     cold_block_snapshots: dict[tuple[str, int, int], Any],
@@ -445,12 +455,8 @@ def verify_cold_vs_hot(
                         token_end=tok_hi,
                         block_tokens=logical_span,
                     )
-                    expected = (
-                        expected_sub.detach().cpu().contiguous().view(-1).numpy().tobytes()
-                    )
-                    actual = (
-                        actual_sub.detach().cpu().contiguous().view(-1).numpy().tobytes()
-                    )
+                    expected = _tensor_raw_bytes(expected_sub)
+                    actual = _tensor_raw_bytes(actual_sub)
                     verified_slices += 1
                     verified_bytes += len(expected)
                     if actual != expected:
