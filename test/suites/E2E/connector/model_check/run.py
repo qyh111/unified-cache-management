@@ -105,6 +105,15 @@ def parse_args(argv: list[str] | None = None):
         help="UCM connector generation to test (default: v1)",
     )
     parser.add_argument(
+        "--multi-connector",
+        choices=("none", "pd-first", "ucm-first"),
+        default="none",
+        help=(
+            "wrap UCMConnector inside vLLM MultiConnector with a sibling P/D "
+            "handshake connector (default: none; 'pd-first' mimics Mooncake + UCM)"
+        ),
+    )
+    parser.add_argument(
         "--model",
         required=True,
         type=Path,
@@ -391,20 +400,55 @@ def _run_request_to_prefill_end(
     return info
 
 
+def _find_ucm_connector(connector):
+    """Unwrap MultiConnector to locate the UCMConnector child."""
+    if hasattr(connector, "sub_connectors"):
+        for child in connector.sub_connectors:
+            if type(child).__name__ == "UCMConnector" or hasattr(
+                child, "connector_worker"
+            ):
+                return child
+    return connector
+
+
+def _set_v1_store_root(kv_transfer_config, store_root: Path) -> None:
+    """Update v1 UCM storage_backends on standalone or MultiConnector configs."""
+    extra = kv_transfer_config.kv_connector_extra_config or {}
+    if kv_transfer_config.kv_connector == "MultiConnector":
+        for child in extra.get("connectors", ()):
+            if child.get("kv_connector") == "UCMConnector":
+                child_extra = child.get("kv_connector_extra_config") or {}
+                ucm_connectors = child_extra.get("ucm_connectors")
+                if ucm_connectors:
+                    ucm_connectors[0]["ucm_connector_config"]["storage_backends"] = (
+                        str(store_root)
+                    )
+        return
+    ucm_connectors = extra.get("ucm_connectors")
+    if ucm_connectors:
+        ucm_connectors[0]["ucm_connector_config"]["storage_backends"] = str(store_root)
+
+
 def _register_connector_staging_buffers(buffers, worker) -> None:
     """Register live connector-owned staging buffers (e.g. HLA PLE pack buffer)."""
-    inner = getattr(worker, "connector", worker)
-    layout = getattr(inner, "kv_cache_layout", None)
-    if layout is None or not hasattr(layout, "_ple_stage"):
-        return
+    candidates = (
+        list(worker.sub_connectors) if hasattr(worker, "sub_connectors") else [worker]
+    )
+    for candidate in candidates:
+        inner = getattr(candidate, "connector", candidate)
+        layout = getattr(inner, "kv_cache_layout", None)
+        if layout is None or not hasattr(layout, "_ple_stage"):
+            continue
 
-    def _ple_stage_ranges() -> list[tuple[int, int]]:
-        stage = getattr(layout, "_ple_stage", None)
-        if stage is None or not stage.numel():
-            return []
-        return [(int(stage.data_ptr()), int(stage.numel() * stage.element_size()))]
+        def _ple_stage_ranges(bound_layout=layout) -> list[tuple[int, int]]:
+            stage = getattr(bound_layout, "_ple_stage", None)
+            if stage is None or not stage.numel():
+                return []
+            return [
+                (int(stage.data_ptr()), int(stage.numel() * stage.element_size()))
+            ]
 
-    buffers.register_dynamic_provider(_ple_stage_ranges)
+        buffers.register_dynamic_provider(_ple_stage_ranges)
 
 
 def run(args, cleanup, scratch_dir: str, kv_device):
@@ -463,10 +507,7 @@ def run(args, cleanup, scratch_dir: str, kv_device):
     store_root = Path(store_root_str)
     audit_dir = Path(audit_dir_str)
     if args.connector == "v1" and not args.ucm_config:
-        ucm_cfg = engine.kv_transfer_config.kv_connector_extra_config["ucm_connectors"][0][
-            "ucm_connector_config"
-        ]
-        ucm_cfg["storage_backends"] = str(store_root)
+        _set_v1_store_root(engine.kv_transfer_config, store_root)
 
     coords = inspect_local_coords(args)
     is_root = coords.world_rank == 0
@@ -492,7 +533,7 @@ def run(args, cleanup, scratch_dir: str, kv_device):
         )
         cleanup.callback(lambda: getattr(worker, "shutdown", lambda: None)())
         if args.connector == "v2" and kv_device.type == "cpu":
-            worker.connector_worker._device = None
+            _find_ucm_connector(worker).connector_worker._device = None
         worker.register_kv_caches(views)
         _register_connector_staging_buffers(buffers, worker)
 
@@ -522,10 +563,15 @@ def run(args, cleanup, scratch_dir: str, kv_device):
         from math import lcm
 
         if args.connector == "v2":
-            connector_block = int(worker.connector_worker.layout.spec.chunk_size)
+            connector_block = int(
+                _find_ucm_connector(worker).connector_worker.layout.spec.chunk_size
+            )
         else:
             connector_block = broadcast(
-                int(scheduler.connector.get_block_size() or block_size)
+                int(
+                    _find_ucm_connector(scheduler.connector).get_block_size()
+                    or block_size
+                )
                 if is_root
                 else 1
             )

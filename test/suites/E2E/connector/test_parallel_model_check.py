@@ -119,6 +119,26 @@ PARALLEL_CASES = [
         2,
         ["--block-size", "128", "--cp-kv-cache-interleave-size", "128"],
     ),
+    # ---- MultiConnector ([MockPDHandshakeConnector, UCMConnector]) ---------
+    # Control (PP=1) + PP handshake repro (PP=2), mimicking Ascend Mooncake+UCM.
+    (
+        "glm53-tp2-multi-pd-first",
+        "glm-5.3",
+        2,
+        1,
+        1,
+        1,
+        ["--block-size", "128", "--multi-connector", "pd-first"],
+    ),
+    (
+        "glm53-pp2-tp2-multi-pd-first",
+        "glm-5.3",
+        2,
+        2,
+        1,
+        1,
+        ["--block-size", "128", "--multi-connector", "pd-first"],
+    ),
     ("minimax-m3-tp2", "minimax-m3", 2, 1, 1, 1, ["--block-size", "128"]),
     ("minimax-m3-pp2-tp2", "minimax-m3", 2, 2, 1, 1, ["--block-size", "128"]),
     (
