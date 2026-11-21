@@ -48,12 +48,36 @@ def build_kv_transfer_config(args, store_root: Path):
     else:
         raise ValueError(f"Unsupported connector version: {args.connector}")
 
-    return KVTransferConfig(
+    ucm_child = dict(
         kv_connector="UCMConnector",
         kv_connector_module_path=module_path,
         kv_role="kv_both",
         kv_load_failure_policy="fail",
         kv_connector_extra_config=extra,
+    )
+    multi_mode = getattr(args, "multi_connector", "none")
+    if multi_mode == "none":
+        return KVTransferConfig(**ucm_child)
+
+    pd_child = dict(
+        kv_connector="MockPDHandshakeConnector",
+        kv_connector_module_path="mock_pd_connector",
+        kv_role="kv_both",
+        kv_load_failure_policy="fail",
+        kv_connector_extra_config={},
+    )
+    if multi_mode == "pd-first":
+        children = [pd_child, ucm_child]
+    elif multi_mode == "ucm-first":
+        children = [ucm_child, pd_child]
+    else:
+        raise ValueError(f"Unsupported multi_connector mode: {multi_mode!r}")
+
+    return KVTransferConfig(
+        kv_connector="MultiConnector",
+        kv_role="kv_both",
+        kv_load_failure_policy="fail",
+        kv_connector_extra_config={"connectors": children},
     )
 
 

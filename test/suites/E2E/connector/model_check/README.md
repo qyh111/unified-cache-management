@@ -59,7 +59,8 @@ python test/suites/E2E/connector/model_check/run.py \
   --block-size 128 --cp-kv-cache-interleave-size 128 \
   --tokens 4096 --max-num-batched-tokens 2048
 
-# Run pytest parallel matrix (default: Connector v1, 20 roundtrip + 2 v1 reject)
+# Run pytest parallel matrix (default: Connector v1, 22 roundtrip + 2 v1 reject,
+# including MultiConnector [MockPDHandshakeConnector, UCMConnector] PP=1/PP=2)
 # Each roundtrip case uses --auto-align-chunks 4 so padded Mamba/KDA/FAWA block
 # sizes automatically size prompt length and per-step batch budget to 4 aligned
 # chunks (guaranteeing a real State checkpoint at 75%).
