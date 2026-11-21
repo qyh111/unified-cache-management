@@ -83,11 +83,21 @@ def selected_platform() -> str:
 
 # Parallel topologies covering standard TP, PP, pure PCP, pure DCP, PCP+DCP, PP+CP.
 # (case_id, model_id, tp, pp, pcp, dcp, extra_args)
+# Note: --tokens / --max-num-batched-tokens overrides in extra_args ensure each
+# model forms multi-step chunks and creates an actual State checkpoint at 75%.
 PARALLEL_CASES = [
     ("glm53-tp2", "glm-5.3", 2, 1, 1, 1, ["--block-size", "128"]),
     ("glm53-pp2-tp2", "glm-5.3", 2, 2, 1, 1, ["--block-size", "128"]),
     ("glm53-pcp2-tp2", "glm-5.3", 2, 1, 2, 1, ["--block-size", "128"]),
-    ("glm53-dcp2-tp2", "glm-5.3", 2, 1, 1, 2, ["--block-size", "128"]),
+    (
+        "glm53-dcp2-tp2",
+        "glm-5.3",
+        2,
+        1,
+        1,
+        2,
+        ["--block-size", "128", "--cp-kv-cache-interleave-size", "128"],
+    ),
     (
         "glm53-pcp2-dcp2-tp2",
         "glm-5.3",
@@ -106,19 +116,76 @@ PARALLEL_CASES = [
         2,
         ["--block-size", "128", "--cp-kv-cache-interleave-size", "128"],
     ),
-    ("dsv4-flash-tp2-pcp2", "deepseek-v4-flash", 2, 1, 2, 1, []),
-    ("dsv41-flash-tp2-pcp2", "deepseek-v4.1-flash", 2, 1, 2, 1, ["--block-size", "128"]),
-    ("glm53-flash-tp2-pcp2", "glm-5.3-flash", 2, 1, 2, 1, ["--block-size", "128"]),
-    ("qwen27b-tp2-pcp2", "qwen3.8-27b", 2, 1, 2, 1, ["--block-size", "128"]),
-    ("qwen-fn-tp4-pcp2", "qwen3.8-flash-next", 4, 1, 2, 1, ["--block-size", "1536"]),
-    ("kimi-k3-tp4-pcp2", "kimi-k3", 4, 1, 2, 1, ["--block-size", "128"]),
+    (
+        "dsv4-flash-tp2-pcp2",
+        "deepseek-v4-flash",
+        2,
+        1,
+        2,
+        1,
+        ["--tokens", "16384", "--max-num-batched-tokens", "4096"],
+    ),
+    (
+        "dsv41-flash-tp2-pcp2",
+        "deepseek-v4.1-flash",
+        2,
+        1,
+        2,
+        1,
+        ["--block-size", "128", "--tokens", "16384", "--max-num-batched-tokens", "4096"],
+    ),
+    (
+        "glm53-flash-tp2-pcp2",
+        "glm-5.3-flash",
+        2,
+        1,
+        2,
+        1,
+        ["--block-size", "128", "--tokens", "16896", "--max-num-batched-tokens", "4224"],
+    ),
+    (
+        "qwen27b-tp2-pcp2",
+        "qwen3.8-27b",
+        2,
+        1,
+        2,
+        1,
+        ["--block-size", "128", "--tokens", "4096", "--max-num-batched-tokens", "1024"],
+    ),
+    (
+        "qwen-fn-tp4",
+        "qwen3.8-flash-next",
+        4,
+        1,
+        1,
+        1,
+        ["--block-size", "1536", "--tokens", "6144", "--max-num-batched-tokens", "1536"],
+    ),
+    (
+        "kimi-k3-tp4-pcp2",
+        "kimi-k3",
+        4,
+        1,
+        2,
+        1,
+        ["--block-size", "128", "--tokens", "4096", "--max-num-batched-tokens", "1024"],
+    ),
     ("minimax-m3-tp2", "minimax-m3", 2, 1, 1, 1, ["--block-size", "128"]),
     ("minimax-m3-pp2-tp2", "minimax-m3", 2, 2, 1, 1, ["--block-size", "128"]),
-    ("minimax-m3-dcp2-tp2", "minimax-m3", 2, 1, 1, 2, ["--block-size", "128"]),
+    (
+        "minimax-m3-dcp2-tp8",
+        "minimax-m3",
+        8,
+        1,
+        1,
+        2,
+        ["--block-size", "128", "--cp-kv-cache-interleave-size", "128"],
+    ),
 ]
 
 # Startup-rejection cases verifying unsupported v1 parallel configs fail fast
 # instead of silently corrupting external KV cache.
+# (case_id, model_id, tp, pp, pcp, dcp, extra_args, error_regex)
 V1_REJECT_CASES = [
     (
         "hla-pp2-reject",
@@ -127,6 +194,7 @@ V1_REJECT_CASES = [
         2,
         1,
         1,
+        [],
         "Pipeline parallelism is not supported",
     ),
     (
@@ -136,6 +204,7 @@ V1_REJECT_CASES = [
         1,
         1,
         2,
+        ["--cp-kv-cache-interleave-size", "4224"],
         "Decode context parallelism is not supported",
     ),
     (
@@ -145,6 +214,7 @@ V1_REJECT_CASES = [
         2,
         1,
         1,
+        [],
         "PP=DCP=1|Pipeline parallelism",
     ),
     (
@@ -154,6 +224,7 @@ V1_REJECT_CASES = [
         1,
         1,
         2,
+        [],
         "PP=DCP=1|Decode context parallelism",
     ),
     (
@@ -163,6 +234,7 @@ V1_REJECT_CASES = [
         2,
         1,
         1,
+        [],
         "PP=DCP=1|Pipeline parallelism",
     ),
     (
@@ -172,6 +244,7 @@ V1_REJECT_CASES = [
         1,
         1,
         2,
+        ["--cp-kv-cache-interleave-size", "32"],
         "PP=DCP=1|Decode context parallelism",
     ),
 ]
@@ -260,12 +333,12 @@ def test_parallel_roundtrip_matrix(
 @pytest.mark.stage(2)
 @pytest.mark.feature("connector")
 @pytest.mark.parametrize(
-    ("case_id", "model_id", "tp", "pp", "pcp", "dcp", "error_regex"),
+    ("case_id", "model_id", "tp", "pp", "pcp", "dcp", "extra_args", "error_regex"),
     V1_REJECT_CASES,
     ids=[case[0] for case in V1_REJECT_CASES],
 )
 def test_v1_unsupported_parallel_rejection(
-    case_id, model_id, tp, pp, pcp, dcp, error_regex
+    case_id, model_id, tp, pp, pcp, dcp, extra_args, error_regex
 ):
     if selected_connector() != "v1":
         pytest.skip("Startup-rejection matrix applies to v1 connector")
@@ -292,6 +365,7 @@ def test_v1_unsupported_parallel_rejection(
         "1024",
         "--max-num-batched-tokens",
         "512",
+        *extra_args,
         "--expect-reject",
         error_regex,
     ]
