@@ -73,13 +73,26 @@ def make_engine(args, store_root: Path):
         for name in architectures
     )
     world_size = args.tp * args.pcp * args.pp
+    if getattr(args, "auto_align_chunks", 0) > 0:
+        model_max_pos = (
+            model_config.get("max_position_embeddings")
+            or model_config.get("text_config", {}).get("max_position_embeddings")
+            or 24576
+        )
+        # Reserve enough max_model_len headroom for padded Mamba/KDA or FAWA
+        # alignments (e.g. 4 x 4096 = 16384 or 4 x 4224 = 16896) without
+        # exceeding the model's position limit.
+        max_model_len = min(int(model_max_pos), max(args.tokens + 16, 24576 + 16))
+    else:
+        max_model_len = args.tokens + 16
+    max_num_batched_tokens = min(args.max_num_batched_tokens, max_model_len)
     engine_kwargs = dict(
         model=str(args.model.resolve()),
         skip_tokenizer_init=not needs_tokenizer,
         trust_remote_code=args.trust_remote_code,
         load_format="dummy",
-        max_model_len=args.tokens + 16,
-        max_num_batched_tokens=args.max_num_batched_tokens,
+        max_model_len=max_model_len,
+        max_num_batched_tokens=max_num_batched_tokens,
         enable_chunked_prefill=True,
         max_num_seqs=2,
         tensor_parallel_size=args.tp,
@@ -100,7 +113,17 @@ def make_engine(args, store_root: Path):
         block_size=args.block_size,
         kv_transfer_config=build_kv_transfer_config(args, store_root),
     )
-    if args.cp_kv_cache_interleave_size is not None:
+    if args.cp_kv_cache_interleave_size == "auto":
+        if args.dcp > 1:
+            # Probe the platform-resolved block_size without kv_transfer_config
+            # so Ascend's DCP interleave equality check sees the model's real
+            # padded block_size (e.g. Mamba/KDA or DeepSeek-V4) instead of 1.
+            probe_kwargs = dict(engine_kwargs, kv_transfer_config=None)
+            probe_engine = EngineArgs(**probe_kwargs).create_engine_config()
+            engine_kwargs["cp_kv_cache_interleave_size"] = int(
+                probe_engine.cache_config.block_size
+            )
+    elif args.cp_kv_cache_interleave_size is not None:
         engine_kwargs["cp_kv_cache_interleave_size"] = args.cp_kv_cache_interleave_size
 
     engine = EngineArgs(**engine_kwargs).create_engine_config()
@@ -254,7 +277,15 @@ def make_model(engine):
     return model
 
 
-def allocate(engine, kv_mib, scratch_dir, cleanup, *, kv_device):
+def allocate(
+    engine,
+    kv_mib,
+    scratch_dir,
+    cleanup,
+    *,
+    kv_device,
+    auto_dcp_interleave: bool = False,
+):
     from parallel import gather
     from vllm.config import set_current_vllm_config
     from vllm.distributed import (
@@ -389,6 +420,14 @@ def allocate(engine, kv_mib, scratch_dir, cleanup, *, kv_device):
     )
     kv_cache_utils.update_kv_cache_capacity(engine, scheduler_config)
     engine.adjust_dcp_kv_cache_interleave_size(worker_config)
+    if (
+        auto_dcp_interleave
+        and engine.parallel_config.decode_context_parallel_size > 1
+    ):
+        final_block_size = int(engine.cache_config.block_size)
+        interleave = int(engine.parallel_config.cp_kv_cache_interleave_size)
+        if interleave > final_block_size or final_block_size % interleave != 0:
+            engine.parallel_config.cp_kv_cache_interleave_size = final_block_size
     engine.validate_block_size()
 
     block_size, hash_size = kv_cache_utils.resolve_kv_cache_block_sizes(

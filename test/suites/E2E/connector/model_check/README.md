@@ -59,7 +59,10 @@ python test/suites/E2E/connector/model_check/run.py \
   --block-size 128 --cp-kv-cache-interleave-size 128 \
   --tokens 4096 --max-num-batched-tokens 2048
 
-# Run pytest parallel matrix against the provisioned A2/A3 ModelScope root
+# Run pytest parallel matrix (default: Connector v1, 20 roundtrip + 4 v1 reject)
+# Each roundtrip case uses --auto-align-chunks 4 so padded Mamba/KDA/FAWA block
+# sizes automatically size prompt length and per-step batch budget to 4 aligned
+# chunks (guaranteeing a real State checkpoint at 75%).
 export UCM_V2_MODEL_ROOT=/home/qyh/ucm-a2-quant-models
 export UCM_MODEL_CHECK_PLATFORM=ascend
 export UCM_MODEL_CHECK_CONNECTOR=v1

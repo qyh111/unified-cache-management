@@ -81,11 +81,14 @@ def selected_platform() -> str:
     return platform
 
 
-# Parallel topologies covering standard TP, PP, pure PCP, pure DCP, PCP+DCP, PP+CP.
+# Parallel topologies for Connector v1 verification across UCMDirect/CP, FAWA
+# (hma_connector), and HLA (hla_connector).
 # (case_id, model_id, tp, pp, pcp, dcp, extra_args)
-# Note: --tokens / --max-num-batched-tokens overrides in extra_args ensure each
-# model forms multi-step chunks and creates an actual State checkpoint at 75%.
+# Every case runs with --auto-align-chunks 4 so prompt length and per-step batch
+# budget automatically align to the real runtime hit_alignment (including padded
+# Mamba/KDA block sizes and FAWA chunks) and create a State checkpoint at 75%.
 PARALLEL_CASES = [
+    # ---- ucm_connector (GLM-5.3, MiniMax-M3) -------------------------------
     ("glm53-tp2", "glm-5.3", 2, 1, 1, 1, ["--block-size", "128"]),
     ("glm53-pp2-tp2", "glm-5.3", 2, 2, 1, 1, ["--block-size", "128"]),
     ("glm53-pcp2-tp2", "glm-5.3", 2, 1, 2, 1, ["--block-size", "128"]),
@@ -116,60 +119,6 @@ PARALLEL_CASES = [
         2,
         ["--block-size", "128", "--cp-kv-cache-interleave-size", "128"],
     ),
-    (
-        "dsv4-flash-tp2-pcp2",
-        "deepseek-v4-flash",
-        2,
-        1,
-        2,
-        1,
-        ["--tokens", "16384", "--max-num-batched-tokens", "4096"],
-    ),
-    (
-        "dsv41-flash-tp2-pcp2",
-        "deepseek-v4.1-flash",
-        2,
-        1,
-        2,
-        1,
-        ["--block-size", "128", "--tokens", "16384", "--max-num-batched-tokens", "4096"],
-    ),
-    (
-        "glm53-flash-tp2-pcp2",
-        "glm-5.3-flash",
-        2,
-        1,
-        2,
-        1,
-        ["--block-size", "128", "--tokens", "16896", "--max-num-batched-tokens", "4224"],
-    ),
-    (
-        "qwen27b-tp2-pcp2",
-        "qwen3.8-27b",
-        2,
-        1,
-        2,
-        1,
-        ["--block-size", "128", "--tokens", "4096", "--max-num-batched-tokens", "1024"],
-    ),
-    (
-        "qwen-fn-tp4",
-        "qwen3.8-flash-next",
-        4,
-        1,
-        1,
-        1,
-        ["--block-size", "1536", "--tokens", "6144", "--max-num-batched-tokens", "1536"],
-    ),
-    (
-        "kimi-k3-tp4-pcp2",
-        "kimi-k3",
-        4,
-        1,
-        2,
-        1,
-        ["--block-size", "128", "--tokens", "4096", "--max-num-batched-tokens", "1024"],
-    ),
     ("minimax-m3-tp2", "minimax-m3", 2, 1, 1, 1, ["--block-size", "128"]),
     ("minimax-m3-pp2-tp2", "minimax-m3", 2, 2, 1, 1, ["--block-size", "128"]),
     (
@@ -181,10 +130,34 @@ PARALLEL_CASES = [
         2,
         ["--block-size", "128", "--cp-kv-cache-interleave-size", "128"],
     ),
+    # ---- hma_connector / FAWA (DeepSeek-V4-Flash, DeepSeek-V4.1-Flash) -----
+    ("dsv4-flash-tp2", "deepseek-v4-flash", 2, 1, 1, 1, []),
+    ("dsv4-flash-tp2-pcp2", "deepseek-v4-flash", 2, 1, 2, 1, []),
+    ("dsv41-flash-tp2", "deepseek-v4.1-flash", 2, 1, 1, 1, ["--block-size", "128"]),
+    (
+        "dsv41-flash-tp2-pcp2",
+        "deepseek-v4.1-flash",
+        2,
+        1,
+        2,
+        1,
+        ["--block-size", "128"],
+    ),
+    # ---- hla_connector / Hybrid MLA+KDA/Mamba (use production TP to avoid
+    #      oversized per-rank state padding) ---------------------------------
+    ("glm53-flash-tp8", "glm-5.3-flash", 8, 1, 1, 1, ["--block-size", "128"]),
+    ("glm53-flash-tp8-pcp2", "glm-5.3-flash", 8, 1, 2, 1, ["--block-size", "128"]),
+    ("kimi-k3-tp8", "kimi-k3", 8, 1, 1, 1, ["--block-size", "128"]),
+    ("kimi-k3-tp8-pcp2", "kimi-k3", 8, 1, 2, 1, ["--block-size", "128"]),
+    ("qwen27b-tp2", "qwen3.8-27b", 2, 1, 1, 1, ["--block-size", "128"]),
+    ("qwen27b-tp2-pcp2", "qwen3.8-27b", 2, 1, 2, 1, ["--block-size", "128"]),
+    ("qwen-fn-tp4", "qwen3.8-flash-next", 4, 1, 1, 1, ["--block-size", "1536"]),
 ]
 
 # Startup-rejection cases verifying unsupported v1 parallel configs fail fast
-# instead of silently corrupting external KV cache.
+# inside UCM connectors instead of silently corrupting external KV cache.
+# Only includes topologies that the engine itself permits (engine-banned combos
+# such as DeepSeek-V4.1 PP/DCP or Qwen4Exp CP are excluded).
 # (case_id, model_id, tp, pp, pcp, dcp, extra_args, error_regex)
 V1_REJECT_CASES = [
     (
@@ -200,32 +173,12 @@ V1_REJECT_CASES = [
     (
         "hla-dcp2-reject",
         "glm-5.3-flash",
-        2,
+        8,
         1,
         1,
         2,
-        ["--cp-kv-cache-interleave-size", "4224"],
+        ["--cp-kv-cache-interleave-size", "auto"],
         "Decode context parallelism is not supported",
-    ),
-    (
-        "fawa-v41-pp2-reject",
-        "deepseek-v4.1-flash",
-        2,
-        2,
-        1,
-        1,
-        [],
-        "PP=DCP=1|Pipeline parallelism",
-    ),
-    (
-        "fawa-v41-dcp2-reject",
-        "deepseek-v4.1-flash",
-        2,
-        1,
-        1,
-        2,
-        [],
-        "PP=DCP=1|Decode context parallelism",
     ),
     (
         "fawa-v4-pp2-reject",
@@ -244,7 +197,7 @@ V1_REJECT_CASES = [
         1,
         1,
         2,
-        ["--cp-kv-cache-interleave-size", "32"],
+        ["--cp-kv-cache-interleave-size", "auto"],
         "PP=DCP=1|Decode context parallelism",
     ),
 ]
@@ -325,6 +278,8 @@ def test_parallel_roundtrip_matrix(
         os.environ.get("UCM_MODEL_CHECK_TOKENS", "4096"),
         "--max-num-batched-tokens",
         os.environ.get("UCM_MODEL_CHECK_BATCH_TOKENS", "2048"),
+        "--auto-align-chunks",
+        os.environ.get("UCM_MODEL_CHECK_AUTO_ALIGN_CHUNKS", "4"),
         *extra_args,
     ]
     subprocess.run(cmd, check=True, env=offline_env())
@@ -362,9 +317,9 @@ def test_v1_unsupported_parallel_rejection(
         "--dcp",
         str(dcp),
         "--tokens",
-        "1024",
+        "8192",
         "--max-num-batched-tokens",
-        "512",
+        "2048",
         *extra_args,
         "--expect-reject",
         error_regex,
