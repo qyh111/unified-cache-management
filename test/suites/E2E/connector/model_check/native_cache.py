@@ -334,6 +334,63 @@ def make_model(engine, *, allow_kpool_host_stub: bool = False):
     return model
 
 
+def native_kv_head_partitions(engine, model, specs) -> dict[str, int]:
+    """Read GQA partition counts from the cache layer's owning QKV module."""
+    from vllm.v1.kv_cache_interface import (
+        AttentionSpec,
+        MLAAttentionSpec,
+        SlidingWindowMLASpec,
+    )
+
+    layers = engine.compilation_config.static_forward_context
+    modules = dict(model.named_modules())
+    module_names = {id(module): name for name, module in modules.items()}
+    tp_size = engine.parallel_config.tensor_parallel_size
+    if tp_size == 1:
+        return {}
+    partitions = {}
+    for layer_name, spec in specs.items():
+        if not isinstance(spec, AttentionSpec) or isinstance(
+            spec, (MLAAttentionSpec, SlidingWindowMLASpec)
+        ):
+            continue
+        max_tp_shards = getattr(spec, "max_tp_shards", None)
+        if max_tp_shards is not None:
+            count = min(tp_size, max_tp_shards)
+            if count <= 0 or tp_size % count:
+                raise ValueError(f"Invalid native GQA partition for {layer_name}")
+            partitions[layer_name] = count
+            continue
+
+        module_name = module_names.get(id(layers.get(layer_name)))
+        while module_name is not None:
+            owner = modules[module_name]
+            projection = getattr(owner, "qkv_proj", owner)
+            replicas = getattr(projection, "num_kv_head_replicas", None)
+            total_heads = getattr(owner, "total_num_kv_heads", None)
+            if replicas is not None:
+                if replicas <= 0 or tp_size % replicas:
+                    raise ValueError(f"Invalid native GQA replica count for {layer_name}")
+                partitions[layer_name] = tp_size // replicas
+                break
+            if total_heads is not None:
+                partitions[layer_name] = min(tp_size, total_heads)
+                break
+            module_name = module_name.rpartition(".")[0] if module_name else None
+
+        if layer_name not in partitions:
+            # In ordinary GQA only the single-local-head case can have head
+            # replicas. That case needs the owning projection's geometry.
+            if spec.num_kv_heads <= 1:
+                raise ValueError(
+                    f"Cannot resolve native GQA partition for {layer_name}"
+                )
+            partitions[layer_name] = tp_size
+        if partitions[layer_name] <= 0 or tp_size % partitions[layer_name]:
+            raise ValueError(f"Invalid native GQA partition for {layer_name}")
+    return partitions
+
+
 def allocate(
     engine,
     kv_mib,
@@ -341,6 +398,7 @@ def allocate(
     cleanup,
     *,
     kv_device,
+    connector_version: str,
     auto_dcp_interleave: bool = False,
     schedule_resolver=None,
     chunk_size: int | None = None,
@@ -445,6 +503,11 @@ def allocate(
         raise ValueError(f"{type(model).__name__} registered no KV cache specs")
     if any(getattr(spec, "non_causal", False) for spec in specs.values()):
         raise ValueError("Non-causal prefill disables native prefix caching")
+    head_partitions = (
+        native_kv_head_partitions(engine, model, specs)
+        if connector_version == "v1"
+        else {}
+    )
 
     supported = get_supported_kv_cache_layouts(get_current_attn_backends(engine))
     packing = resolve_kv_cache_layout(
@@ -583,6 +646,9 @@ def allocate(
         tensors = view if isinstance(view, (tuple, list)) else (view,)
         if any(tensor.device != kv_device for tensor in tensors):
             raise RuntimeError(f"Native allocator placed {name} outside {kv_device}")
+    for name, target in attn_utils.get_shared_kv_cache_layers(engine).items():
+        if target in head_partitions:
+            head_partitions[name] = head_partitions[target]
 
     print(
         f"[rank {rank}] {type(model).__name__}: layout={packing.name}, "
@@ -592,4 +658,12 @@ def allocate(
         f"max_num_batched_tokens={engine.scheduler_config.max_num_batched_tokens}",
         flush=True,
     )
-    return worker_config, scheduler_config, block_size, hash_size, views, resolved_plan
+    return (
+        worker_config,
+        scheduler_config,
+        block_size,
+        hash_size,
+        views,
+        resolved_plan,
+        head_partitions,
+    )

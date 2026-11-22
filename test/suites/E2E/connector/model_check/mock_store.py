@@ -13,9 +13,10 @@ import hashlib
 import json
 import os
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from threading import Lock
+from typing import Any, Callable
 from unittest.mock import patch
 
 import numpy as np
@@ -39,6 +40,10 @@ class BufferRegistry:
         self._dynamic_providers.append(provider)
 
     def assert_valid(self, ptr: int, num_bytes: int, context: str) -> None:
+        if ptr < 0 or num_bytes < 0:
+            raise AssertionError(
+                f"Invalid KV range during {context}: {ptr=}, {num_bytes=}"
+            )
         if ptr == 0 or num_bytes == 0:
             return
         end = ptr + num_bytes
@@ -71,11 +76,22 @@ def _append_audit(audit_path: Path, record: dict[str, Any]) -> None:
 class SharedFileByteStore:
     """Lock-free cross-process byte repository shared by all torchrun ranks."""
 
-    def __init__(self, root: Path, audit_dir: Path, world_rank: int) -> None:
+    def __init__(
+        self,
+        root: Path,
+        audit_dir: Path,
+        world_rank: int,
+        *,
+        dump_delay_polls: int = 0,
+    ) -> None:
         self.root = Path(root)
         self.audit_dir = Path(audit_dir)
         self.world_rank = int(world_rank)
+        self.dump_delay_polls = dump_delay_polls
+        self.io_errors: list[AssertionError] = []
+        self.pending_dumps = 0
         self.audit_file = self.audit_dir / f"rank_{self.world_rank}.jsonl"
+        self.prefix_lookups: list[tuple[Path, tuple[bytes, ...]]] | None = None
         self.root.mkdir(parents=True, exist_ok=True)
         self.audit_dir.mkdir(parents=True, exist_ok=True)
 
@@ -105,6 +121,7 @@ class SharedFileByteStore:
                 "namespace": self._namespace_label(namespace_dir),
                 "key": key_hex,
                 "shard": int(shard_index),
+                "num_shards": num_shards,
                 "offset": 0,
                 "size": len(payload),
                 "rank": self.world_rank,
@@ -190,9 +207,23 @@ class SharedFileByteStore:
 
 
 @dataclass
-class _CompletedTask:
+class _StoreTask:
     success: bool = True
     error: Exception | None = None
+    pending_dump: Callable[[], None] | None = None
+    remaining_polls: int = 0
+    lock: Any = field(default_factory=Lock, repr=False)
+
+    def complete(self) -> None:
+        if self.pending_dump is not None:
+            try:
+                self.pending_dump()
+            except Exception as exc:
+                self.error = exc
+            finally:
+                self.pending_dump = None
+        if self.error is not None:
+            raise self.error
 
 
 class MockStoreV1:
@@ -224,7 +255,15 @@ class MockStoreV1:
         self._tensor_sizes = [int(size) for size in raw_sizes]
         self._shard_size = int(config.get("shard_size") or sum(self._tensor_sizes) or 1)
         self._block_size = int(config.get("block_size") or self._shard_size)
-        self._num_shards = max(1, self._block_size // max(1, self._shard_size))
+        if self._shard_size <= 0 or any(size < 0 for size in self._tensor_sizes):
+            raise AssertionError(f"Invalid v1 Store geometry: {config}")
+        self._num_shards, remainder = divmod(self._block_size, self._shard_size)
+        if (
+            self._num_shards <= 0
+            or remainder
+            or sum(self._tensor_sizes) > self._shard_size
+        ):
+            raise AssertionError(f"Invalid v1 Store geometry: {config}")
 
     def cc_store(self) -> int:
         return 0
@@ -236,6 +275,8 @@ class MockStoreV1:
         ]
 
     def lookup_on_prefix(self, block_ids: list[bytes]) -> int:
+        if self._backing.prefix_lookups is not None:
+            self._backing.prefix_lookups.append((self._namespace_dir, tuple(block_ids)))
         for index, key in enumerate(block_ids):
             if not self._backing.is_v1_committed(self._namespace_dir, key):
                 return index - 1
@@ -250,16 +291,43 @@ class MockStoreV1:
     def prefetch(self, block_ids: list[bytes]) -> None:
         return None
 
-    def _normalize_ptr_rows(self, ptrs: Any, num_blocks: int) -> list[list[int]]:
+    def _normalize_ptr_rows(self, ptrs: Any) -> list[list[int]]:
         if isinstance(ptrs, np.ndarray):
             arr = ptrs
             if arr.ndim == 1:
-                arr = arr.reshape(num_blocks, -1)
+                if not arr.size:
+                    return []
+                if not self._tensor_sizes:
+                    raise AssertionError("v1 Store received pointers without tensor sizes")
+                arr = arr.reshape(-1, len(self._tensor_sizes))
+            if arr.ndim != 2:
+                raise AssertionError(f"Invalid v1 pointer matrix shape: {arr.shape}")
             return [[int(value) for value in row] for row in arr.tolist()]
         rows = list(ptrs)
         if rows and not isinstance(rows[0], (list, tuple, np.ndarray)):
             return [[int(value)] for value in rows]
         return [[int(value) for value in row] for row in rows]
+
+    def _validate_io(self, block_ids, shard_indices, ptrs, operation):
+        rows = self._normalize_ptr_rows(ptrs)
+        if len(block_ids) != len(shard_indices) or len(block_ids) != len(rows):
+            raise AssertionError(
+                f"v1 {operation} row count mismatch: keys={len(block_ids)}, "
+                f"shards={len(shard_indices)}, rows={len(rows)}"
+            )
+        for key, shard, row in zip(block_ids, shard_indices, rows, strict=True):
+            if not 0 <= shard < self._num_shards:
+                raise AssertionError(
+                    f"v1 {operation} shard {shard} outside [0, {self._num_shards})"
+                )
+            if len(row) != len(self._tensor_sizes):
+                raise AssertionError(
+                    f"v1 {operation} column count mismatch: ptrs={len(row)}, "
+                    f"tensor_size_list={len(self._tensor_sizes)}"
+                )
+            for ptr, size in zip(row, self._tensor_sizes, strict=True):
+                self._buffers.assert_valid(ptr, size, f"v1 {operation} {key.hex()[:8]}")
+        return rows
 
     def dump_data(
         self,
@@ -267,29 +335,58 @@ class MockStoreV1:
         shard_index: list[int],
         src_addr: Any,
         prerequisite_handle: int = 0,
-    ) -> _CompletedTask:
-        rows = self._normalize_ptr_rows(src_addr, len(block_ids))
-        for key, shard_id, ptr_row in zip(block_ids, shard_index, rows):
-            if len(ptr_row) != len(self._tensor_sizes):
-                raise AssertionError(
-                    f"v1 dump_data column count mismatch: ptrs={len(ptr_row)}, "
-                    f"tensor_size_list={len(self._tensor_sizes)}"
+    ) -> _StoreTask:
+        try:
+            rows = self._validate_io(block_ids, shard_index, src_addr, "dump_data")
+        except (AssertionError, ValueError) as exc:
+            self._backing.io_errors.append(AssertionError(str(exc)))
+            raise
+        keys = tuple(block_ids)
+        shards = tuple(shard_index)
+
+        def read_rows():
+            for row in rows:
+                yield b"".join(
+                    ctypes.string_at(ptr, size) if ptr else bytes(size)
+                    for ptr, size in zip(row, self._tensor_sizes, strict=True)
                 )
-            chunks = []
-            for ptr, size in zip(ptr_row, self._tensor_sizes):
-                if ptr == 0 or size == 0:
-                    chunks.append(bytes(size))
-                else:
-                    self._buffers.assert_valid(ptr, size, f"v1 dump {key.hex()[:8]}")
-                    chunks.append(ctypes.string_at(ptr, size))
-            self._backing.write_v1_shard(
-                self._namespace_dir,
-                key,
-                int(shard_id),
-                self._num_shards,
-                b"".join(chunks),
+
+        def persist(payloads):
+            for key, shard, payload in zip(keys, shards, payloads, strict=True):
+                self._backing.write_v1_shard(
+                    self._namespace_dir,
+                    key,
+                    int(shard),
+                    self._num_shards,
+                    payload,
+                )
+
+        if self._backing.dump_delay_polls and keys:
+            original = [hashlib.sha256(payload).digest() for payload in read_rows()]
+
+            def complete_dump():
+                try:
+                    payloads = list(read_rows())
+                    if [
+                        hashlib.sha256(payload).digest() for payload in payloads
+                    ] != original:
+                        raise AssertionError(
+                            "v1 Dump source changed before Store completion"
+                        )
+                    persist(payloads)
+                except Exception as exc:
+                    self._backing.io_errors.append(AssertionError(str(exc)))
+                    raise
+                finally:
+                    self._backing.pending_dumps -= 1
+
+            self._backing.pending_dumps += 1
+            return _StoreTask(
+                pending_dump=complete_dump,
+                remaining_polls=self._backing.dump_delay_polls,
             )
-        return _CompletedTask()
+        persist(read_rows())
+        return _StoreTask()
 
     def load_data(
         self,
@@ -298,22 +395,21 @@ class MockStoreV1:
         dst_addr: Any,
         prerequisite_handle: int = 0,
         **kwargs,
-    ) -> _CompletedTask:
+    ) -> _StoreTask:
         from ucm.store.pipeline.errors import StoreNotFoundError
 
-        rows = self._normalize_ptr_rows(dst_addr, len(block_ids))
+        try:
+            rows = self._validate_io(block_ids, shard_index, dst_addr, "load_data")
+        except (AssertionError, ValueError) as exc:
+            self._backing.io_errors.append(AssertionError(str(exc)))
+            raise
         expected_len = sum(self._tensor_sizes)
-        for key, shard_id, ptr_row in zip(block_ids, shard_index, rows):
-            if len(ptr_row) != len(self._tensor_sizes):
-                raise AssertionError(
-                    f"v1 load_data column count mismatch: ptrs={len(ptr_row)}, "
-                    f"tensor_size_list={len(self._tensor_sizes)}"
-                )
+        for key, shard_id, ptr_row in zip(block_ids, shard_index, rows, strict=True):
             payload = self._backing.read_v1_shard(
                 self._namespace_dir, key, int(shard_id)
             )
             if payload is None:
-                return _CompletedTask(
+                return _StoreTask(
                     success=False,
                     error=StoreNotFoundError(
                         f"Missing v1 shard {shard_id} for key {key.hex()} "
@@ -328,19 +424,21 @@ class MockStoreV1:
             cursor = 0
             for ptr, size in zip(ptr_row, self._tensor_sizes):
                 if ptr != 0 and size > 0:
-                    self._buffers.assert_valid(ptr, size, f"v1 load {key.hex()[:8]}")
                     ctypes.memmove(ptr, payload[cursor : cursor + size], size)
                 cursor += size
-        return _CompletedTask()
+        return _StoreTask()
 
-    def wait(self, task: _CompletedTask) -> None:
-        if task.error is not None:
-            raise task.error
+    def wait(self, task: _StoreTask) -> None:
+        with task.lock:
+            task.complete()
 
-    def check(self, task: _CompletedTask) -> bool:
-        if task.error is not None:
-            raise task.error
-        return True
+    def check(self, task: _StoreTask) -> bool:
+        with task.lock:
+            if task.pending_dump is not None and task.remaining_polls:
+                task.remaining_polls -= 1
+                return False
+            task.complete()
+            return True
 
 
 class MockSchedulerClientV2:
@@ -568,6 +666,8 @@ def install_mock_store(
 
     with ExitStack() as stack:
         if connector_version == "v1":
+            if not use_host_device:
+                raise ValueError("v1 mock Store requires CPU KV buffers")
             from ucm.store.factory_v1 import UcmConnectorFactoryV1
 
             def create_mock_v1(name, config, module_path=None):

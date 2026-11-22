@@ -8,6 +8,7 @@ layout or topology helpers.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from collections import defaultdict
@@ -79,6 +80,16 @@ def view_components(view) -> tuple:
     return tuple(view) if isinstance(view, (tuple, list)) else (view,)
 
 
+def _prefix_cacheable_group_ids(worker_config):
+    cacheable_ids = getattr(worker_config, "prefix_cacheable_group_ids", None)
+    if cacheable_ids is not None:
+        return cacheable_ids
+    return tuple(
+        gid for gid, group in enumerate(worker_config.kv_cache_groups)
+        if group.kv_cache_spec.prefix_cacheable
+    )
+
+
 def register_kv_buffers(views: dict[str, Any]) -> BufferRegistry:
     """Register every unique storage backing allocated by the native MRV2 runner."""
     registry = BufferRegistry()
@@ -100,6 +111,7 @@ def _native_layer_content_key(
     *,
     num_blocks: int,
     leading_dim: int,
+    head_partitions: dict[str, int] | None = None,
 ) -> tuple[int, int, int, str]:
     """Return a seed key shared ONLY by workers whose native KV bytes must match.
 
@@ -132,23 +144,173 @@ def _native_layer_content_key(
     if is_mla:
         tp_shard = 0
     else:
-        max_tp_shards = getattr(spec, "max_tp_shards", None) or coords.tp_size
+        max_tp_shards = (head_partitions or {}).get(layer_name)
+        if max_tp_shards is None:
+            max_tp_shards = getattr(spec, "max_tp_shards", None) or coords.tp_size
         tp_shards = min(coords.tp_size, int(max_tp_shards))
         tp_shard = coords.tp_rank * tp_shards // coords.tp_size
 
     # DCP-replicated tensors allocate num_blocks * dcp_size rows per rank,
     # holding the same full logical block across all DCP peers.
     rows_per_block = leading_dim // max(1, num_blocks)
+    dcp_replicated = (
+        getattr(spec, "sfa_dcp_replicated_indexer_size", 1) > 1
+        if head_partitions is not None
+        else rows_per_block > 1 and rows_per_block == coords.dcp_size
+    )
     if is_state:
         # At TP=1 with PCP>1, HLA scopes state per PCP rank.
         seq_shard = coords.pcp_rank if coords.tp_size == 1 else 0
-    elif rows_per_block > 1 and rows_per_block == coords.dcp_size:
+    elif dcp_replicated:
         seq_shard = 0
     else:
         group_dcp = _group_dcp_size(spec, coords.dcp_size) if spec is not None else 1
         seq_shard = coords.dcp_rank if group_dcp > 1 else 0
 
     return (coords.pp_rank, tp_shard, seq_shard, layer_name)
+
+
+class NativePrefill:
+    """Generate KV at the native block-table locations written by each cold step."""
+
+    def __init__(self, views, config, coords, engine, head_partitions):
+        from vllm.v1.kv_cache_interface import MambaSpec
+
+        self.num_blocks = int(config.num_blocks)
+        self.coords = coords
+        self.interleave = int(engine.parallel_config.cp_kv_cache_interleave_size)
+        self.layers = {}
+        for gid in _prefix_cacheable_group_ids(config):
+            group = config.kv_cache_groups[gid]
+            for name in group.layer_names:
+                if name not in views:
+                    if group.kv_cache_spec.has_layer_views:
+                        raise AssertionError(f"Missing native view for g{gid}:{name}")
+                    continue
+                spec = _unwrap_layer_spec(group.kv_cache_spec, name)
+                is_state = isinstance(spec, MambaSpec)
+                parts = _unwrap_parts(
+                    views[name],
+                    is_state=is_state,
+                    device_type=engine.device_config.device_type,
+                )
+                self.layers[name] = (
+                    gid,
+                    spec,
+                    is_state,
+                    tuple(
+                        (
+                            part,
+                            _native_layer_content_key(
+                                config,
+                                name,
+                                coords,
+                                num_blocks=self.num_blocks,
+                                leading_dim=int(part.size(0)),
+                                head_partitions=head_partitions,
+                            ),
+                        )
+                        for part in parts
+                        if part.numel()
+                    ),
+                )
+
+    def write_layer(self, name, requests):
+        if name not in self.layers:
+            return
+        gid, spec, is_state, parts = self.layers[name]
+        for request_id, start, end, tables, boundaries in requests:
+            table = tables[gid]
+            if is_state:
+                # Native align-mode State has one running slot per step and
+                # explicit boundary slots, which can have different block IDs.
+                running = (end - 1) // spec.block_size
+                if running >= len(table) or table[running] <= 0:
+                    raise AssertionError(
+                        f"Missing cold running State for g{gid} at {end}"
+                    )
+                state_blocks = {table[running]: end}
+                state_blocks.update(
+                    (block, boundary)
+                    for group_id, block, boundary in boundaries
+                    if group_id == gid
+                )
+                for block, boundary in state_blocks.items():
+                    for index, (part, key) in enumerate(parts):
+                        page = _slice_block_tensor(part, self.num_blocks, block)
+                        page.copy_(_pattern(page, (request_id, key, index, boundary)))
+                continue
+
+            group_dcp = _group_dcp_size(spec, self.coords.dcp_size)
+            logical_span = spec.block_size * group_dcp
+            for logical_block in range(
+                start // logical_span, (end - 1) // logical_span + 1
+            ):
+                if logical_block >= len(table) or table[logical_block] == 0:
+                    # Native sliding-window tables may omit positions which
+                    # won't be used even within this prefill step.
+                    continue
+                lo = max(start - logical_block * logical_span, 0)
+                hi = min(end - logical_block * logical_span, logical_span)
+                for index, (part, key) in enumerate(parts):
+                    page = _slice_block_tensor(
+                        part, self.num_blocks, table[logical_block]
+                    )
+                    pattern = _pattern(page, (request_id, key, index, logical_block))
+                    self._write_attention(page, pattern, spec, group_dcp, lo, hi)
+
+    def _write_attention(self, page, pattern, spec, group_dcp, lo, hi):
+        logical_span = spec.block_size * group_dcp
+        if lo == 0 and hi == logical_span:
+            page.copy_(pattern)
+            return
+
+        replicated = int(getattr(spec, "sfa_dcp_replicated_indexer_size", 1)) > 1
+        ratio = spec.tokens_per_state
+        if ratio <= 0:
+            raise AssertionError(f"Cannot map partial token range for {spec}")
+        if group_dcp > 1 and not replicated:
+            positions = np.arange(lo, hi)
+            positions = positions[
+                positions // self.interleave % group_dcp == self.coords.dcp_rank
+            ]
+            if not positions.size:
+                return
+            positions = (
+                positions // (self.interleave * group_dcp) * self.interleave
+                + positions % self.interleave
+            )
+            lo, hi = int(positions[0]), int(positions[-1]) + 1
+        storage_tokens = logical_span if replicated else spec.block_size
+        rows = int(page.size(0))
+        states_per_row = int(storage_tokens // ratio) // rows
+        axes = [
+            axis for axis in range(1, page.ndim) if page.size(axis) == states_per_row
+        ]
+        if not axes or states_per_row <= 0:
+            raise AssertionError(
+                f"Cannot map partial token range to {tuple(page.shape)} for {spec}"
+            )
+        token_axis = axes[0] - 1
+        state_start, state_end = int(lo // ratio), int(hi // ratio)
+        for row in range(rows):
+            offset = row * states_per_row
+            start = max(state_start - offset, 0)
+            end = min(state_end - offset, states_per_row)
+            if start < end:
+                page[row].narrow(token_axis, start, end - start).copy_(
+                    pattern[row].narrow(token_axis, start, end - start)
+                )
+
+
+def _pattern(view, key):
+    import torch
+
+    digest = hashlib.sha256(repr(key).encode()).digest()
+    rng = np.random.default_rng(int.from_bytes(digest[:8], "little"))
+    data = rng.integers(1, 255, size=view.numel() * view.element_size(), dtype=np.uint8)
+    data[data == 0xA5] = 0x5A
+    return torch.from_numpy(data).view(view.dtype).reshape(view.shape).to(view.device)
 
 
 def fill_native_kv(views: dict[str, Any], worker_config, coords) -> None:
@@ -159,20 +321,12 @@ def fill_native_kv(views: dict[str, Any], worker_config, coords) -> None:
     transient compressor.state_cache) always end up with the prefix-cacheable
     layer's replica-consistent bytes.
     """
-    import hashlib
     import torch
 
     num_blocks = int(worker_config.num_blocks)
-    cacheable_ids = getattr(worker_config, "prefix_cacheable_group_ids", None)
-    if cacheable_ids is None:
-        cacheable_ids = tuple(
-            gid
-            for gid, group in enumerate(worker_config.kv_cache_groups)
-            if group.kv_cache_spec.prefix_cacheable
-        )
     cacheable_layers = {
         name
-        for gid in cacheable_ids
+        for gid in _prefix_cacheable_group_ids(worker_config)
         for name in worker_config.kv_cache_groups[gid].layer_names
     }
     ordered_passes = (
@@ -332,6 +486,7 @@ def snapshot_cold_blocks(
     block_tables: tuple[list[int], ...],
     *,
     device_type: str,
+    state_blocks: dict[int, int] | None = None,
 ) -> dict[tuple[str, int, int], Any]:
     """Clone ONLY the blocks allocated to the cold request (avoids full-pool copy)."""
     from vllm.v1.kv_cache_interface import MambaSpec, UniformTypeKVCacheSpecs
@@ -349,6 +504,8 @@ def snapshot_cold_blocks(
         )
         is_state = any(isinstance(member, MambaSpec) for member in members)
         unique_blocks = {blk for blk in block_tables[gid] if blk > 0}
+        if state_blocks and gid in state_blocks:
+            unique_blocks.add(state_blocks[gid])
         for layer_name in group.layer_names:
             if layer_name not in views:
                 continue
@@ -409,6 +566,81 @@ def _tensor_raw_bytes(tensor) -> bytes:
     return flat.view(torch.uint8).numpy().tobytes()
 
 
+def verify_unallocated_kv_is_poisoned(
+    worker_config,
+    views,
+    tables,
+    *,
+    device_type,
+    poison_byte=0xA5,
+):
+    """Check guard pages outside the hot request's native allocations."""
+    from bisect import bisect_left
+
+    from vllm.v1.kv_cache_interface import MambaSpec
+
+    candidates = []
+    writable = defaultdict(list)
+    num_blocks = worker_config.num_blocks
+    for gid, group in enumerate(worker_config.kv_cache_groups):
+        allocated = set(tables[gid]) - {0}
+        for name in group.layer_names:
+            if name not in views:
+                continue
+            spec = _unwrap_layer_spec(group.kv_cache_spec, name)
+            for part in _unwrap_parts(
+                views[name],
+                is_state=isinstance(spec, MambaSpec),
+                device_type=device_type,
+            ):
+                if not part.numel():
+                    continue
+                storage = int(part.untyped_storage().data_ptr())
+                rows, remainder = divmod(part.size(0), num_blocks)
+                if rows < 1 or remainder:
+                    raise AssertionError(f"Invalid native KV block axis for {name}")
+                for block in range(num_blocks):
+                    page = part.narrow(0, block * rows, rows)
+                    start = int(page.data_ptr())
+                    elements = 1 + sum(
+                        (size - 1) * stride
+                        for size, stride in zip(page.shape, page.stride())
+                    )
+                    end = start + elements * page.element_size()
+                    if block in allocated:
+                        writable[storage].append((start, end))
+                    else:
+                        candidates.append((storage, start, end, page, name, block))
+
+    intervals = {}
+    for storage, spans in writable.items():
+        starts, ends = [], []
+        for start, end in sorted(spans):
+            if ends and start <= ends[-1]:
+                ends[-1] = max(ends[-1], end)
+            else:
+                starts.append(start)
+                ends.append(end)
+        intervals[storage] = starts, ends
+
+    checked = 0
+    marker = bytes([poison_byte])
+    for storage, start, end, page, name, block in candidates:
+        starts, ends = intervals.get(storage, ((), ()))
+        last = bisect_left(starts, end) - 1
+        if last >= 0 and ends[last] > start:
+            continue  # This guard aliases a legitimately allocated native page.
+        data = _tensor_raw_bytes(page)
+        if data.count(marker) != len(data):
+            raise AssertionError(
+                f"Load wrote outside the hot allocation: {name} block {block}"
+            )
+        checked += 1
+    if not checked:
+        raise AssertionError("No unallocated KV guard pages were available")
+    return checked
+
+
 def verify_cold_vs_hot(
     worker_config,
     cold_block_snapshots: dict[tuple[str, int, int], Any],
@@ -423,6 +655,8 @@ def verify_cold_vs_hot(
     world_rank: int,
     poison_byte: int = 0xA5,
     compress_ratios: list[int] | tuple[int, ...] | None = None,
+    require_state_targets: bool = False,
+    cold_state_blocks: dict[int, int] | None = None,
 ) -> tuple[int, int]:
     """Compare every engine-native restored hot slice against its cold snapshot."""
     from vllm.v1.kv_cache_interface import (
@@ -432,17 +666,9 @@ def verify_cold_vs_hot(
     )
 
     num_blocks = int(worker_config.num_blocks)
-    cacheable_ids = getattr(worker_config, "prefix_cacheable_group_ids", None)
-    if cacheable_ids is None:
-        cacheable_ids = tuple(
-            gid
-            for gid, group in enumerate(worker_config.kv_cache_groups)
-            if group.kv_cache_spec.prefix_cacheable
-        )
-
     verified_slices = 0
     verified_bytes = 0
-    for gid in cacheable_ids:
+    for gid in _prefix_cacheable_group_ids(worker_config):
         group = worker_config.kv_cache_groups[gid]
         if not group.layer_names:
             continue
@@ -472,14 +698,29 @@ def verify_cold_vs_hot(
             # state snapshot saved at the hit_tokens boundary of the cold run.
             checkpoint_idx = max(0, (hit_tokens - 1) // logical_span)
             running_idx = max(0, (hot_load_step_end - 1) // logical_span)
-            cold_ckpt_blk = cold_table[checkpoint_idx]
+            cold_ckpt_blk = (
+                cold_table[checkpoint_idx] if checkpoint_idx < len(cold_table) else 0
+            )
+            if cold_state_blocks is not None:
+                cold_ckpt_blk = cold_state_blocks.get(gid, cold_ckpt_blk)
+            if require_state_targets and cold_ckpt_blk <= 0:
+                raise AssertionError(
+                    f"[rank {world_rank}] Missing cold State checkpoint "
+                    f"for g{gid} at {hit_tokens} tokens"
+                )
             if cold_ckpt_blk > 0:
                 seen_hot = set()
                 for role_name, idx in (
                     ("state_ckpt", checkpoint_idx),
                     ("state_run", running_idx),
                 ):
-                    if idx < len(hot_table) and hot_table[idx] > 0:
+                    if idx >= len(hot_table) or hot_table[idx] <= 0:
+                        if require_state_targets:
+                            raise AssertionError(
+                                f"[rank {world_rank}] Missing hot {role_name} "
+                                f"for g{gid} at block-table index {idx}"
+                            )
+                    else:
                         hot_blk = hot_table[idx]
                         if hot_blk not in seen_hot:
                             seen_hot.add(hot_blk)
@@ -515,10 +756,22 @@ def verify_cold_vs_hot(
 
         for layer_name in group.layer_names:
             if layer_name not in hot_views:
+                if require_state_targets and is_state:
+                    raise AssertionError(
+                        f"[rank {world_rank}] Missing State view {layer_name}"
+                    )
                 continue
             parts = _unwrap_parts(
                 hot_views[layer_name], is_state=is_state, device_type=device_type
             )
+            if (
+                require_state_targets
+                and is_state
+                and not any(part.numel() for part in parts)
+            ):
+                raise AssertionError(
+                    f"[rank {world_rank}] Empty State view {layer_name}"
+                )
             for c_blk, h_blk, tok_lo, tok_hi, slot_desc in pairs:
                 for part_idx, hot_tensor in enumerate(parts):
                     if not hot_tensor.numel():
@@ -545,6 +798,13 @@ def verify_cold_vs_hot(
                     )
                     expected = _tensor_raw_bytes(expected_sub)
                     actual = _tensor_raw_bytes(actual_sub)
+                    if require_state_targets and expected.count(
+                        bytes([poison_byte])
+                    ) == len(expected):
+                        raise AssertionError(
+                            f"[rank {world_rank}] Cold prefill never wrote "
+                            f"g{gid}:{layer_name}:p{part_idx}:{slot_desc}"
+                        )
                     verified_slices += 1
                     verified_bytes += len(expected)
                     if actual != expected:
@@ -575,6 +835,9 @@ def audit_writes(
     audit_dir: Path,
     *,
     allow_duplicate_writes: bool = False,
+    dcp_dump_ranks: dict[str, int] | None = None,
+    dcp_rank_by_worker: list[int] | None = None,
+    pp_size: int = 1,
 ) -> dict[str, int]:
     """Verify cross-rank write ownership and detect conflicting/duplicate writes."""
     records = []
@@ -586,21 +849,24 @@ def audit_writes(
         raise AssertionError("Cold write produced zero store writes across all ranks")
 
     seen: dict[tuple, list[dict[str, Any]]] = defaultdict(list)
+    shards_by_key = defaultdict(set)
+    geometry_by_key = defaultdict(set)
     for rec in records:
-        slot = (
-            rec["namespace"],
-            rec["key"],
-            rec["shard"],
-            rec["offset"],
-            rec["size"],
-        )
+        namespace_key = (rec["namespace"], rec["key"])
+        if rec["version"] == "v1":
+            # A v1 write replaces the whole shard path regardless of its size.
+            slot = (*namespace_key, rec["shard"])
+            shards_by_key[namespace_key].add(rec["shard"])
+            geometry_by_key[namespace_key].add((rec["num_shards"], rec["size"]))
+        else:
+            slot = (*namespace_key, rec["shard"], rec["offset"], rec["size"])
         seen[slot].append(rec)
 
     duplicates = []
     conflicts = []
     for slot, writers in seen.items():
         ranks = [w["rank"] for w in writers]
-        hashes = {w["sha256"] for w in writers}
+        hashes = {(w["size"], w["sha256"]) for w in writers}
         if len(hashes) > 1:
             conflicts.append((slot, ranks))
         elif len(set(ranks)) > 1:
@@ -618,6 +884,42 @@ def audit_writes(
             f"Duplicate cross-rank writes to the same store slot {slot} "
             f"from ranks {ranks} (total duplicates={len(duplicates)})"
         )
+
+    for key, shards in shards_by_key.items():
+        geometry = geometry_by_key[key]
+        if len(geometry) != 1:
+            raise AssertionError(
+                f"Inconsistent v1 shard geometry for {key}: {geometry}"
+            )
+        ((num_shards, _),) = geometry
+        if shards != set(range(num_shards)):
+            raise AssertionError(
+                f"Incomplete v1 shard coverage for {key}: "
+                f"missing={sorted(set(range(num_shards)) - shards)}"
+            )
+
+    if dcp_dump_ranks is not None:
+        namespaces_by_key = defaultdict(set)
+        for rec in records:
+            key = rec["key"]
+            if key not in dcp_dump_ranks:
+                raise AssertionError(
+                    f"DCP Store wrote key {key} outside the scheduler plan"
+                )
+            expected = dcp_dump_ranks[key]
+            rank = rec["rank"]
+            if dcp_rank_by_worker[rank] != expected:
+                raise AssertionError(
+                    f"DCP Store wrote key {key} from world rank {rank} "
+                    f"(DCP rank {dcp_rank_by_worker[rank]}, expected {expected})"
+                )
+            namespaces_by_key[key].add(rec["namespace"])
+        for key in dcp_dump_ranks:
+            if len(namespaces_by_key[key]) != pp_size:
+                raise AssertionError(
+                    f"DCP key {key} written in {len(namespaces_by_key[key])} "
+                    f"stage namespaces, expected {pp_size}"
+                )
 
     namespaces = {rec["namespace"] for rec in records}
     unique_keys = {(rec["namespace"], rec["key"]) for rec in records}

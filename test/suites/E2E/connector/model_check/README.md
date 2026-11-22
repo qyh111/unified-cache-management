@@ -18,14 +18,21 @@ connectors without circularly depending on UCM's internal layout logic.
    Every pointer copy is bounds-checked against registered native KV buffers, and
    cross-rank writes are audited for conflicting or duplicate writes.
 3. **Engine-Native Poison + Roundtrip Oracle** (`verifier.py`, `run.py`):
-   - **Cold Write**: fills native KV tensors with replica-consistent deterministic
-     bytes and runs a full chunked-prefill Dump through the real vLLM `Scheduler`
-     and `KVOutputAggregator`.
+   - **Cold Write**: v1 starts the KV pool poisoned, writes replica-consistent
+     bytes to the current Scheduler step's native block-table locations, and
+     snapshots the prefix before later steps can reclaim its blocks. Retained
+     State checkpoints carry boundary-specific bytes. The harness still drives
+     the layer callbacks around a simulated forward.
    - **Negative Isolation**: mutates token 0 and verifies zero false external hits.
    - **Poison + Hot Reload**: resets local HBM prefix cache, poisons all KV buffers
      with `0xA5`, reloads a shared-prefix request from the mock store, and checks
      every engine-native expected slice (`prefix_cacheable_group_ids`, `block_tables`,
      and native `kv_caches` views) byte-for-byte.
+4. **v1 parallel fault checks**: The GLM-5.3 PP2 and DCP2 matrix cases hide a
+   committed key after a successful reload and verify that the hit stops before
+   it. They also check native guard pages outside the hot request's allocation.
+   Direct MLA DCP cases check each Store key's writer against its Scheduler
+   shard position and the writer's native DCP rank.
 
 ## Examples (Ascend A2/A3 server)
 
@@ -70,3 +77,8 @@ export UCM_MODEL_CHECK_CONNECTOR=v1
 python -m pytest -c test/pytest.ini --confcutdir=test/suites/E2E/connector -o addopts= -vs \
   test/suites/E2E/connector/test_parallel_model_check.py
 ```
+
+For an asynchronous v1 Dump path, add `--dump-delay-polls 64` to a GLM-5.3
+`run.py` command. The harness requires a pending Dump when it schedules a
+second prefill request and checks that the source bytes remain intact until the
+Store consumes them.

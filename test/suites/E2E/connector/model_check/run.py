@@ -198,6 +198,22 @@ def parse_args(argv: list[str] | None = None):
         help="allow identical duplicate cross-rank writes instead of failing audit",
     )
     parser.add_argument(
+        "--partial-miss",
+        choices=("pp-stage", "dcp-shard"),
+        help="after a successful v1 reload, hide one committed key and check hit truncation",
+    )
+    parser.add_argument(
+        "--dump-delay-polls",
+        type=int,
+        default=0,
+        help="hold v1 Dump tasks for N polls and schedule a second request before draining",
+    )
+    parser.add_argument(
+        "--verify-load-guards",
+        action="store_true",
+        help="verify unallocated native KV guard pages after the v1 hot load",
+    )
+    parser.add_argument(
         "--expect-reject",
         metavar="REGEX",
         help="expect startup/connector construction to fail with a matching error",
@@ -212,6 +228,17 @@ def parse_args(argv: list[str] | None = None):
         parser.error("--prefix-percent must be in [1, 99]")
     if args.auto_align_chunks != 0 and args.auto_align_chunks < 2:
         parser.error("--auto-align-chunks must be 0 (disabled) or >= 2")
+    if args.partial_miss:
+        if args.connector != "v1" or args.ucm_config or args.expect_reject:
+            parser.error("--partial-miss requires the default v1 mock Store")
+        if args.partial_miss == "pp-stage" and (args.pp < 2 or args.dcp != 1):
+            parser.error("--partial-miss pp-stage requires PP > 1 and DCP = 1")
+        if args.partial_miss == "dcp-shard" and (args.dcp < 2 or args.pp != 1):
+            parser.error("--partial-miss dcp-shard requires DCP > 1 and PP = 1")
+    if args.dump_delay_polls < 0 or args.dump_delay_polls and args.connector != "v1":
+        parser.error("--dump-delay-polls requires a nonnegative v1 poll count")
+    if args.verify_load_guards and args.connector != "v1":
+        parser.error("--verify-load-guards requires v1")
     if args.platform == "cuda-sim" and not args.cuda_capability:
         parser.error("cuda-sim requires --cuda-capability, e.g. 9.0")
     if args.platform == "ascend-sim" and not args.ascend_soc:
@@ -230,19 +257,39 @@ def _execute_worker_step(
     total_tokens: int,
     views: dict,
     finished_req_ids: set[str],
+    *,
+    native_v1: bool,
+    sync_loads: bool,
+    prefill=None,
+    prefill_requests=(),
 ):
-    """Run the exact vLLM KVConnectorBase_V1 worker callback sequence for one step."""
+    """Drive connector callbacks around the simulated layer forward."""
     from vllm.forward_context import get_forward_context, set_forward_context
     from vllm.v1.outputs import KVConnectorOutput
 
     if metadata is not None:
+        if native_v1:
+            worker.handle_preemptions(metadata)
         worker.bind_connector_metadata(metadata)
         with set_forward_context(None, engine, num_tokens=total_tokens):
-            worker.start_load_kv(get_forward_context())
-            for layer_name, view in views.items():
-                worker.wait_for_layer_load(layer_name)
-                worker.save_kv_layer(layer_name, view, None)
+            if not native_v1 or sync_loads:
+                worker.start_load_kv(get_forward_context())
+            if total_tokens or not native_v1:
+                for layer_names in _forward_layers(views, native_v1):
+                    for layer_name in layer_names:
+                        worker.wait_for_layer_load(layer_name)
+                        if prefill is not None:
+                            prefill.write_layer(layer_name, prefill_requests)
+                    for layer_name in layer_names:
+                        worker.save_kv_layer(layer_name, views[layer_name], None)
+            if native_v1:
+                worker.finish_forward()
+                if not sync_loads:
+                    worker.start_load_kv(get_forward_context())
             worker.wait_for_save()
+    elif prefill is not None:
+        for layer_name in views:
+            prefill.write_layer(layer_name, prefill_requests)
 
     transfers = worker.get_transfer_results(set(finished_req_ids))
     worker_meta = worker.build_connector_worker_meta()
@@ -260,7 +307,31 @@ def _execute_worker_step(
     )
 
 
-def _step_all_ranks(engine, scheduler, aggregator, worker, views, *, is_root: bool):
+def _forward_layers(views, native_v1):
+    if not native_v1:
+        return [(name,) for name in views]
+    # A model layer may publish paired cache views (e.g. attention + indexer).
+    # Both receive their new data before any save hook for that layer runs.
+    layers = {}
+    for name in views:
+        match = re.search(r"(?:^|\.)layers\.\d+(?=\.|$)", name)
+        key = name[: match.end()] if match else name
+        layers.setdefault(key, []).append(name)
+    return layers.values()
+
+
+def _step_all_ranks(
+    engine,
+    scheduler,
+    aggregator,
+    worker,
+    views,
+    *,
+    is_root: bool,
+    native_v1: bool,
+    prefill=None,
+    dcp_dump_ranks=None,
+):
     """Execute one synchronized Scheduler -> Workers -> KVOutputAggregator step."""
     from parallel import broadcast, gather
     from vllm.v1.outputs import make_empty_encoder_model_runner_output
@@ -269,16 +340,59 @@ def _step_all_ranks(engine, scheduler, aggregator, worker, views, *, is_root: bo
     step_payload = None
     if is_root:
         output = scheduler.schedule()
+        if dcp_dump_ranks is not None and output.kv_connector_metadata is not None:
+            # MLA CP exposes scheduler keys unchanged to the Store. Their
+            # semantic DCP order is fixed by the v1 metadata contract.
+            for request in output.kv_connector_metadata.request_meta.values():
+                keys, blocks = request.dump_block_ids
+                dcp_size = engine.parallel_config.decode_context_parallel_size
+                if len(keys) != dcp_size * len(blocks):
+                    raise AssertionError("Invalid scheduler DCP dump plan geometry")
+                for offset, key in enumerate(keys):
+                    key_hex = key.hex()
+                    expected = offset % dcp_size
+                    if dcp_dump_ranks.setdefault(key_hex, expected) != expected:
+                        raise AssertionError(
+                            f"DCP dump key {key_hex} changed shard rank"
+                        )
+        prefill_requests = []
+        if prefill is not None:
+            block_state = getattr(output, "kv_connector_block_state", None)
+            boundaries = block_state.boundary_state_offloads if block_state else {}
+            for request_id, count in output.num_scheduled_tokens.items():
+                end = scheduler.requests[request_id].num_computed_tokens
+                tables = scheduler.kv_cache_manager.get_block_ids(request_id)
+                prefill_requests.append(
+                    (
+                        request_id,
+                        end - count,
+                        end,
+                        tables,
+                        boundaries.get(request_id, ()),
+                    )
+                )
         step_payload = (
             output.kv_connector_metadata,
             int(output.total_num_scheduled_tokens),
-            dict(output.num_scheduled_tokens),
             set(output.finished_req_ids or ()),
+            bool(getattr(output, "has_sync_kv_loads", False)),
+            prefill_requests,
         )
-    metadata, total_tokens, num_scheduled, finished_req_ids = broadcast(step_payload)
+    metadata, total_tokens, finished_req_ids, sync_loads, prefill_requests = broadcast(
+        step_payload
+    )
 
     local_kv_out = _execute_worker_step(
-        engine, worker, metadata, total_tokens, views, finished_req_ids
+        engine,
+        worker,
+        metadata,
+        total_tokens,
+        views,
+        finished_req_ids,
+        native_v1=native_v1,
+        sync_loads=sync_loads,
+        prefill=prefill,
+        prefill_requests=prefill_requests,
     )
     all_kv_outs = gather(local_kv_out)
 
@@ -294,7 +408,16 @@ def _step_all_ranks(engine, scheduler, aggregator, worker, views, *, is_root: bo
     return None, None
 
 
-def _drain_scheduler(engine, scheduler, aggregator, worker, views, *, is_root: bool):
+def _drain_scheduler(
+    engine,
+    scheduler,
+    aggregator,
+    worker,
+    views,
+    *,
+    is_root: bool,
+    native_v1: bool,
+):
     """Advance empty steps until all pending async dumps/offloads finish."""
     from parallel import broadcast
 
@@ -302,7 +425,15 @@ def _drain_scheduler(engine, scheduler, aggregator, worker, views, *, is_root: b
         has_work = broadcast(scheduler.has_requests() if is_root else False)
         if not has_work:
             return
-        _step_all_ranks(engine, scheduler, aggregator, worker, views, is_root=is_root)
+        _step_all_ranks(
+            engine,
+            scheduler,
+            aggregator,
+            worker,
+            views,
+            is_root=is_root,
+            native_v1=native_v1,
+        )
     if is_root:
         raise AssertionError("Scheduler still has unfinished requests after drain limit")
 
@@ -334,6 +465,11 @@ def _run_request_to_prefill_end(
     *,
     is_root: bool,
     target_tokens: int,
+    native_v1: bool,
+    prefill=None,
+    dcp_dump_ranks=None,
+    capture_at: int | None = None,
+    capture_boundary=None,
     on_load_step_complete=None,
 ):
     """Run one request through chunked prefill and return final tables & hit stats."""
@@ -350,13 +486,24 @@ def _run_request_to_prefill_end(
     final_tables = None
     last_computed = 0
     load_checked = False
+    cold_captured = False
+    cold_state_blocks = {}
     step_ends: list[int] = []
 
     for _ in range(max(64, target_tokens // 16 + 16)):
         output, _ = _step_all_ranks(
-            engine, scheduler, aggregator, worker, views, is_root=is_root
+            engine,
+            scheduler,
+            aggregator,
+            worker,
+            views,
+            is_root=is_root,
+            native_v1=native_v1,
+            prefill=prefill,
+            dcp_dump_ranks=dcp_dump_ranks,
         )
         load_event = None
+        cold_event = None
         done = False
         if is_root:
             steps += 1
@@ -369,6 +516,21 @@ def _run_request_to_prefill_end(
                 not step_ends or last_computed != step_ends[-1]
             ):
                 step_ends.append(last_computed)
+            if capture_at is not None and not cold_captured:
+                block_state = getattr(output, "kv_connector_block_state", None)
+                if block_state is not None:
+                    cold_state_blocks.update(
+                        (gid, block)
+                        for gid, block, boundary in block_state.boundary_state_offloads.get(
+                            req.request_id, ()
+                        )
+                        if boundary == capture_at
+                    )
+                if last_computed >= capture_at:
+                    cold_event = (
+                        scheduler.kv_cache_manager.get_block_ids(req.request_id),
+                        cold_state_blocks,
+                    )
             # Fire load-complete callback once external load has finished (not
             # still WAITING_FOR_REMOTE_KVS) and before subsequent prefill steps
             # can move running Mamba/state slots.
@@ -388,6 +550,11 @@ def _run_request_to_prefill_end(
         load_event = broadcast(load_event)
         if load_event is not None and on_load_step_complete is not None:
             on_load_step_complete(*load_event)
+        if capture_at is not None and not cold_captured:
+            cold_event = broadcast(cold_event)
+            if cold_event is not None:
+                capture_boundary(*cold_event)
+                cold_captured = True
         done = broadcast(done)
         if done:
             break
@@ -451,20 +618,69 @@ def _register_connector_staging_buffers(buffers, worker) -> None:
         buffers.register_dynamic_provider(_ple_stage_ranges)
 
 
+def _check_partial_miss(
+    args,
+    backing,
+    scheduler,
+    engine,
+    hash_size,
+    prompt,
+    hit_alignment,
+    connector_block,
+):
+    """Remove the commit marker of exactly one key from an otherwise warm prefix."""
+    shards = args.dcp
+    missing_idx = (hit_alignment // connector_block + 1) * shards - 1
+    candidates = []
+    for namespace, keys in backing.prefix_lookups:
+        if args.partial_miss == "pp-stage" and not namespace.name.startswith("pp_1_"):
+            continue
+        if len(keys) > missing_idx and all(
+            backing.is_v1_committed(namespace, key) for key in keys[: missing_idx + 1]
+        ):
+            candidates.append((namespace, keys[missing_idx]))
+    if not candidates:
+        raise AssertionError(
+            f"No committed {args.partial_miss} key at index {missing_idx}"
+        )
+    namespace, missing_key = candidates[0]
+    if not namespace.resolve().is_relative_to(backing.root.resolve()):
+        raise AssertionError(
+            f"Partial-miss key is outside the scratch Store: {namespace}"
+        )
+    marker = namespace / f"{missing_key.hex()}.committed"
+    hidden = marker.with_suffix(".hidden")
+    backing.prefix_lookups = None
+    marker.rename(hidden)
+    try:
+        req = _make_request(f"partial-{uuid4().hex[:8]}", prompt, hash_size, engine)
+        matched, _ = scheduler.connector.get_num_new_matched_tokens(req, 0)
+        if matched != hit_alignment:
+            raise AssertionError(
+                f"Partial {args.partial_miss} miss: expected {hit_alignment} tokens, "
+                f"got {matched} with {missing_key.hex()} missing in {namespace.name}"
+            )
+    finally:
+        hidden.rename(marker)
+
+
 def run(args, cleanup, scratch_dir: str, kv_device):
     import torch.distributed as dist
     from mock_store import SharedFileByteStore, install_mock_store
     from native_cache import allocate, make_engine
     from parallel import barrier, broadcast, collect_handshakes, inspect_local_coords
     from verifier import (
+        NativePrefill,
         audit_writes,
         fill_native_kv,
         poison_native_kv,
         register_kv_buffers,
         snapshot_cold_blocks,
         verify_cold_vs_hot,
+        verify_unallocated_kv_is_poisoned,
     )
 
+    native_v1 = args.connector == "v1"
     shared_root = Path(scratch_dir) / "shared_store"
     shared_audit = Path(scratch_dir) / "audit"
     store_root = Path(shared_root)
@@ -491,12 +707,14 @@ def run(args, cleanup, scratch_dir: str, kv_device):
         hash_size,
         views,
         preplanned_schedule,
+        head_partitions,
     ) = allocate(
         engine,
         args.kv_mib,
         scratch_dir,
         cleanup,
         kv_device=kv_device,
+        connector_version=args.connector,
         auto_dcp_interleave=(args.cp_kv_cache_interleave_size == "auto"),
         schedule_resolver=schedule_resolver,
         chunk_size=args.chunk_size,
@@ -512,7 +730,12 @@ def run(args, cleanup, scratch_dir: str, kv_device):
     coords = inspect_local_coords(args)
     is_root = coords.world_rank == 0
     buffers = register_kv_buffers(views)
-    backing = SharedFileByteStore(store_root, audit_dir, coords.world_rank)
+    backing = SharedFileByteStore(
+        store_root,
+        audit_dir,
+        coords.world_rank,
+        dump_delay_polls=args.dump_delay_polls,
+    )
 
     from vllm.distributed.kv_transfer.kv_connector.factory import KVConnectorFactory
     from vllm.distributed.kv_transfer.kv_connector.utils import KVOutputAggregator
@@ -537,7 +760,7 @@ def run(args, cleanup, scratch_dir: str, kv_device):
         worker.register_kv_caches(views)
         _register_connector_staging_buffers(buffers, worker)
 
-        handshakes = collect_handshakes(worker, coords, args)
+        handshakes = collect_handshakes(worker, coords, args, engine)
         if is_root:
             scheduler = engine.scheduler_config.get_scheduler_cls()(
                 vllm_config=engine,
@@ -549,6 +772,21 @@ def run(args, cleanup, scratch_dir: str, kv_device):
             cleanup.callback(scheduler.shutdown)
             if handshakes:
                 scheduler.connector.set_xfer_handshake_metadata_pp_aware(handshakes)
+            if native_v1 and not args.expect_reject and args.multi_connector != "none":
+                from mock_pd_connector import MockPDHandshakeConnector
+
+                pd_child = next(
+                    child
+                    for child in scheduler.connector.sub_connectors
+                    if isinstance(child, MockPDHandshakeConnector)
+                )
+                metadata = pd_child.received_handshake_metadata or {}
+                if metadata.keys() != handshakes.keys() or {
+                    item.world_rank for item in metadata.values()
+                } != set(range(dist.get_world_size())):
+                    raise AssertionError(
+                        "Scheduler P/D sibling missed worker handshakes"
+                    )
             aggregator = KVOutputAggregator.from_connector(
                 scheduler.connector, dist.get_world_size()
             )
@@ -559,6 +797,24 @@ def run(args, cleanup, scratch_dir: str, kv_device):
                 f"Expected startup rejection matching {args.expect_reject!r}, "
                 "but connector initialization succeeded"
             )
+
+        dcp_dump_ranks = None
+        dcp_rank_by_worker = None
+        if native_v1 and args.dcp > 1 and args.multi_connector == "none":
+            from parallel import gather
+            from ucm.integration.vllm.ucm_connector import UCMCPConnector
+
+            # Only the MLA CP connector uses these unmodified scheduler keys
+            # for Store writes. FAWA and HLA have their own plan formats.
+            check_dcp_ranks = False
+            if is_root:
+                ucm_scheduler = _find_ucm_connector(scheduler.connector).connector
+                check_dcp_ranks = (
+                    isinstance(ucm_scheduler, UCMCPConnector) and ucm_scheduler.is_mla
+                )
+            if broadcast(check_dcp_ranks):
+                dcp_dump_ranks = {} if is_root else None
+                dcp_rank_by_worker = gather(coords.dcp_rank)
 
         from math import lcm
 
@@ -623,7 +879,27 @@ def run(args, cleanup, scratch_dir: str, kv_device):
             )
 
         # ---- Phase 1: Cold prefill + Dump ----------------------------------
-        fill_native_kv(views, worker_config, coords)
+        prefill = None
+        cold_reference = {}
+        if native_v1:
+            poison_native_kv(views)
+            prefill = NativePrefill(
+                views, worker_config, coords, engine, head_partitions
+            )
+        else:
+            fill_native_kv(views, worker_config, coords)
+
+        def capture_cold_boundary(tables, state_blocks=None):
+            cold_reference["tables"] = tables
+            cold_reference["state_blocks"] = state_blocks
+            cold_reference["snapshots"] = snapshot_cold_blocks(
+                worker_config,
+                views,
+                tables,
+                device_type=engine.device_config.device_type,
+                state_blocks=state_blocks,
+            )
+
         vocab_size = max(1024, int(engine.model_config.get_vocab_size()))
         prompt_a = [(idx * 17 + 3) % vocab_size for idx in range(effective_tokens)]
 
@@ -632,17 +908,20 @@ def run(args, cleanup, scratch_dir: str, kv_device):
             if is_root
             else None
         )
-        tables_a, local_a, ext_a, _, steps_a, step_ends_a = (
-            _run_request_to_prefill_end(
-                engine,
-                scheduler,
-                aggregator,
-                worker,
-                views,
-                req_a,
-                is_root=is_root,
-                target_tokens=effective_tokens,
-            )
+        tables_a, local_a, ext_a, _, steps_a, step_ends_a = _run_request_to_prefill_end(
+            engine,
+            scheduler,
+            aggregator,
+            worker,
+            views,
+            req_a,
+            is_root=is_root,
+            target_tokens=effective_tokens,
+            native_v1=native_v1,
+            prefill=prefill,
+            dcp_dump_ranks=dcp_dump_ranks,
+            capture_at=expected_hit if native_v1 else None,
+            capture_boundary=capture_cold_boundary,
         )
         if local_a != 0 or ext_a != 0:
             raise AssertionError(
@@ -662,25 +941,77 @@ def run(args, cleanup, scratch_dir: str, kv_device):
                 f"Expected multi-step chunked prefill for tokens={effective_tokens}, "
                 f"budget={effective_batch}, got steps_cold={steps_a}"
             )
-        # Snapshot ONLY the blocks allocated to prompt_a right after cold prefill.
-        cold_snapshots = snapshot_cold_blocks(
-            worker_config,
-            views,
-            tables_a,
-            device_type=engine.device_config.device_type,
-        )
+        if not native_v1:
+            capture_cold_boundary(tables_a)
+        if not cold_reference:
+            raise AssertionError(
+                f"Cold prefill never reached checkpoint {expected_hit}"
+            )
         if is_root:
             scheduler.finish_requests(req_a.request_id, RequestStatus.FINISHED_ABORTED)
+        if args.dump_delay_polls:
+            from parallel import gather
+
+            if not any(gather(backing.pending_dumps)):
+                raise AssertionError(
+                    "No cold Dump was still pending before the overlap step"
+                )
+            probe = None
+            if is_root:
+                probe_prompt = list(prompt_a)
+                probe_prompt[0] = (probe_prompt[0] + 2) % vocab_size
+                probe = _make_request(
+                    f"overlap-{uuid4().hex[:8]}",
+                    probe_prompt,
+                    hash_size,
+                    engine,
+                )
+                scheduler.add_request(probe)
+            output, _ = _step_all_ranks(
+                engine,
+                scheduler,
+                aggregator,
+                worker,
+                views,
+                is_root=is_root,
+                native_v1=True,
+                prefill=prefill,
+                dcp_dump_ranks=dcp_dump_ranks,
+            )
+            if is_root:
+                if not output.num_scheduled_tokens.get(probe.request_id):
+                    raise AssertionError(
+                        "The overlap request received no prefill tokens"
+                    )
+                scheduler.finish_requests(
+                    probe.request_id, RequestStatus.FINISHED_ABORTED
+                )
         _drain_scheduler(
-            engine, scheduler, aggregator, worker, views, is_root=is_root
+            engine,
+            scheduler,
+            aggregator,
+            worker,
+            views,
+            is_root=is_root,
+            native_v1=native_v1,
         )
+        if backing.io_errors:
+            raise backing.io_errors[0]
+        if backing.pending_dumps:
+            raise AssertionError(
+                f"Rank {coords.world_rank} still has pending cold Dumps"
+            )
         barrier()
 
         # Verify write audit on rank 0 before checking reads.
         audit_summary = None
         if is_root:
             audit_summary = audit_writes(
-                audit_dir, allow_duplicate_writes=args.allow_duplicate_writes
+                audit_dir,
+                allow_duplicate_writes=args.allow_duplicate_writes,
+                dcp_dump_ranks=dcp_dump_ranks,
+                dcp_rank_by_worker=dcp_rank_by_worker,
+                pp_size=args.pp,
             )
             print(f"[rank 0] Cold Dump audit passed: {audit_summary}", flush=True)
 
@@ -706,6 +1037,8 @@ def run(args, cleanup, scratch_dir: str, kv_device):
             req_neg,
             is_root=is_root,
             target_tokens=effective_tokens,
+            native_v1=native_v1,
+            prefill=prefill,
         )
         if ext_neg != 0 or local_neg != 0:
             raise AssertionError(
@@ -714,8 +1047,16 @@ def run(args, cleanup, scratch_dir: str, kv_device):
         if is_root:
             scheduler.finish_requests(req_neg.request_id, RequestStatus.FINISHED_ABORTED)
         _drain_scheduler(
-            engine, scheduler, aggregator, worker, views, is_root=is_root
+            engine,
+            scheduler,
+            aggregator,
+            worker,
+            views,
+            is_root=is_root,
+            native_v1=native_v1,
         )
+        if backing.io_errors:
+            raise backing.io_errors[0]
         barrier()
 
         # ---- Phase 3: Poison KV + Hot reload + Engine-native byte check ----
@@ -748,8 +1089,8 @@ def run(args, cleanup, scratch_dir: str, kv_device):
                 )
             slices_count, bytes_count = verify_cold_vs_hot(
                 worker_config,
-                cold_snapshots,
-                tables_a,
+                cold_reference["snapshots"],
+                cold_reference["tables"],
                 views,
                 load_tables,
                 ext_hit_now,
@@ -759,9 +1100,18 @@ def run(args, cleanup, scratch_dir: str, kv_device):
                 world_rank=coords.world_rank,
                 poison_byte=0xA5,
                 compress_ratios=compress_ratios,
+                require_state_targets=native_v1,
+                cold_state_blocks=cold_reference["state_blocks"],
             )
             verify_result["slices"] = slices_count
             verify_result["bytes"] = bytes_count
+            if args.verify_load_guards:
+                verify_result["guards"] = verify_unallocated_kv_is_poisoned(
+                    worker_config,
+                    views,
+                    load_tables,
+                    device_type=engine.device_config.device_type,
+                )
             verify_result["checked"] = True
 
         req_hot = (
@@ -769,6 +1119,8 @@ def run(args, cleanup, scratch_dir: str, kv_device):
             if is_root
             else None
         )
+        if is_root and args.partial_miss:
+            backing.prefix_lookups = []
         _, local_hot, ext_hot, _, steps_hot, _ = _run_request_to_prefill_end(
             engine,
             scheduler,
@@ -778,6 +1130,7 @@ def run(args, cleanup, scratch_dir: str, kv_device):
             req_hot,
             is_root=is_root,
             target_tokens=effective_tokens,
+            native_v1=native_v1,
             on_load_step_complete=check_after_load,
         )
         if local_hot != 0:
@@ -799,9 +1152,38 @@ def run(args, cleanup, scratch_dir: str, kv_device):
         if is_root:
             scheduler.finish_requests(req_hot.request_id, RequestStatus.FINISHED_ABORTED)
         _drain_scheduler(
-            engine, scheduler, aggregator, worker, views, is_root=is_root
+            engine,
+            scheduler,
+            aggregator,
+            worker,
+            views,
+            is_root=is_root,
+            native_v1=native_v1,
         )
+        if backing.io_errors:
+            raise backing.io_errors[0]
         barrier()
+        if args.partial_miss:
+            if is_root:
+                if expected_hit <= hit_alignment:
+                    raise ValueError(
+                        "--partial-miss requires at least two warm aligned chunks"
+                    )
+                _check_partial_miss(
+                    args,
+                    backing,
+                    scheduler,
+                    engine,
+                    hash_size,
+                    prompt_hot,
+                    hit_alignment,
+                    connector_block,
+                )
+                print(
+                    f"[rank 0] Partial {args.partial_miss} hit: {hit_alignment}",
+                    flush=True,
+                )
+            barrier()
 
         return {
             "tokens": effective_tokens,
@@ -812,6 +1194,7 @@ def run(args, cleanup, scratch_dir: str, kv_device):
             "external_hit_tokens": ext_hot,
             "verified_bytes": verify_result["bytes"],
             "verified_slices": verify_result["slices"],
+            "guard_pages": verify_result.get("guards", 0),
             "audit": audit_summary,
         }
 
@@ -884,6 +1267,7 @@ def main(argv: list[str] | None = None) -> None:
         f"hit={summary['external_hit_tokens']}/{summary['tokens']} "
         f"(batch={summary['batch_tokens']}, align={summary['hit_alignment']}), "
         f"verified_slices={summary['verified_slices']}, "
+        f"guard_pages={summary['guard_pages']}, "
         f"verified_bytes={summary['verified_bytes']}, audit={summary['audit']}",
         flush=True,
     )

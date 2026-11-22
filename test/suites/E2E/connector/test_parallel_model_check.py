@@ -174,6 +174,11 @@ PARALLEL_CASES = [
     ("qwen-fn-tp4", "qwen3.8-flash-next", 4, 1, 1, 1, ["--block-size", "1536"]),
 ]
 
+V1_PARTIAL_MISS_CASES = {
+    "glm53-pp2-tp2": "pp-stage",
+    "glm53-dcp2-tp2": "dcp-shard",
+}
+
 # Startup-rejection cases verifying unsupported v1 parallel configs fail fast
 # inside UCM connectors instead of silently corrupting external KV cache.
 # Only includes topologies that the engine itself permits (engine-banned combos
@@ -283,6 +288,10 @@ def test_parallel_roundtrip_matrix(
         os.environ.get("UCM_MODEL_CHECK_AUTO_ALIGN_CHUNKS", "4"),
         *extra_args,
     ]
+    if connector == "v1" and case_id in V1_PARTIAL_MISS_CASES:
+        cmd.extend(
+            ["--partial-miss", V1_PARTIAL_MISS_CASES[case_id], "--verify-load-guards"]
+        )
     subprocess.run(cmd, check=True, env=offline_env())
 
 
