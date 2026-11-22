@@ -215,6 +215,31 @@ class NativePrefill:
                     ),
                 )
 
+    def pending_source_blocks(self, sources, tables):
+        """Resolve delayed Store pointers against this request's native pages."""
+        from bisect import bisect_left
+
+        addresses = sorted(set().union(*sources))
+        blocks, matched = set(), set()
+        if not addresses:
+            return blocks
+        for gid, _, _, parts in self.layers.values():
+            for block in set(tables[gid]) - {0}:
+                for part, _ in parts:
+                    page = _slice_block_tensor(part, self.num_blocks, block)
+                    start, end = _page_byte_range(page)
+                    local = addresses[
+                        bisect_left(addresses, start) : bisect_left(addresses, end)
+                    ]
+                    if local:
+                        blocks.add(block)
+                        matched.update(local)
+        if len(matched) != len(addresses):
+            raise AssertionError(
+                "Could not resolve all pending Dump sources to native request blocks"
+            )
+        return blocks
+
     def write_layer(self, name, requests):
         if name not in self.layers:
             return
@@ -229,16 +254,20 @@ class NativePrefill:
                     raise AssertionError(
                         f"Missing cold running State for g{gid} at {end}"
                     )
-                state_blocks = {table[running]: end}
+                state_blocks = {table[running]: (end, "running")}
                 state_blocks.update(
-                    (block, boundary)
+                    (block, (boundary, "checkpoint"))
                     for group_id, block, boundary in boundaries
                     if group_id == gid
                 )
-                for block, boundary in state_blocks.items():
+                # Give distinct running/checkpoint pages independent canaries
+                # even if they encode the same logical token boundary.
+                for block, (boundary, slot) in state_blocks.items():
                     for index, (part, key) in enumerate(parts):
                         page = _slice_block_tensor(part, self.num_blocks, block)
-                        page.copy_(_pattern(page, (request_id, key, index, boundary)))
+                        page.copy_(
+                            _pattern(page, (request_id, key, index, boundary, slot))
+                        )
                 continue
 
             group_dcp = _group_dcp_size(spec, self.coords.dcp_size)
@@ -566,6 +595,14 @@ def _tensor_raw_bytes(tensor) -> bytes:
     return flat.view(torch.uint8).numpy().tobytes()
 
 
+def _page_byte_range(page):
+    start = int(page.data_ptr())
+    elements = 1 + sum(
+        (size - 1) * stride for size, stride in zip(page.shape, page.stride())
+    )
+    return start, start + elements * page.element_size()
+
+
 def verify_unallocated_kv_is_poisoned(
     worker_config,
     views,
@@ -601,12 +638,7 @@ def verify_unallocated_kv_is_poisoned(
                     raise AssertionError(f"Invalid native KV block axis for {name}")
                 for block in range(num_blocks):
                     page = part.narrow(0, block * rows, rows)
-                    start = int(page.data_ptr())
-                    elements = 1 + sum(
-                        (size - 1) * stride
-                        for size, stride in zip(page.shape, page.stride())
-                    )
-                    end = start + elements * page.element_size()
+                    start, end = _page_byte_range(page)
                     if block in allocated:
                         writable[storage].append((start, end))
                     else:
@@ -698,11 +730,22 @@ def verify_cold_vs_hot(
             # state snapshot saved at the hit_tokens boundary of the cold run.
             checkpoint_idx = max(0, (hit_tokens - 1) // logical_span)
             running_idx = max(0, (hot_load_step_end - 1) // logical_span)
-            cold_ckpt_blk = (
-                cold_table[checkpoint_idx] if checkpoint_idx < len(cold_table) else 0
-            )
-            if cold_state_blocks is not None:
-                cold_ckpt_blk = cold_state_blocks.get(gid, cold_ckpt_blk)
+            cold_ckpt_blk = (cold_state_blocks or {}).get(gid)
+            if cold_ckpt_blk is None:
+                if require_state_targets and any(
+                    getattr(member, "mamba_cache_mode", None) == "align"
+                    for member in member_specs
+                ):
+                    raise AssertionError(
+                        f"[rank {world_rank}] No native State hand-off for g{gid} "
+                        f"at {hit_tokens} tokens"
+                    )
+                if checkpoint_idx >= len(cold_table):
+                    raise AssertionError(
+                        f"[rank {world_rank}] Cold State g{gid} has no table entry "
+                        f"at index {checkpoint_idx}"
+                    )
+                cold_ckpt_blk = cold_table[checkpoint_idx]
             if require_state_targets and cold_ckpt_blk <= 0:
                 raise AssertionError(
                     f"[rank {world_rank}] Missing cold State checkpoint "

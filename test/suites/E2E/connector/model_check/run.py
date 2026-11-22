@@ -314,10 +314,10 @@ def _forward_layers(views, native_v1):
     # Both receive their new data before any save hook for that layer runs.
     layers = {}
     for name in views:
-        match = re.search(r"(?:^|\.)layers\.\d+(?=\.|$)", name)
-        key = name[: match.end()] if match else name
+        match = re.search(r"(?:^|\.)layers\.(\d+)(?=\.|$)", name)
+        key = (int(match[1]), name[: match.end()]) if match else (-1, name)
         layers.setdefault(key, []).append(name)
-    return layers.values()
+    return [layers[key] for key in sorted(layers, key=lambda group: group[0])]
 
 
 def _step_all_ranks(
@@ -331,6 +331,7 @@ def _step_all_ranks(
     native_v1: bool,
     prefill=None,
     dcp_dump_ranks=None,
+    protected_blocks=(),
 ):
     """Execute one synchronized Scheduler -> Workers -> KVOutputAggregator step."""
     from parallel import broadcast, gather
@@ -338,8 +339,30 @@ def _step_all_ranks(
 
     output = None
     step_payload = None
+    boundaries = {}
     if is_root:
-        output = scheduler.schedule()
+        # EngineCore's Scheduler clears connector-only block state before it
+        # returns. Capture the native hand-off at the producer SPI boundary.
+        if prefill is not None:
+            from unittest.mock import patch
+
+            build_meta = scheduler.connector.build_connector_meta
+
+            def capture_state(output):
+                state = getattr(output, "kv_connector_block_state", None)
+                if state is not None:
+                    boundaries.update(
+                        (req_id, tuple(entries))
+                        for req_id, entries in state.boundary_state_offloads.items()
+                    )
+                return build_meta(output)
+
+            with patch.object(
+                scheduler.connector, "build_connector_meta", capture_state
+            ):
+                output = scheduler.schedule()
+        else:
+            output = scheduler.schedule()
         if dcp_dump_ranks is not None and output.kv_connector_metadata is not None:
             # MLA CP exposes scheduler keys unchanged to the Store. Their
             # semantic DCP order is fixed by the v1 metadata contract.
@@ -357,11 +380,16 @@ def _step_all_ranks(
                         )
         prefill_requests = []
         if prefill is not None:
-            block_state = getattr(output, "kv_connector_block_state", None)
-            boundaries = block_state.boundary_state_offloads if block_state else {}
             for request_id, count in output.num_scheduled_tokens.items():
                 end = scheduler.requests[request_id].num_computed_tokens
                 tables = scheduler.kv_cache_manager.get_block_ids(request_id)
+                reused = set(protected_blocks).intersection(
+                    block_id for table in tables for block_id in table
+                )
+                if reused:
+                    raise AssertionError(
+                        f"Allocated pending Dump source blocks: {sorted(reused)}"
+                    )
                 prefill_requests.append(
                     (
                         request_id,
@@ -404,7 +432,7 @@ def _step_all_ranks(
             runner_outputs.append(runner_out)
         aggregated = aggregator.aggregate(runner_outputs, output_rank=0)
         scheduler.update_from_output(output, aggregated)
-        return output, aggregated
+        return output, boundaries
     return None, None
 
 
@@ -491,7 +519,7 @@ def _run_request_to_prefill_end(
     step_ends: list[int] = []
 
     for _ in range(max(64, target_tokens // 16 + 16)):
-        output, _ = _step_all_ranks(
+        output, boundaries = _step_all_ranks(
             engine,
             scheduler,
             aggregator,
@@ -517,15 +545,11 @@ def _run_request_to_prefill_end(
             ):
                 step_ends.append(last_computed)
             if capture_at is not None and not cold_captured:
-                block_state = getattr(output, "kv_connector_block_state", None)
-                if block_state is not None:
-                    cold_state_blocks.update(
-                        (gid, block)
-                        for gid, block, boundary in block_state.boundary_state_offloads.get(
-                            req.request_id, ()
-                        )
-                        if boundary == capture_at
-                    )
+                cold_state_blocks.update(
+                    (gid, block)
+                    for gid, block, boundary in boundaries.get(req.request_id, ())
+                    if boundary == capture_at
+                )
                 if last_computed >= capture_at:
                     cold_event = (
                         scheduler.kv_cache_manager.get_block_ids(req.request_id),
@@ -947,17 +971,33 @@ def run(args, cleanup, scratch_dir: str, kv_device):
             raise AssertionError(
                 f"Cold prefill never reached checkpoint {expected_hit}"
             )
-        if is_root:
-            scheduler.finish_requests(req_a.request_id, RequestStatus.FINISHED_ABORTED)
+        protected_blocks = set()
         if args.dump_delay_polls:
             from parallel import gather
 
-            if not any(gather(backing.pending_dumps)):
+            local_sources = prefill.pending_source_blocks(
+                backing.pending_dump_sources.values(), tables_a
+            )
+            protected_blocks = set().union(*gather(local_sources))
+            if not protected_blocks:
                 raise AssertionError(
                     "No cold Dump was still pending before the overlap step"
                 )
+        if is_root:
+            scheduler.finish_requests(req_a.request_id, RequestStatus.FINISHED_ABORTED)
+        if args.dump_delay_polls:
             probe = None
             if is_root:
+                block_pool = scheduler.kv_cache_manager.block_pool
+                released = {
+                    block_id
+                    for block_id in protected_blocks
+                    if block_pool.blocks[block_id].ref_cnt <= 0
+                }
+                if released:
+                    raise AssertionError(
+                        f"Freed pending Dump source blocks: {sorted(released)}"
+                    )
                 probe_prompt = list(prompt_a)
                 probe_prompt[0] = (probe_prompt[0] + 2) % vocab_size
                 probe = _make_request(
@@ -977,6 +1017,7 @@ def run(args, cleanup, scratch_dir: str, kv_device):
                 native_v1=True,
                 prefill=prefill,
                 dcp_dump_ranks=dcp_dump_ranks,
+                protected_blocks=protected_blocks,
             )
             if is_root:
                 if not output.num_scheduled_tokens.get(probe.request_id):

@@ -21,8 +21,10 @@ connectors without circularly depending on UCM's internal layout logic.
    - **Cold Write**: v1 starts the KV pool poisoned, writes replica-consistent
      bytes to the current Scheduler step's native block-table locations, and
      snapshots the prefix before later steps can reclaim its blocks. Retained
-     State checkpoints carry boundary-specific bytes. The harness still drives
-     the layer callbacks around a simulated forward.
+     State checkpoints use the Scheduler's native boundary hand-offs, with
+     distinct bytes for running and checkpoint pages when the slots differ.
+     The harness drives layer callbacks in model layer order around a simulated
+     forward.
    - **Negative Isolation**: mutates token 0 and verifies zero false external hits.
    - **Poison + Hot Reload**: resets local HBM prefix cache, poisons all KV buffers
      with `0xA5`, reloads a shared-prefix request from the mock store, and checks
@@ -81,4 +83,6 @@ python -m pytest -c test/pytest.ini --confcutdir=test/suites/E2E/connector -o ad
 For an asynchronous v1 Dump path, add `--dump-delay-polls 64` to a GLM-5.3
 `run.py` command. The harness requires a pending Dump when it schedules a
 second prefill request and checks that the source bytes remain intact until the
-Store consumes them.
+Store consumes them. It also resolves the pending source addresses back to
+native block IDs and checks that aborting the first request leaves those blocks
+referenced and that the second request allocates none of them.

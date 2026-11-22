@@ -350,6 +350,8 @@ def native_kv_head_partitions(engine, model, specs) -> dict[str, int]:
         return {}
     partitions = {}
     for layer_name, spec in specs.items():
+        if not spec.prefix_cacheable:
+            continue
         if not isinstance(spec, AttentionSpec) or isinstance(
             spec, (MLAAttentionSpec, SlidingWindowMLASpec)
         ):

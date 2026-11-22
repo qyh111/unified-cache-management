@@ -89,11 +89,15 @@ class SharedFileByteStore:
         self.world_rank = int(world_rank)
         self.dump_delay_polls = dump_delay_polls
         self.io_errors: list[AssertionError] = []
-        self.pending_dumps = 0
+        self.pending_dump_sources: dict[int, set[int]] = {}
         self.audit_file = self.audit_dir / f"rank_{self.world_rank}.jsonl"
         self.prefix_lookups: list[tuple[Path, tuple[bytes, ...]]] | None = None
         self.root.mkdir(parents=True, exist_ok=True)
         self.audit_dir.mkdir(parents=True, exist_ok=True)
+
+    @property
+    def pending_dumps(self) -> int:
+        return len(self.pending_dump_sources)
 
     def _namespace_label(self, namespace_dir: Path) -> str:
         try:
@@ -363,6 +367,7 @@ class MockStoreV1:
 
         if self._backing.dump_delay_polls and keys:
             original = [hashlib.sha256(payload).digest() for payload in read_rows()]
+            task_id = id(rows)
 
             def complete_dump():
                 try:
@@ -378,9 +383,14 @@ class MockStoreV1:
                     self._backing.io_errors.append(AssertionError(str(exc)))
                     raise
                 finally:
-                    self._backing.pending_dumps -= 1
+                    del self._backing.pending_dump_sources[task_id]
 
-            self._backing.pending_dumps += 1
+            self._backing.pending_dump_sources[task_id] = {
+                ptr
+                for row in rows
+                for ptr, size in zip(row, self._tensor_sizes, strict=True)
+                if ptr and size
+            }
             return _StoreTask(
                 pending_dump=complete_dump,
                 remaining_polls=self._backing.dump_delay_polls,

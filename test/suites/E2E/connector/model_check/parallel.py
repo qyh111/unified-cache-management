@@ -154,28 +154,11 @@ def inspect_local_coords(args) -> RankCoords:
 def collect_handshakes(worker, coords: RankCoords, args, engine) -> dict:
     """Collect v1 handshakes with the platform Worker's rank-key format."""
     if args.connector == "v1":
-        from types import SimpleNamespace
-        from unittest.mock import patch
-
-        from vllm.distributed.kv_transfer import kv_transfer_state
-
-        if engine.device_config.device_type == "npu":
-            from vllm_ascend.worker import worker as worker_module
-
-            worker_cls = worker_module.NPUWorker
-        else:
-            from vllm.v1.worker import gpu_worker as worker_module
-
-            worker_cls = worker_module.Worker
-        # The harness owns the real connector instance without constructing a
-        # device worker. Use the worker's serialization with that instance.
-        with patch.object(kv_transfer_state, "_KV_CONNECTOR_AGENT", worker):
-            report = worker_cls.get_kv_connector_handshake_metadata(
-                SimpleNamespace(vllm_config=engine)
-            )
+        is_ascend = engine.device_config.device_type == "npu"
+        reports = gather((coords, worker.get_handshake_metadata()))
         handshakes = {}
-        for reporting_rank, worker_report in enumerate(gather(report)):
-            if not worker_report:
+        for reporting_rank, (rank, metadata) in enumerate(reports):
+            if metadata is None:
                 # A startup-rejection case needs to report an accepted
                 # configuration even when the connector publishes no handshake.
                 if not args.expect_reject and (
@@ -185,14 +168,22 @@ def collect_handshakes(worker, coords: RankCoords, args, engine) -> dict:
                         f"Missing handshake from rank {reporting_rank}"
                     )
                 continue
-            for key, metadata in worker_report.items():
-                if getattr(metadata, "world_rank", reporting_rank) != reporting_rank:
-                    raise AssertionError(
-                        f"Worker rank {reporting_rank} reported another rank's handshake"
-                    )
-                if key in handshakes and handshakes[key] != metadata:
-                    raise AssertionError(f"Different worker handshakes share key {key}")
-                handshakes[key] = metadata
+            if getattr(metadata, "world_rank", reporting_rank) != reporting_rank:
+                raise AssertionError(
+                    f"Worker rank {reporting_rank} reported another rank's handshake"
+                )
+            # Match NPUWorker and GPU Worker serialization without importing
+            # accelerator drivers in a CPU-only run (notably acl.rt).
+            if is_ascend and rank.pcp_size > 1:
+                key = (rank.pp_rank, rank.pcp_rank, rank.tp_rank)
+            else:
+                tp_rank = rank.tp_rank
+                if not is_ascend and rank.pcp_size > 1 and rank.dcp_size > 1:
+                    tp_rank += rank.pcp_rank * rank.tp_size
+                key = (rank.pp_rank, tp_rank)
+            if key in handshakes and handshakes[key] != metadata:
+                raise AssertionError(f"Different worker handshakes share key {key}")
+            handshakes[key] = metadata
         return handshakes
 
     local_handshake = worker.get_handshake_metadata()
