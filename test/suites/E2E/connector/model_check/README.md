@@ -68,8 +68,11 @@ python test/suites/E2E/connector/model_check/run.py \
   --block-size 128 --cp-kv-cache-interleave-size 128 \
   --tokens 4096 --max-num-batched-tokens 2048
 
-# Run pytest parallel matrix (default: Connector v1, 22 roundtrip + 2 v1 reject,
-# including MultiConnector [MockPDHandshakeConnector, UCMConnector] PP=1/PP=2)
+# Run pytest parallel matrix (default: Connector v1, 28 roundtrip + 2 v1 reject,
+# covering layerwise, whole-block request-async with --load-delay-polls,
+# and MultiConnector [MockPDHandshakeConnector, UCMConnector] PP=1/PP=2).
+# Set ENABLE_UCM_PATCH=1 to also activate UCM runtime monkey-patches (e.g. the
+# MultiConnector PP handshake routing patch) when running directly from source.
 # Each roundtrip case uses --auto-align-chunks 4 so padded Mamba/KDA/FAWA block
 # sizes automatically size prompt length and per-step batch budget to 4 aligned
 # chunks (guaranteeing a real State checkpoint at 75%).
@@ -86,3 +89,15 @@ second prefill request and checks that the source bytes remain intact until the
 Store consumes them. It also resolves the pending source addresses back to
 native block IDs and checks that aborting the first request leaves those blocks
 referenced and that the second request allocates none of them.
+
+For request-async v1 Load verification, pass `--no-use-layerwise` (or run a
+FAWA model, which always loads asynchronously) with `--load-delay-polls 4`. The
+harness asserts the hot request stays in `WAITING_FOR_REMOTE_KVS` across steps,
+verifies its destination blocks stay referenced and untouched while an
+overlapping prefill request executes, and simulates MRV2's align-mode Mamba
+state pre-copy (`checkpoint -> running`) on the promotion step before running
+the byte-for-byte oracle.
+
+To enable UCM runtime monkey-patches on demand when running from a source
+checkout without `ucm_patch.pth`, pass `--enable-ucm-patch` to `run.py` or set
+`ENABLE_UCM_PATCH=1` in the environment.

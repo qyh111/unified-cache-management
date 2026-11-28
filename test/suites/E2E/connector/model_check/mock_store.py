@@ -83,13 +83,16 @@ class SharedFileByteStore:
         world_rank: int,
         *,
         dump_delay_polls: int = 0,
+        load_delay_polls: int = 0,
     ) -> None:
         self.root = Path(root)
         self.audit_dir = Path(audit_dir)
         self.world_rank = int(world_rank)
         self.dump_delay_polls = dump_delay_polls
+        self.load_delay_polls = load_delay_polls
         self.io_errors: list[AssertionError] = []
         self.pending_dump_sources: dict[int, set[int]] = {}
+        self.pending_load_targets: dict[int, set[int]] = {}
         self.audit_file = self.audit_dir / f"rank_{self.world_rank}.jsonl"
         self.prefix_lookups: list[tuple[Path, tuple[bytes, ...]]] | None = None
         self.root.mkdir(parents=True, exist_ok=True)
@@ -98,6 +101,10 @@ class SharedFileByteStore:
     @property
     def pending_dumps(self) -> int:
         return len(self.pending_dump_sources)
+
+    @property
+    def pending_loads(self) -> int:
+        return len(self.pending_load_targets)
 
     def _namespace_label(self, namespace_dir: Path) -> str:
         try:
@@ -214,18 +221,22 @@ class SharedFileByteStore:
 class _StoreTask:
     success: bool = True
     error: Exception | None = None
-    pending_dump: Callable[[], None] | None = None
+    pending_action: Callable[[], None] | None = None
     remaining_polls: int = 0
     lock: Any = field(default_factory=Lock, repr=False)
 
-    def complete(self) -> None:
-        if self.pending_dump is not None:
+    def finish_action(self) -> None:
+        if self.pending_action is not None:
             try:
-                self.pending_dump()
+                self.pending_action()
             except Exception as exc:
+                self.success = False
                 self.error = exc
             finally:
-                self.pending_dump = None
+                self.pending_action = None
+
+    def complete(self) -> None:
+        self.finish_action()
         if self.error is not None:
             raise self.error
 
@@ -392,7 +403,7 @@ class MockStoreV1:
                 if ptr and size
             }
             return _StoreTask(
-                pending_dump=complete_dump,
+                pending_action=complete_dump,
                 remaining_polls=self._backing.dump_delay_polls,
             )
         persist(read_rows())
@@ -413,29 +424,74 @@ class MockStoreV1:
         except (AssertionError, ValueError) as exc:
             self._backing.io_errors.append(AssertionError(str(exc)))
             raise
+        keys = tuple(block_ids)
+        shards = tuple(shard_index)
         expected_len = sum(self._tensor_sizes)
-        for key, shard_id, ptr_row in zip(block_ids, shard_index, rows, strict=True):
-            payload = self._backing.read_v1_shard(
-                self._namespace_dir, key, int(shard_id)
-            )
-            if payload is None:
-                return _StoreTask(
-                    success=False,
-                    error=StoreNotFoundError(
+
+        def apply_load() -> None:
+            for key, shard_id, ptr_row in zip(keys, shards, rows, strict=True):
+                payload = self._backing.read_v1_shard(
+                    self._namespace_dir, key, int(shard_id)
+                )
+                if payload is None:
+                    raise StoreNotFoundError(
                         f"Missing v1 shard {shard_id} for key {key.hex()} "
                         f"in {self._namespace_dir}"
-                    ),
-                )
-            if len(payload) != expected_len:
-                raise AssertionError(
-                    f"v1 shard byte length mismatch for {key.hex()} s{shard_id}: "
-                    f"stored={len(payload)}, expected={expected_len}"
-                )
-            cursor = 0
-            for ptr, size in zip(ptr_row, self._tensor_sizes):
-                if ptr != 0 and size > 0:
-                    ctypes.memmove(ptr, payload[cursor : cursor + size], size)
-                cursor += size
+                    )
+                if len(payload) != expected_len:
+                    raise AssertionError(
+                        f"v1 shard byte length mismatch for {key.hex()} s{shard_id}: "
+                        f"stored={len(payload)}, expected={expected_len}"
+                    )
+                cursor = 0
+                for ptr, size in zip(ptr_row, self._tensor_sizes):
+                    if ptr != 0 and size > 0:
+                        ctypes.memmove(ptr, payload[cursor : cursor + size], size)
+                    cursor += size
+
+        if self._backing.load_delay_polls and keys:
+
+            def read_targets():
+                for row in rows:
+                    yield b"".join(
+                        ctypes.string_at(ptr, size) if ptr else bytes(size)
+                        for ptr, size in zip(row, self._tensor_sizes, strict=True)
+                    )
+
+            original = [hashlib.sha256(buf).digest() for buf in read_targets()]
+            task_id = id(rows)
+
+            def complete_load() -> None:
+                try:
+                    current = [hashlib.sha256(buf).digest() for buf in read_targets()]
+                    if current != original:
+                        raise AssertionError(
+                            "v1 async Load destination changed before Store completion"
+                        )
+                    apply_load()
+                except StoreNotFoundError:
+                    raise
+                except Exception as exc:
+                    self._backing.io_errors.append(AssertionError(str(exc)))
+                    raise
+                finally:
+                    self._backing.pending_load_targets.pop(task_id, None)
+
+            self._backing.pending_load_targets[task_id] = {
+                ptr
+                for row in rows
+                for ptr, size in zip(row, self._tensor_sizes, strict=True)
+                if ptr and size
+            }
+            return _StoreTask(
+                pending_action=complete_load,
+                remaining_polls=self._backing.load_delay_polls,
+            )
+
+        try:
+            apply_load()
+        except StoreNotFoundError as exc:
+            return _StoreTask(success=False, error=exc)
         return _StoreTask()
 
     def wait(self, task: _StoreTask) -> None:
@@ -444,10 +500,12 @@ class MockStoreV1:
 
     def check(self, task: _StoreTask) -> bool:
         with task.lock:
-            if task.pending_dump is not None and task.remaining_polls:
+            if task.pending_action is not None and task.remaining_polls:
                 task.remaining_polls -= 1
                 return False
-            task.complete()
+            # Run the deferred IO when the poll finishes, and let wait() surface
+            # any Store error (matching RankConsistencyManager's check -> wait contract).
+            task.finish_action()
             return True
 
 

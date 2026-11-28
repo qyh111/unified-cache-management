@@ -209,6 +209,24 @@ def parse_args(argv: list[str] | None = None):
         help="hold v1 Dump tasks for N polls and schedule a second request before draining",
     )
     parser.add_argument(
+        "--load-delay-polls",
+        type=int,
+        default=0,
+        help=(
+            "hold v1 async Load tasks for N polls and run an overlapping prefill "
+            "request while the hot request waits in WAITING_FOR_REMOTE_KVS"
+        ),
+    )
+    parser.add_argument(
+        "--enable-ucm-patch",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "enable or disable UCM runtime monkey-patches (ENABLE_UCM_PATCH) "
+            "before importing vLLM; default follows the ENABLE_UCM_PATCH env var"
+        ),
+    )
+    parser.add_argument(
         "--verify-load-guards",
         action="store_true",
         help="verify unallocated native KV guard pages after the v1 hot load",
@@ -237,6 +255,8 @@ def parse_args(argv: list[str] | None = None):
             parser.error("--partial-miss dcp-shard requires DCP > 1 and PP = 1")
     if args.dump_delay_polls < 0 or args.dump_delay_polls and args.connector != "v1":
         parser.error("--dump-delay-polls requires a nonnegative v1 poll count")
+    if args.load_delay_polls < 0 or args.load_delay_polls and args.connector != "v1":
+        parser.error("--load-delay-polls requires a nonnegative v1 poll count")
     if args.verify_load_guards and args.connector != "v1":
         parser.error("--verify-load-guards requires v1")
     if args.platform == "cuda-sim" and not args.cuda_capability:
@@ -252,6 +272,7 @@ def parse_args(argv: list[str] | None = None):
 
 def _execute_worker_step(
     engine,
+    worker_config,
     worker,
     metadata,
     total_tokens: int,
@@ -261,15 +282,28 @@ def _execute_worker_step(
     native_v1: bool,
     sync_loads: bool,
     prefill=None,
-    prefill_requests=(),
+    scheduled_requests=(),
 ):
     """Drive connector callbacks around the simulated layer forward."""
+    from verifier import apply_mamba_align_precopy
     from vllm.forward_context import get_forward_context, set_forward_context
     from vllm.v1.outputs import KVConnectorOutput
 
+    if metadata is not None and native_v1:
+        worker.handle_preemptions(metadata)
+
+    # Mirror MRV2 execute_model: run Mamba align pre-copy before pre_forward /
+    # sync start_load_kv so async-loaded checkpoints migrate into running slots
+    # on the promotion step without masking missing sync loads.
+    if total_tokens and scheduled_requests:
+        apply_mamba_align_precopy(
+            worker_config,
+            views,
+            scheduled_requests,
+            device_type=engine.device_config.device_type,
+        )
+
     if metadata is not None:
-        if native_v1:
-            worker.handle_preemptions(metadata)
         worker.bind_connector_metadata(metadata)
         with set_forward_context(None, engine, num_tokens=total_tokens):
             if not native_v1 or sync_loads:
@@ -279,7 +313,7 @@ def _execute_worker_step(
                     for layer_name in layer_names:
                         worker.wait_for_layer_load(layer_name)
                         if prefill is not None:
-                            prefill.write_layer(layer_name, prefill_requests)
+                            prefill.write_layer(layer_name, scheduled_requests)
                     for layer_name in layer_names:
                         worker.save_kv_layer(layer_name, views[layer_name], None)
             if native_v1:
@@ -289,7 +323,7 @@ def _execute_worker_step(
             worker.wait_for_save()
     elif prefill is not None:
         for layer_name in views:
-            prefill.write_layer(layer_name, prefill_requests)
+            prefill.write_layer(layer_name, scheduled_requests)
 
     transfers = worker.get_transfer_results(set(finished_req_ids))
     worker_meta = worker.build_connector_worker_meta()
@@ -322,6 +356,7 @@ def _forward_layers(views, native_v1):
 
 def _step_all_ranks(
     engine,
+    worker_config,
     scheduler,
     aggregator,
     worker,
@@ -332,6 +367,7 @@ def _step_all_ranks(
     prefill=None,
     dcp_dump_ranks=None,
     protected_blocks=(),
+    protected_label: str = "pending Dump source",
 ):
     """Execute one synchronized Scheduler -> Workers -> KVOutputAggregator step."""
     from parallel import broadcast, gather
@@ -378,40 +414,41 @@ def _step_all_ranks(
                         raise AssertionError(
                             f"DCP dump key {key_hex} changed shard rank"
                         )
-        prefill_requests = []
-        if prefill is not None:
-            for request_id, count in output.num_scheduled_tokens.items():
-                end = scheduler.requests[request_id].num_computed_tokens
-                tables = scheduler.kv_cache_manager.get_block_ids(request_id)
+        scheduled_requests = []
+        for request_id, count in output.num_scheduled_tokens.items():
+            end = scheduler.requests[request_id].num_computed_tokens
+            tables = scheduler.kv_cache_manager.get_block_ids(request_id)
+            if protected_blocks:
                 reused = set(protected_blocks).intersection(
                     block_id for table in tables for block_id in table
                 )
                 if reused:
                     raise AssertionError(
-                        f"Allocated pending Dump source blocks: {sorted(reused)}"
+                        f"Allocated {protected_label} blocks: {sorted(reused)}"
                     )
-                prefill_requests.append(
-                    (
-                        request_id,
-                        end - count,
-                        end,
-                        tables,
-                        boundaries.get(request_id, ()),
-                    )
+            scheduled_requests.append(
+                (
+                    request_id,
+                    end - count,
+                    end,
+                    tables,
+                    boundaries.get(request_id, ()),
                 )
+            )
         step_payload = (
             output.kv_connector_metadata,
             int(output.total_num_scheduled_tokens),
             set(output.finished_req_ids or ()),
             bool(getattr(output, "has_sync_kv_loads", False)),
-            prefill_requests,
+            scheduled_requests,
         )
-    metadata, total_tokens, finished_req_ids, sync_loads, prefill_requests = broadcast(
-        step_payload
+    metadata, total_tokens, finished_req_ids, sync_loads, scheduled_requests = (
+        broadcast(step_payload)
     )
 
     local_kv_out = _execute_worker_step(
         engine,
+        worker_config,
         worker,
         metadata,
         total_tokens,
@@ -420,7 +457,7 @@ def _step_all_ranks(
         native_v1=native_v1,
         sync_loads=sync_loads,
         prefill=prefill,
-        prefill_requests=prefill_requests,
+        scheduled_requests=scheduled_requests,
     )
     all_kv_outs = gather(local_kv_out)
 
@@ -438,6 +475,7 @@ def _step_all_ranks(
 
 def _drain_scheduler(
     engine,
+    worker_config,
     scheduler,
     aggregator,
     worker,
@@ -445,16 +483,18 @@ def _drain_scheduler(
     *,
     is_root: bool,
     native_v1: bool,
+    max_steps: int = 32,
 ):
     """Advance empty steps until all pending async dumps/offloads finish."""
     from parallel import broadcast
 
-    for _ in range(32):
+    for _ in range(max_steps):
         has_work = broadcast(scheduler.has_requests() if is_root else False)
         if not has_work:
             return
         _step_all_ranks(
             engine,
+            worker_config,
             scheduler,
             aggregator,
             worker,
@@ -485,6 +525,7 @@ def _make_request(request_id: str, token_ids: list[int], hash_size: int, engine)
 
 def _run_request_to_prefill_end(
     engine,
+    worker_config,
     scheduler,
     aggregator,
     worker,
@@ -499,18 +540,23 @@ def _run_request_to_prefill_end(
     capture_at: int | None = None,
     capture_boundary=None,
     on_load_step_complete=None,
+    already_added: bool = False,
+    initial_local_hit: int = 0,
+    initial_external_hit: int = 0,
+    initial_steps: int = 0,
+    extra_step_budget: int = 0,
 ):
     """Run one request through chunked prefill and return final tables & hit stats."""
     from parallel import broadcast
     from vllm.v1.request import RequestStatus
 
-    if is_root:
+    if is_root and not already_added:
         scheduler.add_request(req)
 
-    local_hit = 0
-    external_hit = 0
-    first_step = True
-    steps = 0
+    local_hit = initial_local_hit
+    external_hit = initial_external_hit
+    first_step = not already_added
+    steps = initial_steps
     final_tables = None
     last_computed = 0
     load_checked = False
@@ -518,9 +564,10 @@ def _run_request_to_prefill_end(
     cold_state_blocks = {}
     step_ends: list[int] = []
 
-    for _ in range(max(64, target_tokens // 16 + 16)):
+    for _ in range(max(64, target_tokens // 16 + 16) + extra_step_budget):
         output, boundaries = _step_all_ranks(
             engine,
+            worker_config,
             scheduler,
             aggregator,
             worker,
@@ -759,7 +806,9 @@ def run(args, cleanup, scratch_dir: str, kv_device):
         audit_dir,
         coords.world_rank,
         dump_delay_polls=args.dump_delay_polls,
+        load_delay_polls=args.load_delay_polls,
     )
+    drain_steps = max(32, args.dump_delay_polls + args.load_delay_polls + 16)
 
     from vllm.distributed.kv_transfer.kv_connector.factory import KVConnectorFactory
     from vllm.distributed.kv_transfer.kv_connector.utils import KVOutputAggregator
@@ -934,6 +983,7 @@ def run(args, cleanup, scratch_dir: str, kv_device):
         )
         tables_a, local_a, ext_a, _, steps_a, step_ends_a = _run_request_to_prefill_end(
             engine,
+            worker_config,
             scheduler,
             aggregator,
             worker,
@@ -1009,6 +1059,7 @@ def run(args, cleanup, scratch_dir: str, kv_device):
                 scheduler.add_request(probe)
             output, _ = _step_all_ranks(
                 engine,
+                worker_config,
                 scheduler,
                 aggregator,
                 worker,
@@ -1018,6 +1069,7 @@ def run(args, cleanup, scratch_dir: str, kv_device):
                 prefill=prefill,
                 dcp_dump_ranks=dcp_dump_ranks,
                 protected_blocks=protected_blocks,
+                protected_label="pending Dump source",
             )
             if is_root:
                 if not output.num_scheduled_tokens.get(probe.request_id):
@@ -1029,12 +1081,14 @@ def run(args, cleanup, scratch_dir: str, kv_device):
                 )
         _drain_scheduler(
             engine,
+            worker_config,
             scheduler,
             aggregator,
             worker,
             views,
             is_root=is_root,
             native_v1=native_v1,
+            max_steps=drain_steps,
         )
         if backing.io_errors:
             raise backing.io_errors[0]
@@ -1071,6 +1125,7 @@ def run(args, cleanup, scratch_dir: str, kv_device):
         )
         _, local_neg, ext_neg, _, _, _ = _run_request_to_prefill_end(
             engine,
+            worker_config,
             scheduler,
             aggregator,
             worker,
@@ -1089,12 +1144,14 @@ def run(args, cleanup, scratch_dir: str, kv_device):
             scheduler.finish_requests(req_neg.request_id, RequestStatus.FINISHED_ABORTED)
         _drain_scheduler(
             engine,
+            worker_config,
             scheduler,
             aggregator,
             worker,
             views,
             is_root=is_root,
             native_v1=native_v1,
+            max_steps=drain_steps,
         )
         if backing.io_errors:
             raise backing.io_errors[0]
@@ -1162,8 +1219,104 @@ def run(args, cleanup, scratch_dir: str, kv_device):
         )
         if is_root and args.partial_miss:
             backing.prefix_lookups = []
+        already_added = False
+        initial_local_hot = 0
+        initial_ext_hot = 0
+        initial_steps_hot = 0
+        if args.load_delay_polls:
+            from parallel import gather
+
+            if is_root:
+                scheduler.add_request(req_hot)
+            _step_all_ranks(
+                engine,
+                worker_config,
+                scheduler,
+                aggregator,
+                worker,
+                views,
+                is_root=is_root,
+                native_v1=native_v1,
+            )
+            hot_wait_tables = None
+            if is_root:
+                if getattr(req_hot, "prefill_stats", None) is not None:
+                    initial_local_hot = int(
+                        req_hot.prefill_stats.num_local_cached_tokens
+                    )
+                    initial_ext_hot = int(
+                        req_hot.prefill_stats.num_external_cached_tokens
+                    )
+                if req_hot.status != RequestStatus.WAITING_FOR_REMOTE_KVS:
+                    raise AssertionError(
+                        f"--load-delay-polls expected WAITING_FOR_REMOTE_KVS after "
+                        f"step 1, got status={req_hot.status} "
+                        f"(external_hit={initial_ext_hot})"
+                    )
+                hot_wait_tables = scheduler.kv_cache_manager.get_block_ids(
+                    req_hot.request_id
+                )
+            hot_wait_tables = broadcast(hot_wait_tables)
+            local_load_targets = prefill.pending_source_blocks(
+                backing.pending_load_targets.values(),
+                hot_wait_tables,
+                label="async Load targets",
+            )
+            protected_load_blocks = set().union(*gather(local_load_targets))
+            if not protected_load_blocks:
+                raise AssertionError(
+                    "No hot async Load was still pending before the overlap step"
+                )
+            overlap_load = None
+            if is_root:
+                block_pool = scheduler.kv_cache_manager.block_pool
+                released = {
+                    block_id
+                    for block_id in protected_load_blocks
+                    if block_pool.blocks[block_id].ref_cnt <= 0
+                }
+                if released:
+                    raise AssertionError(
+                        f"Freed pending async Load destination blocks: {sorted(released)}"
+                    )
+                overlap_prompt = list(prompt_a)
+                overlap_prompt[0] = (overlap_prompt[0] + 3) % vocab_size
+                overlap_load = _make_request(
+                    f"load-overlap-{uuid4().hex[:8]}",
+                    overlap_prompt,
+                    hash_size,
+                    engine,
+                )
+                scheduler.add_request(overlap_load)
+            overlap_output, _ = _step_all_ranks(
+                engine,
+                worker_config,
+                scheduler,
+                aggregator,
+                worker,
+                views,
+                is_root=is_root,
+                native_v1=True,
+                protected_blocks=protected_load_blocks,
+                protected_label="pending async Load destination",
+            )
+            if is_root:
+                if not overlap_output.num_scheduled_tokens.get(overlap_load.request_id):
+                    raise AssertionError(
+                        "The async-load overlap request received no prefill tokens"
+                    )
+                if req_hot.status != RequestStatus.WAITING_FOR_REMOTE_KVS:
+                    raise AssertionError(
+                        "Hot request left WAITING_FOR_REMOTE_KVS during the overlap step"
+                    )
+                scheduler.finish_requests(
+                    overlap_load.request_id, RequestStatus.FINISHED_ABORTED
+                )
+            already_added = True
+            initial_steps_hot = 2
         _, local_hot, ext_hot, _, steps_hot, _ = _run_request_to_prefill_end(
             engine,
+            worker_config,
             scheduler,
             aggregator,
             worker,
@@ -1173,6 +1326,11 @@ def run(args, cleanup, scratch_dir: str, kv_device):
             target_tokens=effective_tokens,
             native_v1=native_v1,
             on_load_step_complete=check_after_load,
+            already_added=already_added,
+            initial_local_hit=initial_local_hot,
+            initial_external_hit=initial_ext_hot,
+            initial_steps=initial_steps_hot,
+            extra_step_budget=args.load_delay_polls + 4,
         )
         if local_hot != 0:
             raise AssertionError(
@@ -1194,15 +1352,21 @@ def run(args, cleanup, scratch_dir: str, kv_device):
             scheduler.finish_requests(req_hot.request_id, RequestStatus.FINISHED_ABORTED)
         _drain_scheduler(
             engine,
+            worker_config,
             scheduler,
             aggregator,
             worker,
             views,
             is_root=is_root,
             native_v1=native_v1,
+            max_steps=drain_steps,
         )
         if backing.io_errors:
             raise backing.io_errors[0]
+        if backing.pending_loads:
+            raise AssertionError(
+                f"Rank {coords.world_rank} still has pending hot async Loads"
+            )
         barrier()
         if args.partial_miss:
             if is_root:
@@ -1249,10 +1413,24 @@ def main(argv: list[str] | None = None) -> None:
     if script_dir not in sys.path:
         sys.path.insert(0, script_dir)
 
+    if args.enable_ucm_patch is True:
+        os.environ["ENABLE_UCM_PATCH"] = "1"
+    elif args.enable_ucm_patch is False:
+        os.environ["ENABLE_UCM_PATCH"] = "0"
+
     from parallel import launch
 
     if launch(args):
         return
+
+    ucm_patch_enabled = os.environ.get("ENABLE_UCM_PATCH", "").lower() in (
+        "1",
+        "true",
+    )
+    if ucm_patch_enabled:
+        from ucm.integration.vllm.patch import boot_patch
+
+        boot_patch.install_hook()
 
     os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "1"
     import torch
@@ -1305,6 +1483,7 @@ def main(argv: list[str] | None = None) -> None:
         f"PASS: connector={args.connector}, "
         f"TP={args.tp} PP={args.pp} PCP={args.pcp} DCP={args.dcp}, "
         f"layerwise={args.use_layerwise}, "
+        f"ucm_patch={ucm_patch_enabled}, "
         f"hit={summary['external_hit_tokens']}/{summary['tokens']} "
         f"(batch={summary['batch_tokens']}, align={summary['hit_alignment']}), "
         f"verified_slices={summary['verified_slices']}, "

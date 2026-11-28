@@ -215,7 +215,7 @@ class NativePrefill:
                     ),
                 )
 
-    def pending_source_blocks(self, sources, tables):
+    def pending_source_blocks(self, sources, tables, *, label: str = "Dump sources"):
         """Resolve delayed Store pointers against this request's native pages."""
         from bisect import bisect_left
 
@@ -236,7 +236,7 @@ class NativePrefill:
                         matched.update(local)
         if len(matched) != len(addresses):
             raise AssertionError(
-                "Could not resolve all pending Dump sources to native request blocks"
+                f"Could not resolve all pending {label} to native request blocks"
             )
         return blocks
 
@@ -413,6 +413,68 @@ def fill_native_kv(views: dict[str, Any], worker_config, coords) -> None:
                         .reshape(chunk_view.shape)
                     )
                     chunk_view.copy_(src.to(tensor.device))
+
+
+def apply_mamba_align_precopy(
+    worker_config,
+    views: dict[str, Any],
+    scheduled_requests,
+    *,
+    device_type: str,
+) -> None:
+    """Simulate MRV2 MambaHybridModelState.preprocess_state align pre-copy.
+
+    Runs before connector pre_forward / sync start_load_kv, matching MRV2
+    execute_model. For request-async HLA loads, the async load step restores
+    only the checkpoint slot (new_tokens=0); this copy migrates that loaded
+    checkpoint into the newly allocated running slot on the promotion step.
+    """
+    if not scheduled_requests:
+        return
+    from vllm.v1.kv_cache_interface import MambaSpec
+
+    num_blocks = int(worker_config.num_blocks)
+    for gid in _prefix_cacheable_group_ids(worker_config):
+        group = worker_config.kv_cache_groups[gid]
+        if not group.layer_names:
+            continue
+        spec = _unwrap_layer_spec(group.kv_cache_spec, group.layer_names[0])
+        if (
+            not isinstance(spec, MambaSpec)
+            or getattr(spec, "mamba_cache_mode", None) != "align"
+        ):
+            continue
+        block_size = int(spec.block_size)
+        copy_pairs: list[tuple[int, int]] = []
+        for _req_id, start, end, tables, _boundaries in scheduled_requests:
+            if start <= 0 or end <= start:
+                continue
+            prev_idx = (start - 1) // block_size
+            new_idx = (end - 1) // block_size
+            if prev_idx == new_idx:
+                continue
+            table = tables[gid]
+            if prev_idx >= len(table) or new_idx >= len(table):
+                continue
+            src_block = int(table[prev_idx])
+            dst_block = int(table[new_idx])
+            if src_block > 0 and dst_block > 0 and src_block != dst_block:
+                copy_pairs.append((src_block, dst_block))
+        if not copy_pairs:
+            continue
+        for layer_name in group.layer_names:
+            if layer_name not in views:
+                continue
+            parts = _unwrap_parts(
+                views[layer_name], is_state=True, device_type=device_type
+            )
+            for tensor in parts:
+                if not tensor.numel():
+                    continue
+                for src_block, dst_block in copy_pairs:
+                    src_page = _slice_block_tensor(tensor, num_blocks, src_block)
+                    dst_page = _slice_block_tensor(tensor, num_blocks, dst_block)
+                    dst_page.copy_(src_page)
 
 
 def poison_native_kv(views: dict[str, Any], poison_byte: int = 0xA5) -> None:

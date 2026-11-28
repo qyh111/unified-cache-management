@@ -172,6 +172,18 @@ def collect_handshakes(worker, coords: RankCoords, args, engine) -> dict:
                 raise AssertionError(
                     f"Worker rank {reporting_rank} reported another rank's handshake"
                 )
+            child_handshakes = getattr(metadata, "metadata", None)
+            if isinstance(child_handshakes, tuple):
+                for child_meta in child_handshakes:
+                    if (
+                        child_meta is not None
+                        and getattr(child_meta, "world_rank", reporting_rank)
+                        != reporting_rank
+                    ):
+                        raise AssertionError(
+                            f"Worker rank {reporting_rank} reported another rank's "
+                            "child handshake"
+                        )
             # Match NPUWorker and GPU Worker serialization without importing
             # accelerator drivers in a CPU-only run (notably acl.rt).
             if is_ascend and rank.pcp_size > 1:

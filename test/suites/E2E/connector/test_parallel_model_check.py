@@ -172,11 +172,88 @@ PARALLEL_CASES = [
     ("qwen27b-tp2", "qwen3.8-27b", 2, 1, 1, 1, ["--block-size", "128"]),
     ("qwen27b-tp2-pcp2", "qwen3.8-27b", 2, 1, 2, 1, ["--block-size", "128"]),
     ("qwen-fn-tp4", "qwen3.8-flash-next", 4, 1, 1, 1, ["--block-size", "1536"]),
+    # ---- Whole-block request-async (--no-use-layerwise, PP=1) --------------
+    (
+        "glm53-tp2-async",
+        "glm-5.3",
+        2,
+        1,
+        1,
+        1,
+        ["--block-size", "128", "--no-use-layerwise"],
+    ),
+    (
+        "glm53-pcp2-dcp2-tp2-async",
+        "glm-5.3",
+        2,
+        1,
+        2,
+        2,
+        [
+            "--block-size",
+            "128",
+            "--cp-kv-cache-interleave-size",
+            "128",
+            "--no-use-layerwise",
+        ],
+    ),
+    (
+        "glm53-tp2-multi-pd-first-async",
+        "glm-5.3",
+        2,
+        1,
+        1,
+        1,
+        [
+            "--block-size",
+            "128",
+            "--multi-connector",
+            "pd-first",
+            "--no-use-layerwise",
+        ],
+    ),
+    (
+        "qwen27b-tp2-async",
+        "qwen3.8-27b",
+        2,
+        1,
+        1,
+        1,
+        ["--block-size", "128", "--no-use-layerwise"],
+    ),
+    (
+        "glm53-flash-tp8-async",
+        "glm-5.3-flash",
+        8,
+        1,
+        1,
+        1,
+        ["--block-size", "128", "--no-use-layerwise"],
+    ),
+    (
+        "qwen-fn-tp4-async",
+        "qwen3.8-flash-next",
+        4,
+        1,
+        1,
+        1,
+        ["--block-size", "1536", "--no-use-layerwise"],
+    ),
 ]
 
 V1_PARTIAL_MISS_CASES = {
     "glm53-pp2-tp2": "pp-stage",
     "glm53-dcp2-tp2": "dcp-shard",
+}
+
+V1_LOAD_DELAY_CASES = {
+    "glm53-tp2-async": 4,
+    "glm53-pcp2-dcp2-tp2-async": 4,
+    "glm53-tp2-multi-pd-first-async": 4,
+    "dsv41-flash-tp2": 4,
+    "qwen27b-tp2-async": 4,
+    "glm53-flash-tp8-async": 4,
+    "qwen-fn-tp4-async": 4,
 }
 
 # Startup-rejection cases verifying unsupported v1 parallel configs fail fast
@@ -292,6 +369,8 @@ def test_parallel_roundtrip_matrix(
         cmd.extend(
             ["--partial-miss", V1_PARTIAL_MISS_CASES[case_id], "--verify-load-guards"]
         )
+    if connector == "v1" and case_id in V1_LOAD_DELAY_CASES:
+        cmd.extend(["--load-delay-polls", str(V1_LOAD_DELAY_CASES[case_id])])
     subprocess.run(cmd, check=True, env=offline_env())
 
 
